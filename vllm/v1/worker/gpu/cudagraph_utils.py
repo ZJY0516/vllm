@@ -12,6 +12,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import graph_capture, is_global_first_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.model_executor.offloader.base import get_offloader
+from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -29,11 +30,15 @@ class CudaGraphManager:
         vllm_config: VllmConfig,
         use_aux_hidden_state_outputs: bool,
         device: torch.device,
+        is_first_pp_rank: bool = True,
+        use_pp: bool = False,
     ):
         self.vllm_config = vllm_config
         self.scheduler_config = vllm_config.scheduler_config
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
         self.device = device
+        self.is_first_pp_rank = is_first_pp_rank
+        self.use_pp = use_pp
 
         self.max_model_len = vllm_config.model_config.max_model_len
         self.max_num_reqs = self.scheduler_config.max_num_seqs
@@ -52,6 +57,7 @@ class CudaGraphManager:
         use_uniform_decode_cudagraph = (
             self.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
             and self.cudagraph_mode.separate_routine()
+            and not self.use_pp
         )
         self.cudagraph_sizes, self.uniform_decode_cudagraph_sizes = get_cudagraph_sizes(
             self.compilation_config.cudagraph_capture_sizes,
@@ -61,13 +67,16 @@ class CudaGraphManager:
             self.uniform_decode_query_len,
             use_uniform_decode_cudagraph,
         )
-
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.pool = None
         if self.cudagraph_mode != CUDAGraphMode.NONE:
             self.pool = torch.cuda.graph_pool_handle()
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
+        self.intermediate_input_tensors: IntermediateTensors | None = None
+        self.intermediate_output_tensors: IntermediateTensors | None = None
+        self.intermediate_input_num_rows: dict[int, dict[str, int]] = {}
+        self.intermediate_output_num_rows: dict[int, dict[str, int]] = {}
 
     def needs_capture(self) -> bool:
         return len(self.cudagraph_sizes) > 0
@@ -78,6 +87,125 @@ class CudaGraphManager:
         if uniform_decode and self.uniform_decode_cudagraph_sizes:
             return self.uniform_decode_cudagraph_sizes.get(num_tokens)
         return self.cudagraph_sizes.get(num_tokens)
+
+    @staticmethod
+    def _slice_for_num_tokens(tensor: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        if tensor.ndim == 0:
+            return tensor
+        return tensor[: min(num_tokens, tensor.shape[0])]
+
+    def _get_input_intermediate_tensors(
+        self, model: nn.Module, num_tokens: int
+    ) -> IntermediateTensors | None:
+        return self.prepare_pp_intermediate_tensors(model, num_tokens, None)
+
+    def prepare_pp_intermediate_tensors(
+        self,
+        model: nn.Module,
+        num_tokens: int,
+        intermediate_tensors: IntermediateTensors | None,
+    ) -> IntermediateTensors | None:
+        if self.is_first_pp_rank:
+            return None
+        if self.intermediate_input_tensors is None:
+            self.intermediate_input_tensors = model.make_empty_intermediate_tensors(
+                batch_size=self.max_num_tokens,
+                dtype=self.vllm_config.model_config.dtype,
+                device=self.device,
+            )
+            for v in self.intermediate_input_tensors.tensors.values():
+                v.zero_()
+
+        if intermediate_tensors is None:
+            for v in self.intermediate_input_tensors.tensors.values():
+                if v.ndim > 0:
+                    v[:num_tokens].zero_()
+        else:
+            for key, src in intermediate_tensors.items():
+                dst = self.intermediate_input_tensors[key]
+                if src.ndim == 0:
+                    dst.copy_(src, non_blocking=True)
+                    continue
+                copy_rows = min(src.shape[0], dst.shape[0], num_tokens)
+                dst[:copy_rows].copy_(src[:copy_rows], non_blocking=True)
+                if copy_rows < num_tokens:
+                    dst[copy_rows:num_tokens].zero_()
+
+        sliced_tensors = {
+            k: self._slice_for_num_tokens(v, num_tokens)
+            for k, v in self.intermediate_input_tensors.items()
+        }
+        self.intermediate_input_num_rows[num_tokens] = {
+            k: (v.shape[0] if v.ndim > 0 else 0) for k, v in sliced_tensors.items()
+        }
+        return IntermediateTensors(sliced_tensors)
+
+    def _copy_input_intermediate_tensors(
+        self, num_tokens: int, intermediate_tensors: IntermediateTensors | None
+    ) -> None:
+        if self.is_first_pp_rank:
+            return
+        assert intermediate_tensors is not None
+        assert self.intermediate_input_tensors is not None
+        expected_rows = self.intermediate_input_num_rows.get(num_tokens)
+        assert expected_rows is not None, (
+            f"Missing PP intermediate input metadata for {num_tokens} tokens"
+        )
+        for key, num_rows in expected_rows.items():
+            src = intermediate_tensors[key]
+            dst = self.intermediate_input_tensors[key]
+            if src.ndim == 0:
+                dst.copy_(src, non_blocking=True)
+                continue
+            copy_rows = min(src.shape[0], num_rows, dst.shape[0])
+            dst[:copy_rows].copy_(src[:copy_rows], non_blocking=True)
+            if copy_rows < num_rows:
+                dst[copy_rows:num_rows].zero_()
+
+    def _allocate_output_buffers(
+        self,
+        model_output: torch.Tensor | IntermediateTensors,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        if isinstance(model_output, IntermediateTensors):
+            if self.intermediate_output_tensors is None:
+                self.intermediate_output_tensors = IntermediateTensors(
+                    {k: torch.empty_like(v) for k, v in model_output.items()}
+                )
+        else:
+            if self.hidden_states is None:
+                self.hidden_states = torch.empty_like(model_output)
+            if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
+                assert aux_hidden_states is not None
+                self.aux_hidden_states = [
+                    torch.empty_like(x) for x in aux_hidden_states
+                ]
+
+    def _copy_output_buffers(
+        self,
+        num_tokens: int,
+        model_output: torch.Tensor | IntermediateTensors,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        if isinstance(model_output, IntermediateTensors):
+            assert self.intermediate_output_tensors is not None
+            num_rows = {}
+            for k, v in model_output.items():
+                if v.ndim == 0:
+                    self.intermediate_output_tensors[k].copy_(v)
+                    num_rows[k] = 0
+                else:
+                    self.intermediate_output_tensors[k][: v.shape[0]].copy_(v)
+                    num_rows[k] = v.shape[0]
+            self.intermediate_output_num_rows[num_tokens] = num_rows
+            return
+
+        assert self.hidden_states is not None
+        self.hidden_states[:num_tokens].copy_(model_output)
+        if self.use_aux_hidden_state_outputs:
+            assert aux_hidden_states is not None
+            for i, aux_hidden in enumerate(aux_hidden_states):
+                self.aux_hidden_states[i][:num_tokens].copy_(aux_hidden)
 
     def capture_graph(
         self,
@@ -116,6 +244,12 @@ class CudaGraphManager:
             # default values above.
             **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
         }
+        if not self.is_first_pp_rank:
+            model_inputs["input_ids"] = None
+            model_inputs["inputs_embeds"] = None
+            model_inputs["intermediate_tensors"] = self._get_input_intermediate_tensors(
+                model, num_tokens
+            )
 
         attn_metadata, slot_mappings = prepare_inputs_to_capture(
             num_reqs,
@@ -145,10 +279,7 @@ class CudaGraphManager:
                 aux_hidden_states = None
 
         # Allocate output buffers if not already done.
-        if self.hidden_states is None:
-            self.hidden_states = torch.empty_like(hidden_states)
-        if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
-            self.aux_hidden_states = [torch.empty_like(x) for x in aux_hidden_states]
+        self._allocate_output_buffers(hidden_states, aux_hidden_states)
 
         capture_fn(
             num_tokens=num_tokens,
@@ -166,7 +297,7 @@ class CudaGraphManager:
         num_tokens: int,
         num_reqs: int,
         model: nn.Module,
-        model_inputs: dict[str, torch.Tensor | None],
+        model_inputs: dict[str, torch.Tensor | IntermediateTensors | None],
         num_tokens_across_dp: torch.Tensor,
         attn_metadata: dict[str, Any] | None,
         slot_mappings: dict[str, torch.Tensor] | None,
@@ -206,11 +337,7 @@ class CudaGraphManager:
                 aux_hidden_states = None
 
             # Copy outputs to the output buffers.
-            assert self.hidden_states is not None
-            self.hidden_states[:num_tokens] = hidden_states
-            if self.use_aux_hidden_state_outputs:
-                for i, aux_hidden in enumerate(aux_hidden_states):
-                    self.aux_hidden_states[i][:num_tokens] = aux_hidden
+            self._copy_output_buffers(num_tokens, hidden_states, aux_hidden_states)
         self.graphs[num_tokens] = graph
 
     def _capture_piecewise_graph(
@@ -218,7 +345,7 @@ class CudaGraphManager:
         num_tokens: int,
         num_reqs: int,
         model: nn.Module,
-        model_inputs: dict[str, torch.Tensor | None],
+        model_inputs: dict[str, torch.Tensor | IntermediateTensors | None],
         num_tokens_across_dp: torch.Tensor,
         attn_metadata: dict[str, Any] | None,
         slot_mappings: dict[str, torch.Tensor] | None,
@@ -309,12 +436,17 @@ class CudaGraphManager:
             # This might happen when the dummy run is called before capture.
             cudagraph_mode = CUDAGraphMode.NONE
             cudagraph_size = None
+        # PP decode can still use cudagraph through PIECEWISE mode, while
+        # avoiding FULL replay path edge cases across stages.
+        if self.use_pp and cudagraph_mode == CUDAGraphMode.FULL:
+            cudagraph_mode = CUDAGraphMode.PIECEWISE
         return cudagraph_mode, cudagraph_size
 
     def run_fullgraph(
-        self, num_tokens: int
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        self, num_tokens: int, intermediate_tensors: IntermediateTensors | None = None
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         assert num_tokens in self.graphs, f"No cudagraph for {num_tokens} tokens"
+        self._copy_input_intermediate_tensors(num_tokens, intermediate_tensors)
         # Sync offloader before replay - needed when transitioning from
         # eager/piecewise to full cudagraph (e.g., prefill → decode).
         # The previous eager iteration's start_prefetch may have queued
@@ -323,6 +455,19 @@ class CudaGraphManager:
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
         self.graphs[num_tokens].replay()
+        output_rows = self.intermediate_output_num_rows.get(num_tokens)
+        if output_rows is not None:
+            assert self.intermediate_output_tensors is not None
+            return IntermediateTensors(
+                {
+                    k: (
+                        self.intermediate_output_tensors[k]
+                        if num_rows == 0
+                        else self.intermediate_output_tensors[k][:num_rows]
+                    )
+                    for k, num_rows in output_rows.items()
+                }
+            )
         assert self.hidden_states is not None
         hidden_states = self.hidden_states[:num_tokens]
         if not self.use_aux_hidden_state_outputs:

@@ -203,6 +203,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
             self.use_aux_hidden_state_outputs,
             self.device,
+            is_first_pp_rank=self.is_first_pp_rank,
+            use_pp=self.use_pp,
         )
         # Structured outputs worker.
         self.structured_outputs_worker = StructuredOutputsWorker(
@@ -359,14 +361,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Disable any use of KVConnector for dummy runs.
         self.kv_connector.set_disabled(True)
 
-        # For non-first PP ranks, create dummy intermediate_tensors.
+        # Non-first PP ranks will prepare dummy intermediate_tensors inside
+        # execute_model().
         intermediate_tensors = None
-        if not self.is_first_pp_rank:
-            intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                batch_size=num_tokens,
-                dtype=self.model_config.dtype,
-                device=self.device,
-            )
 
         # Execute the model.
         self.execute_model(
@@ -464,14 +461,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
                 "ensure `cudagraph_mode` was not manually set to `NONE`"
-            )
-            return 0
-
-        # TODO (zhanqiu): support CUDA graph for PP.
-        if self.use_pp:
-            logger.warning_once(
-                "Skipping CUDA graph capture because pipeline parallel is "
-                "enabled. Pipeline parallel is currently eager-only.",
             )
             return 0
 
@@ -924,8 +913,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
+        pp_input_tensors = intermediate_tensors
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
+            # For FULL cudagraph replay, keep the received tensors as the copy
+            # source and only prepare static input buffers (without a source
+            # copy) for shape bookkeeping.
+            if cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                intermediate_tensors = (
+                    self.cudagraph_manager.prepare_pp_intermediate_tensors(
+                        self.model,
+                        input_batch.num_tokens_after_padding,
+                        None,
+                    )
+                )
+            else:
+                intermediate_tensors = (
+                    self.cudagraph_manager.prepare_pp_intermediate_tensors(
+                        self.model,
+                        input_batch.num_tokens_after_padding,
+                        pp_input_tensors,
+                    )
+                )
             model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
             model_inputs["intermediate_tensors"] = intermediate_tensors
@@ -937,7 +946,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # because they are already copied to the CUDA graph input buffers.
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(
-                input_batch.num_tokens_after_padding
+                input_batch.num_tokens_after_padding,
+                intermediate_tensors=pp_input_tensors,
             )
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = model_output
