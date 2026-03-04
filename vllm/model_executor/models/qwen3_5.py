@@ -183,13 +183,22 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             device=hidden_states.device,
         )
 
-        torch.ops.vllm.gdn_attention_core(
-            mixed_qkv,
-            b,
-            a,
-            core_attn_out,
-            self.prefix,
-        )
+        if self.use_flashinfer_core:
+            torch.ops.vllm.gdn_attention_core_flashinfer(
+                mixed_qkv,
+                b,
+                a,
+                core_attn_out,
+                self.prefix,
+            )
+        else:
+            torch.ops.vllm.gdn_attention_core(
+                mixed_qkv,
+                b,
+                a,
+                core_attn_out,
+                self.prefix,
+            )
 
         # ============================================================
         # Part 3: Output Projection

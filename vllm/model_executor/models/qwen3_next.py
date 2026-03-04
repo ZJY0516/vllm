@@ -105,6 +105,16 @@ logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
+try:
+    from flashinfer.gdn_decode import (
+        gated_delta_rule_decode_pretranspose as fi_gated_delta_rule_decode_kernel,
+    )
+
+    _FLASHINFER_GDN_DECODE_AVAILABLE = True
+except ImportError:
+    fi_gated_delta_rule_decode_kernel = None
+    _FLASHINFER_GDN_DECODE_AVAILABLE = False
+
 
 def fi_chunk_gated_delta_rule(
     q: torch.Tensor,
@@ -147,6 +157,40 @@ def fi_chunk_gated_delta_rule(
     )
     # Unsqueeze back to 4D (1, L, H, D) to match fla output format
     return output.unsqueeze(0), final_state
+
+
+def fi_gated_delta_rule_decode_pretranspose(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    state: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    use_qk_l2norm: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if fi_gated_delta_rule_decode_kernel is None:
+        raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
+
+    q_fi = q.squeeze(0).unsqueeze(1).contiguous()
+    k_fi = k.squeeze(0).unsqueeze(1).contiguous()
+    v_fi = v.squeeze(0).unsqueeze(1).contiguous()
+    a_fi = a.unsqueeze(1).contiguous()
+    b_fi = b.unsqueeze(1).contiguous()
+
+    output, final_state = fi_gated_delta_rule_decode_kernel(
+        q=q_fi,
+        k=k_fi,
+        v=v_fi,
+        state=state,
+        A_log=A_log,
+        a=a_fi,
+        dt_bias=dt_bias,
+        b=b_fi,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+    return output.squeeze(1).unsqueeze(0), final_state
 
 
 @CustomOp.register("chunk_gated_delta_rule")
@@ -475,11 +519,38 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         )
 
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
+        self.use_flashinfer_core = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(90)
+            and _FLASHINFER_GDN_DECODE_AVAILABLE
+        )
+        if self.use_flashinfer_core:
+            logger.info_once(
+                "Using FlashInfer GDN decode kernel for Qwen3NextGatedDeltaNet"
+            )
+        self._fi_A_log_fp32: torch.Tensor | None = None
+        self._fi_dt_bias_fp32: torch.Tensor | None = None
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def _get_flashinfer_decode_constants(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # Cache small fp32 constants once to avoid per-step tiny cast/copy kernels.
+        if (
+            self._fi_A_log_fp32 is None
+            or self._fi_A_log_fp32.device != self.A_log.device
+            or self._fi_A_log_fp32.numel() != self.A_log.numel()
+        ):
+            self._fi_A_log_fp32 = self.A_log.detach().to(torch.float32)
+        if (
+            self._fi_dt_bias_fp32 is None
+            or self._fi_dt_bias_fp32.device != self.dt_bias.device
+            or self._fi_dt_bias_fp32.numel() != self.dt_bias.numel()
+        ):
+            self._fi_dt_bias_fp32 = self.dt_bias.detach().to(torch.float32)
+        return self._fi_A_log_fp32, self._fi_dt_bias_fp32
 
     def create_qkvz_proj(
         self,
@@ -604,13 +675,22 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             device=hidden_states.device,
         )
 
-        torch.ops.vllm.gdn_attention_core(
-            mixed_qkv,
-            b,
-            a,
-            core_attn_out,
-            self.prefix,
-        )
+        # if self.use_flashinfer_core:
+        #     torch.ops.vllm.gdn_attention_core_flashinfer(
+        #         mixed_qkv,
+        #         b,
+        #         a,
+        #         core_attn_out,
+        #         self.prefix,
+        #     )
+        # else:
+        #     torch.ops.vllm.gdn_attention_core(
+        #         mixed_qkv,
+        #         b,
+        #         a,
+        #         core_attn_out,
+        #         self.prefix,
+        #     )
 
         # ============================================================
         # Part 3: Output Projection
@@ -632,7 +712,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         core_attn_out: torch.Tensor,
     ):
         """
-        Core attention computation (called by custom op).
+        Native core attention computation (called by custom op).
         """
         forward_context = get_forward_context()
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
@@ -826,6 +906,248 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+    def _forward_flashinfer(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ):
+        """
+        FlashInfer core attention computation (called by custom op).
+        """
+        forward_context = get_forward_context()
+        attn_metadata: AttentionMetadata = forward_context.attn_metadata
+
+        if attn_metadata is None:
+            # V1 profile run
+            return
+
+        assert isinstance(attn_metadata, dict)
+        attn_metadata = attn_metadata[self.prefix]
+        assert isinstance(attn_metadata, GDNAttentionMetadata)
+        has_initial_state = attn_metadata.has_initial_state
+        spec_query_start_loc = attn_metadata.spec_query_start_loc
+        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+        spec_sequence_masks = attn_metadata.spec_sequence_masks
+        spec_token_indx = attn_metadata.spec_token_indx
+        non_spec_token_indx = attn_metadata.non_spec_token_indx
+        spec_state_indices_tensor = (
+            attn_metadata.spec_state_indices_tensor
+        )  # noqa: E501
+        non_spec_state_indices_tensor = (
+            attn_metadata.non_spec_state_indices_tensor
+        )  # noqa: E501
+        non_spec_state_indices_tensor_long = (
+            attn_metadata.non_spec_state_indices_tensor_long
+        )
+        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+        conv_state = self_kv_cache[0].transpose(-1, -2)
+        ssm_state = self_kv_cache[1]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_accepted_tokens = attn_metadata.num_accepted_tokens
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+
+        # 1. Convolution sequence transformation
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+
+        if spec_sequence_masks is not None:
+            if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+                mixed_qkv_spec = mixed_qkv
+                mixed_qkv_non_spec = None
+            else:
+                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
+                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+        else:
+            mixed_qkv_spec = None
+            mixed_qkv_non_spec = mixed_qkv
+
+        # 1.1: Process the multi-query part
+        if spec_sequence_masks is not None:
+            mixed_qkv_spec = causal_conv1d_update(
+                mixed_qkv_spec,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=spec_state_indices_tensor[:, 0][
+                    : attn_metadata.num_spec_decodes
+                ],
+                num_accepted_tokens=num_accepted_tokens,
+                query_start_loc=spec_query_start_loc,
+                max_query_len=spec_state_indices_tensor.size(-1),
+                validate_data=False,
+            )
+
+        # 1.2: Process the remaining part
+        if attn_metadata.num_prefills > 0:
+            mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
+            # - "cache_indices" updates the conv_state cache in positions
+            #   pointed to by "state_indices_tensor"
+            mixed_qkv_non_spec = causal_conv1d_fn(
+                mixed_qkv_non_spec_T,
+                conv_weights,
+                self.conv1d.bias,
+                activation=self.activation,
+                conv_states=conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=non_spec_state_indices_tensor,
+                query_start_loc=non_spec_query_start_loc,
+                metadata=attn_metadata,
+            ).transpose(0, 1)
+        elif attn_metadata.num_decodes > 0:
+            mixed_qkv_non_spec = causal_conv1d_update(
+                mixed_qkv_non_spec,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=non_spec_state_indices_tensor[
+                    : attn_metadata.num_actual_tokens
+                ],
+                validate_data=True,
+            )
+        else:
+            mixed_qkv_non_spec = None
+
+        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+            mixed_qkv_non_spec
+        )
+
+        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+
+        if spec_sequence_masks is not None:
+            if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+                g_spec = g
+                beta_spec = beta
+                g_non_spec = None
+                beta_non_spec = None
+                a_non_spec = None
+                b_non_spec = None
+            else:
+                g_spec = g.index_select(1, spec_token_indx)
+                beta_spec = beta.index_select(1, spec_token_indx)
+                g_non_spec = g.index_select(1, non_spec_token_indx)
+                beta_non_spec = beta.index_select(1, non_spec_token_indx)
+                a_non_spec = a.index_select(0, non_spec_token_indx)
+                b_non_spec = b.index_select(0, non_spec_token_indx)
+        else:
+            g_spec = None
+            beta_spec = None
+            g_non_spec = g
+            beta_non_spec = beta
+            a_non_spec = a
+            b_non_spec = b
+
+        # 2. Recurrent attention
+
+        # 2.1: Process the multi-query part
+        if spec_sequence_masks is not None:
+            # FlashInfer MTP does not yet match vLLM speculative decode state update
+            # semantics with num_accepted_tokens + state index tables.
+            core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
+                q=query_spec,
+                k=key_spec,
+                v=value_spec,
+                g=g_spec,
+                beta=beta_spec,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
+                ssm_state_indices=spec_state_indices_tensor,
+                num_accepted_tokens=num_accepted_tokens,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            core_attn_out_spec, last_recurrent_state = None, None
+
+        # 2.2: Process the remaining part
+        if attn_metadata.num_prefills > 0:
+            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+            initial_state[~has_initial_state, ...] = 0
+            (
+                core_attn_out_non_spec,
+                last_recurrent_state,
+            ) = fi_chunk_gated_delta_rule(
+                q=query_non_spec,
+                k=key_non_spec,
+                v=value_non_spec,
+                g=g_non_spec,
+                beta=beta_non_spec,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=non_spec_query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+            )
+            # Init cache
+            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
+                ssm_state.dtype
+            )
+        elif attn_metadata.num_decodes > 0:
+            num_decode_tokens = attn_metadata.num_decode_tokens
+            if num_decode_tokens > 0:
+                fi_A_log, fi_dt_bias = self._get_flashinfer_decode_constants()
+                if non_spec_state_indices_tensor_long is not None:
+                    base_indices = non_spec_state_indices_tensor_long[
+                        :num_decode_tokens
+                    ]
+                else:
+                    base_indices = non_spec_state_indices_tensor[:num_decode_tokens].to(
+                        torch.long
+                    )
+                gather_indices = torch.where(
+                    base_indices >= 0,
+                    base_indices,
+                    ssm_state.shape[0] - 1,
+                )
+                state_batch = torch.index_select(ssm_state, 0, gather_indices)
+                fi_output, fi_final_state = fi_gated_delta_rule_decode_pretranspose(
+                    q=query_non_spec[:, :num_decode_tokens],
+                    k=key_non_spec[:, :num_decode_tokens],
+                    v=value_non_spec[:, :num_decode_tokens],
+                    a=a_non_spec[:num_decode_tokens],
+                    b=b_non_spec[:num_decode_tokens],
+                    state=state_batch,
+                    A_log=fi_A_log,
+                    dt_bias=fi_dt_bias,
+                    use_qk_l2norm=True,
+                )
+                ssm_state.index_copy_(
+                    0,
+                    gather_indices,
+                    fi_final_state.to(ssm_state.dtype),
+                )
+                core_attn_out_non_spec = fi_output
+                last_recurrent_state = None
+            else:
+                core_attn_out_non_spec = None
+                last_recurrent_state = None
+        else:
+            core_attn_out_non_spec, last_recurrent_state = None, None
+
+        # 3. Merge core attention output
+        if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
+            merged_out = torch.empty(
+                (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
+                dtype=core_attn_out_non_spec.dtype,
+                device=core_attn_out_non_spec.device,
+            )
+            merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
+            merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
+        elif spec_sequence_masks is not None:
+            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+        else:
+            if core_attn_out_non_spec is not None:
+                non_spec_len = core_attn_out_non_spec.size(1)
+                core_attn_out[:non_spec_len] = core_attn_out_non_spec.squeeze(0)
 
 
 class Qwen3NextAttention(nn.Module):
@@ -1467,11 +1789,48 @@ def gdn_attention_core_fake(
     return
 
 
+def gdn_attention_core_flashinfer(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """
+    FlashInfer-enabled core op for Qwen3Next GDN.
+    """
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    self._forward_flashinfer(
+        mixed_qkv=mixed_qkv,
+        b=b,
+        a=a,
+        core_attn_out=core_attn_out,
+    )
+
+
+def gdn_attention_core_flashinfer_fake(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 direct_register_custom_op(
     op_name="gdn_attention_core",
     op_func=gdn_attention_core,
     mutates_args=["core_attn_out"],
     fake_impl=gdn_attention_core_fake,
+)
+
+direct_register_custom_op(
+    op_name="gdn_attention_core_flashinfer",
+    op_func=gdn_attention_core_flashinfer,
+    mutates_args=["core_attn_out"],
+    fake_impl=gdn_attention_core_flashinfer_fake,
 )
 
 

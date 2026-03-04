@@ -53,6 +53,9 @@ class GDNAttentionMetadata:
     non_spec_state_indices_tensor: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes,]
     )
+    non_spec_state_indices_tensor_long: torch.Tensor | None = (
+        None  # int64 view/cache for decode gather/scatter
+    )
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
@@ -112,6 +115,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.non_spec_state_indices_tensor = torch.empty(
             (self.decode_cudagraph_max_bs,),
             dtype=torch.int32,
+            device=device,
+        )
+        self.non_spec_state_indices_tensor_long = torch.empty(
+            (self.decode_cudagraph_max_bs,),
+            dtype=torch.int64,
             device=device,
         )
         self.spec_sequence_masks = torch.empty(
@@ -197,6 +205,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_token_indx = None
             spec_state_indices_tensor = None
             non_spec_state_indices_tensor = block_table_tensor[:, 0]
+            non_spec_state_indices_tensor_long = None
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
@@ -238,6 +247,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     spec_sequence_masks, : self.num_spec + 1
                 ]
                 non_spec_state_indices_tensor = None
+                non_spec_state_indices_tensor_long = None
                 # Padded sequences are always at the back, so the first
                 # num_spec_decodes + 1 entries of query_start_loc already
                 # contain the correct cumulative token counts.
@@ -259,6 +269,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_state_indices_tensor = block_table_tensor[
                     ~spec_sequence_masks, 0
                 ]
+                non_spec_state_indices_tensor_long = None
 
                 spec_query_start_loc = torch.zeros(
                     num_spec_decodes + 1,
@@ -373,6 +384,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 :batch_size
             ]
             non_spec_state_indices_tensor[num_decodes:].fill_(PAD_SLOT_ID)
+            self.non_spec_state_indices_tensor_long[:num_decodes].copy_(
+                non_spec_state_indices_tensor[:num_decodes], non_blocking=True
+            )
+            non_spec_state_indices_tensor_long = self.non_spec_state_indices_tensor_long[
+                :batch_size
+            ]
+            if num_decodes < batch_size:
+                non_spec_state_indices_tensor_long[num_decodes:].fill_(0)
 
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
                 non_spec_query_start_loc, non_blocking=True
@@ -380,6 +399,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
+        elif (
+            num_prefills == 0
+            and num_spec_decodes == 0
+            and non_spec_state_indices_tensor is not None
+        ):
+            non_spec_state_indices_tensor_long = non_spec_state_indices_tensor.to(
+                dtype=torch.int64
+            )
+        else:
+            non_spec_state_indices_tensor_long = None
 
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
@@ -394,6 +423,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc=non_spec_query_start_loc,
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+            non_spec_state_indices_tensor_long=non_spec_state_indices_tensor_long,
             spec_sequence_masks=spec_sequence_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
