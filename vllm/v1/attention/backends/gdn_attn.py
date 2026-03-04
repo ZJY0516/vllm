@@ -387,9 +387,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.non_spec_state_indices_tensor_long[:num_decodes].copy_(
                 non_spec_state_indices_tensor[:num_decodes], non_blocking=True
             )
-            non_spec_state_indices_tensor_long = self.non_spec_state_indices_tensor_long[
-                :batch_size
-            ]
+            non_spec_state_indices_tensor_long = (
+                self.non_spec_state_indices_tensor_long[:batch_size]
+            )
             if num_decodes < batch_size:
                 non_spec_state_indices_tensor_long[num_decodes:].fill_(0)
 

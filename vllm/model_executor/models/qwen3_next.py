@@ -933,12 +933,8 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         spec_sequence_masks = attn_metadata.spec_sequence_masks
         spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = (
-            attn_metadata.spec_state_indices_tensor
-        )  # noqa: E501
-        non_spec_state_indices_tensor = (
-            attn_metadata.non_spec_state_indices_tensor
-        )  # noqa: E501
+        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor_long = (
             attn_metadata.non_spec_state_indices_tensor_long
         )
