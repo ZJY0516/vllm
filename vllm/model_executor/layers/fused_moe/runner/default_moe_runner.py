@@ -244,10 +244,20 @@ class DefaultMoERunner(MoERunner):
         has_separate_shared_experts: bool,
         use_chunked_impl: bool,
     ) -> tuple[bool, torch.Tensor | None]:
+        # When naive dispatch/combine is used (EP all2all), avoid running
+        # shared experts on a separate stream. During CUDA graph capture,
+        # record_stream() does not prevent the graph memory pool from reusing
+        # shared_experts_input's memory for tensors allocated by the dispatch,
+        # which leads to illegal memory access on the shared experts stream.
+        do_naive_dispatch_combine = (
+            self.moe_config.dp_size > 1 and not self.quant_method.supports_internal_mk
+        )
+
         use_shared_experts_stream = (
             current_platform.is_cuda()
             and has_separate_shared_experts
             and not use_chunked_impl
+            and not do_naive_dispatch_combine
             and self.shared_experts_stream is not None
             and (
                 hidden_states.shape[0]
