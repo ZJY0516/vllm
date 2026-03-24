@@ -125,39 +125,64 @@ def fi_chunk_gated_delta_rule(
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
     )
+    from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q)
         k = l2norm_fwd(k)
 
-    # use flashinfer implementation
-    q = q.squeeze(0).contiguous()
-    k = k.squeeze(0).contiguous()
-    v = v.squeeze(0).contiguous()
-
-    g = g.squeeze(0).contiguous()
-    beta = beta.squeeze(0).contiguous()
+    is_blackwell = is_sm100a_supported(q.device) or is_sm110a_supported(q.device)
     fi_state = initial_state.to(torch.float32)
-    fi_g = g.to(torch.float32)
-    fi_beta = beta.to(torch.float32)
-    result = chunk_gated_delta_rule_fi(
-        q=q,
-        k=k,
-        v=v,
-        g=torch.exp(fi_g),
-        beta=fi_beta,
-        initial_state=fi_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
+
+    if is_blackwell:
+        # vllm patches cute.compile with a plain function (cute_compile_patched)
+        # that doesn't support subscript notation cute.compile[options].
+        # Temporarily restore the original CompileCallable so that flashinfer's
+        # Blackwell GDN kernel can use cute.compile[EnableTVMFFI](...).
+        import cutlass.cute as _cute
+        from cutlass.base_dsl.compiler import CompileCallable
+
+        orig_compile = _cute.compile
+        if not isinstance(orig_compile, CompileCallable):
+            _cute.compile = CompileCallable()
+        else:
+            orig_compile = None
+        try:
+            # Blackwell kernel expects 4D tensors (B, T, H, D) and g/beta as
+            # (1, T, H) in log-space / sigmoid-space respectively.
+            result = chunk_gated_delta_rule_fi(
+                q=q.contiguous(),
+                k=k.contiguous(),
+                v=v.contiguous(),
+                g=g.to(torch.float32).contiguous(),
+                beta=beta.to(torch.float32).contiguous(),
+                initial_state=fi_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+            )
+        finally:
+            if orig_compile is not None:
+                _cute.compile = orig_compile
+    else:
+        # Hopper (SM90) kernel expects 3D tensors and g in linear space.
+        result = chunk_gated_delta_rule_fi(
+            q=q.squeeze(0).contiguous(),
+            k=k.squeeze(0).contiguous(),
+            v=v.squeeze(0).contiguous(),
+            g=torch.exp(g.squeeze(0).to(torch.float32).contiguous()),
+            beta=beta.squeeze(0).to(torch.float32).contiguous(),
+            initial_state=fi_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
-    # Unsqueeze back to 4D (1, L, H, D) to match fla output format
-    if output_final_state:
-        output, final_state = result
-        return output.unsqueeze(0), final_state
-    else:
-        return result.unsqueeze(0), None
+    out, state = result if output_final_state else (result, None)
+    # Unsqueeze back to 4D (1, L, H, D) for Hopper; Blackwell is already 4D.
+    if not is_blackwell:
+        out = out.unsqueeze(0)
+    return out, state
 
 
 @CustomOp.register("chunk_gated_delta_rule")
@@ -173,22 +198,17 @@ class ChunkGatedDeltaRule(CustomOp):
             .strip()
             .lower()
         )
-        supports_flashinfer = (
-            current_platform.is_cuda() and current_platform.is_device_capability(90)
+        supports_flashinfer = current_platform.is_cuda() and (
+            current_platform.is_device_capability(90)
+            or current_platform.is_device_capability_family(100)
         )
-
-        if backend == "flashinfer":
-            use_flashinfer = supports_flashinfer
-            if not use_flashinfer:
-                logger.warning_once(
-                    "GDN prefill backend 'flashinfer' is selected but "
-                    "cannot use this kernel on the current platform. "
-                    "Falling back to Triton/FLA."
-                )
-        elif backend == "triton":
-            use_flashinfer = False
-        else:
-            use_flashinfer = supports_flashinfer
+        use_flashinfer = supports_flashinfer and backend != "triton"
+        if backend == "flashinfer" and not supports_flashinfer:
+            logger.warning_once(
+                "GDN prefill backend 'flashinfer' is selected but "
+                "cannot use this kernel on the current platform. "
+                "Falling back to Triton/FLA."
+            )
 
         if use_flashinfer:
             logger.info_once("Using FlashInfer GDN prefill kernel", scope="local")
