@@ -129,15 +129,11 @@ class _BlackwellGDNLauncher:
     """Zero-overhead launcher: compile once, then raw TVM-FFI calls."""
 
     _inited: bool = False
-    # Fixed-size cu_seqlens buffer to avoid recompilation per batch_size.
-    # CuTe DSL bakes tensor shapes into compiled kernels; using a fixed
-    # buffer means we compile once regardless of actual batch_size.
-    _MAX_BATCH_FOR_CU = 256  # covers up to 256 sequences per batch
 
     def __init__(self):
         self._compiled_kernels: dict = {}  # cache_key → compiled_fn
         self._stream = None
-        self._cu_seqlens_buf: torch.Tensor | None = None
+        self._sm_count: int | None = None
 
     @staticmethod
     def _ensure_cute_compile():
@@ -152,7 +148,7 @@ class _BlackwellGDNLauncher:
         import cutlass.cute as cute
         from cutlass.cute.runtime import from_dlpack
         from cutlass.base_dsl.compiler import EnableTVMFFI
-        from flashinfer.gdn_kernels.blackwell_prefill.gdn import GDN
+        from vllm.model_executor.layers.gdn_blackwell import GDN
 
         gdn = GDN(chunk_size=chunk_size, num_chunk_groups=num_chunk_groups)
         q_t = from_dlpack(q, assumed_align=16, enable_tvm_ffi=True)
@@ -197,7 +193,9 @@ class _BlackwellGDNLauncher:
         h_q, h_v, d = problem_size[3], problem_size[4], problem_size[5]
         num_o_heads = max(h_q, h_v)
         b_local = problem_size[0]
-        sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        if self._sm_count is None:
+            self._sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        sm_count = self._sm_count
         use_small_chunk = num_o_heads * b_local < sm_count // 2
         chunk_size = 64 if use_small_chunk else 128
         num_chunk_groups = 1
@@ -315,7 +313,7 @@ def fi_chunk_gated_delta_rule(
             return output, output_state
         return output, None
     else:
-        from flashinfer.gdn_prefill import (
+        from vllm.model_executor.layers.gdn_blackwell import (
             chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
         )
         result = chunk_gated_delta_rule_fi(
@@ -348,45 +346,30 @@ class ChunkGatedDeltaRule(CustomOp):
             .strip()
             .lower()
         )
-        supports_flashinfer = current_platform.is_cuda() and (
-            current_platform.is_device_capability(90)
-            or current_platform.is_device_capability_family(100)
+        supports_cutedsl = current_platform.is_cuda() and (
+            current_platform.is_device_capability_family(100)
         )
-        use_flashinfer = supports_flashinfer and backend != "triton"
-        if backend == "flashinfer" and not supports_flashinfer:
+        use_cutedsl = supports_cutedsl and backend != "triton"
+        if backend == "flashinfer" and not supports_cutedsl:
             logger.warning_once(
                 "GDN prefill backend 'flashinfer' is selected but "
-                "cannot use this kernel on the current platform. "
+                "cannot use CuTe-DSL kernel on the current platform. "
                 "Falling back to Triton/FLA."
             )
 
         # Cache arch detection once — avoids per-call torch.cuda queries.
-        self._is_blackwell = (
-            current_platform.is_device_capability_family(100)
-            if use_flashinfer
-            else False
-        )
+        self._is_blackwell = supports_cutedsl if use_cutedsl else False
 
-        if use_flashinfer:
-            logger.info_once("Using FlashInfer GDN prefill kernel", scope="local")
-            if self._is_blackwell:
-                logger.info_once(
-                    "Using Blackwell CuTe-DSL kernel (direct call, "
-                    "no wrapper overhead).",
-                    scope="local",
-                )
-            else:
-                logger.info_once(
-                    "FlashInfer GDN prefill kernel is JIT-compiled; first run "
-                    "may take a while to compile. Set "
-                    "`--gdn-prefill-backend triton` to avoid JIT compile time.",
-                    scope="local",
-                )
+        if use_cutedsl:
+            logger.info_once(
+                "Using Blackwell CuTe-DSL GDN prefill kernel.",
+                scope="local",
+            )
         else:
             logger.info_once("Using Triton/FLA GDN prefill kernel", scope="local")
 
         self._forward_method = (
-            self.forward_cuda if use_flashinfer else self.forward_native
+            self.forward_cuda if use_cutedsl else self.forward_native
         )
 
     def forward_cuda(
