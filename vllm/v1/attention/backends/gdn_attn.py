@@ -59,6 +59,8 @@ class GDNAttentionMetadata:
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
+    non_spec_query_start_loc_cpu: torch.Tensor | None = None
+
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
@@ -403,6 +405,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             has_initial_state=has_initial_state,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu
+            if num_prefills > 0
+            else None,
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             spec_sequence_masks=spec_sequence_masks,
