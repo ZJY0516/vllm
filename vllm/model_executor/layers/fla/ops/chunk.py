@@ -12,9 +12,11 @@ import warnings
 import torch
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from .chunk_o import chunk_fwd_o
+from .chunk_o import chunk_fwd_o, chunk_fwd_o_qcached
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from .ckkt_solve_fused import fused_ckkt_solve
 from .cumsum import chunk_local_cumsum
+from .fused_wy_rec import fused_wy_recurrence
 from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard
@@ -32,38 +34,46 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
-    # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
-    )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-    )
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-        k=k,
-        w=w,
-        u=u,
-        g=g,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
-    o = chunk_fwd_o(
-        q=q,
-        k=k,
-        v=v_new,
-        h=h,
-        g=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-    )
+    K = k.shape[-1]
+    V = v.shape[-1]
+
+    # Fused path: squaring-trick solve + fused WY+rec + Q-cached output
+    # Falls back to separate kernels for K > 128 (unsupported by fused kernels)
+    if K <= 128:
+        A, g = fused_ckkt_solve(
+            k=k, g=g, beta=beta, cu_seqlens=cu_seqlens, output_dtype=k.dtype,
+        )
+        h, v_new, final_state = fused_wy_recurrence(
+            k=k, v=v, beta=beta, A_inv=A, g_cumsum=g,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+        w = None
+        o = chunk_fwd_o_qcached(
+            q=q, k=k, v=v_new, h=h, g=g, scale=scale, cu_seqlens=cu_seqlens,
+        ) if V <= 256 else chunk_fwd_o(
+            q=q, k=k, v=v_new, h=h, g=g, scale=scale, cu_seqlens=cu_seqlens,
+        )
+    else:
+        g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+        A = chunk_scaled_dot_kkt_fwd(
+            k=k, beta=beta, g=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
+        )
+        A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+        w, u = recompute_w_u_fwd(
+            k=k, v=v, beta=beta, A=A, g_cumsum=g, cu_seqlens=cu_seqlens,
+        )
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+            k=k, w=w, u=u, g=g,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+        o = chunk_fwd_o(
+            q=q, k=k, v=v_new, h=h, g=g, scale=scale, cu_seqlens=cu_seqlens,
+        )
+
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
     elif SUPPRESS_LEVEL >= 3:
