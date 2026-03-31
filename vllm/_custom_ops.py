@@ -426,6 +426,11 @@ def fused_qk_norm_rope(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
     position_ids: torch.Tensor,
+    mrope_section_t: int = 0,
+    mrope_section_h: int = 0,
+    mrope_section_w: int = 0,
+    mrope_interleaved: bool = False,
+    forced_token_heads_per_warp: int = -1,
 ) -> None:
     torch.ops._C.fused_qk_norm_rope(
         qkv,
@@ -439,6 +444,11 @@ def fused_qk_norm_rope(
         cos_sin_cache,
         is_neox,
         position_ids,
+        mrope_section_t,
+        mrope_section_h,
+        mrope_section_w,
+        mrope_interleaved,
+        forced_token_heads_per_warp,
     )
 
 

@@ -8,6 +8,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+import vllm._custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
@@ -275,6 +276,83 @@ class Qwen3NextAttention(nn.Module):
 
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self._supports_fused_qk_norm_rope = (
+            hasattr(torch.ops, "_C")
+            and hasattr(torch.ops._C, "fused_qk_norm_rope")
+            and self.head_dim in (64, 128, 256)
+        )
+
+    def _apply_fused_qk_norm_rope(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if not self._supports_fused_qk_norm_rope:
+            return None
+        if q.ndim != 2 or k.ndim != 2 or v.ndim != 2:
+            return None
+        if not (q.is_cuda and k.is_cuda and v.is_cuda and positions.is_cuda):
+            return None
+        if positions.dtype != torch.int64 or positions.ndim not in (1, 2):
+            return None
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return None
+        if q.dtype != k.dtype or q.dtype != v.dtype:
+            return None
+
+        # Keep RoPE cache dtype/device consistent with query.
+        cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(q)
+        if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[1] % 2 != 0:
+            return None
+
+        mrope_section_t = 0
+        mrope_section_h = 0
+        mrope_section_w = 0
+        mrope_interleaved = False
+        if positions.ndim == 2:
+            mrope_section = getattr(self.rotary_emb, "mrope_section", None)
+            if mrope_section is None or len(mrope_section) != 3:
+                return None
+            mrope_section_t, mrope_section_h, mrope_section_w = (
+                int(mrope_section[0]),
+                int(mrope_section[1]),
+                int(mrope_section[2]),
+            )
+            if (
+                mrope_section_t + mrope_section_h + mrope_section_w
+                != cos_sin_cache.shape[1] // 2
+            ):
+                return None
+            mrope_interleaved = bool(
+                getattr(self.rotary_emb, "mrope_interleaved", False)
+            )
+
+        # GemmaRMSNorm uses (1 + weight) scaling.
+        q_weight = (self.q_norm.weight + 1.0).to(dtype=q.dtype)
+        k_weight = (self.k_norm.weight + 1.0).to(dtype=k.dtype)
+
+        positions = positions.contiguous()
+        qkv = torch.cat((q, k, v), dim=-1)
+        ops.fused_qk_norm_rope(
+            qkv=qkv,
+            num_heads_q=self.num_heads,
+            num_heads_k=self.num_kv_heads,
+            num_heads_v=self.num_kv_heads,
+            head_dim=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=self.rotary_emb.is_neox_style,
+            position_ids=positions,
+            mrope_section_t=mrope_section_t,
+            mrope_section_h=mrope_section_h,
+            mrope_section_w=mrope_section_w,
+            mrope_interleaved=mrope_interleaved,
+        )
+        return qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
     def forward(
         self,
@@ -296,14 +374,17 @@ class Qwen3NextAttention(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-            -1, self.num_heads * self.head_dim
-        )
-        k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-            -1, self.num_kv_heads * self.head_dim
-        )
-
-        q, k = self.rotary_emb(positions, q, k)
+        fused_qkv = self._apply_fused_qk_norm_rope(positions, q, k, v)
+        if fused_qkv is not None:
+            q, k, v = fused_qkv
+        else:
+            q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
+                -1, self.num_heads * self.head_dim
+            )
+            k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
+                -1, self.num_kv_heads * self.head_dim
+            )
+            q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
 
