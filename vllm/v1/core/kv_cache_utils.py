@@ -124,6 +124,10 @@ class KVCacheBlock:
     # The hash key (block hash + group id) of the block, only available
     # when the block is full and cached.
     _block_hash: BlockHashWithGroupId | None = None
+    # Number of prefix tokens covered by _block_hash. For full blocks this is
+    # the block boundary, while partial Mamba-align entries can end at a finer
+    # hash-block boundary inside a physical block.
+    _block_hash_num_tokens: int | None = None
 
     # Used to construct a doubly linked list for free blocks.
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
@@ -144,9 +148,25 @@ class KVCacheBlock:
         )
         self._block_hash = block_hash
 
+    @property
+    def block_hash_num_tokens(self) -> int | None:
+        return self._block_hash_num_tokens
+
+    def set_block_hash(
+        self,
+        block_hash: BlockHashWithGroupId,
+        num_tokens: int | None = None,
+    ) -> None:
+        assert self.block_hash is None, (
+            "The block already has a hash. This should not happen."
+        )
+        self._block_hash = block_hash
+        self._block_hash_num_tokens = num_tokens
+
     def reset_hash(self):
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
+        self._block_hash_num_tokens = None
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
@@ -157,9 +177,22 @@ class KVCacheBlock:
             f"KVCacheBlock(block_id={self.block_id}, "
             f"ref_cnt={self.ref_cnt}, "
             f"_block_hash={self._block_hash!r}, "
+            f"_block_hash_num_tokens={self._block_hash_num_tokens}, "
             f"prev_free_block={prev_block_id}, "
             f"next_free_block={next_block_id})"
         )
+
+
+class KVCacheBlockListWithHitLength(list[KVCacheBlock]):
+    """A block list carrying the exact token length it represents."""
+
+    def __init__(
+        self,
+        blocks: Sequence[KVCacheBlock] = (),
+        hit_length: int | None = None,
+    ) -> None:
+        super().__init__(blocks)
+        self.hit_length = hit_length
 
 
 class FreeKVCacheBlockQueue:

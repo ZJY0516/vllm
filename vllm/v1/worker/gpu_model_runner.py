@@ -219,6 +219,7 @@ from .utils import (
     KVBlockZeroer,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
+    copy_kv_cache_blocks_inplace,
     prepare_kernel_block_sizes,
     sanity_check_mm_encoder_outputs,
 )
@@ -1152,6 +1153,14 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        if scheduler_output.copy_block_ids:
+            copy_kv_cache_blocks_inplace(
+                self.kv_caches_dict,
+                self.attn_groups,
+                self._kernel_block_sizes,
+                self.cache_config.cache_dtype,
+                scheduler_output.copy_block_ids,
+            )
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -6912,11 +6921,18 @@ class GPUModelRunner(
                 max_model_len, block_size * get_total_cp_world_size()
             )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
+                extra_align_block = (
+                    1
+                    if self.cache_config.enable_prefix_caching
+                    and kv_cache_group.kv_cache_spec.mamba_cache_mode == "align"
+                    else 0
+                )
                 max_num_blocks_per_req = (
                     max_num_blocks_per_req
                     if self.cache_config.enable_prefix_caching
                     else 1
                 ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+                max_num_blocks_per_req += extra_align_block
             max_num_blocks.append(max_num_blocks_per_req)
 
         if (
@@ -7274,6 +7290,7 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        self.kv_caches_dict = kv_caches
 
         if (
             self.speculative_config

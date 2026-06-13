@@ -239,6 +239,9 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+    # CoW copies to apply after zeroing new blocks and before forward.
+    # Each tuple is (kv_cache_group_id, src_block_id, dst_block_id, num_tokens).
+    copy_block_ids: list[tuple[int, int, int, int]] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

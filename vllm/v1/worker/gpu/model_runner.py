@@ -108,7 +108,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer
+from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 logger = init_logger(__name__)
 
@@ -426,9 +426,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
             if isinstance(spec, MambaSpec):
+                extra_align_block = (
+                    1
+                    if self.cache_config.enable_prefix_caching
+                    and spec.mamba_cache_mode == "align"
+                    else 0
+                )
                 max_num_blocks = (
-                    max_num_blocks if self.cache_config.enable_prefix_caching else 1
-                ) + spec.num_speculative_blocks
+                    (max_num_blocks if self.cache_config.enable_prefix_caching else 1)
+                    + spec.num_speculative_blocks
+                    + extra_align_block
+                )
             max_num_blocks_per_group.append(max_num_blocks)
 
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
@@ -483,6 +491,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
         )
+        self.kv_caches_dict = kv_caches_dict
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -823,6 +832,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+
+        if scheduler_output.copy_block_ids:
+            copy_kv_cache_blocks_inplace(
+                self.kv_caches_dict,
+                self.attn_groups,
+                self.kernel_block_sizes,
+                self.cache_config.cache_dtype,
+                scheduler_output.copy_block_ids,
+            )
 
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor

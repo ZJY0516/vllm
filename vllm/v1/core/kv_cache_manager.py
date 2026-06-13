@@ -596,6 +596,13 @@ class KVCacheManager:
             ids.extend(mgr.take_new_block_ids())
         return ids
 
+    def take_copy_block_ids(self) -> list[tuple[int, int, int, int]]:
+        """Drain and return pending KV copies as (group, src, dst, tokens)."""
+        ids: list[tuple[int, int, int, int]] = []
+        for mgr in self.coordinator.single_type_managers:
+            ids.extend(mgr.take_copy_block_ids())
+        return ids
+
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         self.coordinator.new_step_starts()
