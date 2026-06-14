@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -799,28 +798,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         if self.block_size == self.block_pool.hash_block_size:
             return
-        if os.getenv("VLLM_MAMBA_CHECKPOINT_METADATA_SPLIT") == "1":
-            self._cache_final_prompt_hash_tail_only(request, num_tokens)
-            return
-
-        request_id = request.request_id
-        num_cached_hash_blocks = self.num_cached_hash_block.get(request_id, 0)
-        num_hash_blocks = num_tokens // self.block_pool.hash_block_size
-        blocks = self.req_to_blocks[request_id]
-        for hash_idx in range(num_cached_hash_blocks, num_hash_blocks):
-            boundary_tokens = (hash_idx + 1) * self.block_pool.hash_block_size
-            if boundary_tokens % self.block_size == 0:
-                continue
-            block_idx = boundary_tokens // self.block_size
-            if block_idx >= len(blocks):
-                break
-            self.block_pool.cache_block_alias(
-                request=request,
-                block=blocks[block_idx],
-                num_tokens=boundary_tokens,
-                kv_cache_group_id=self.kv_cache_group_id,
-            )
-        self.num_cached_hash_block[request_id] = num_hash_blocks
+        self._cache_final_prompt_hash_tail_only(request, num_tokens)
 
     def _cache_final_prompt_hash_tail_only(
         self,
@@ -1723,8 +1701,6 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
     ) -> BlockHashWithGroupId | None:
-        if os.getenv("VLLM_MAMBA_CHECKPOINT_METADATA_SPLIT") != "1":
-            return None
         if self.block_size == self.block_pool.hash_block_size:
             return None
         if num_tokens != request.num_prompt_tokens:

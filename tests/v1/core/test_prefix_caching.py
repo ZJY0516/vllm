@@ -3308,8 +3308,7 @@ def test_hybrid_mamba_align_caches_chunk_end_and_final_hash_tail():
     assert len(mamba_manager._delayed_snapshot_blocks) == 1
 
 
-def test_hybrid_mamba_align_metadata_checkpoint_snapshot(monkeypatch):
-    monkeypatch.setenv("VLLM_MAMBA_CHECKPOINT_METADATA_SPLIT", "1")
+def test_hybrid_mamba_align_metadata_checkpoint_snapshot():
     hash_block_size = 2
     mamba_block_size = 2 * hash_block_size
     kv_cache_config = KVCacheConfig(
@@ -3366,8 +3365,7 @@ def test_hybrid_mamba_align_metadata_checkpoint_snapshot(monkeypatch):
     assert cached[0].block_id == checkpoint_block_id
 
 
-def test_hybrid_metadata_split_caches_only_prompt_tail_boundary(monkeypatch):
-    monkeypatch.setenv("VLLM_MAMBA_CHECKPOINT_METADATA_SPLIT", "1")
+def test_hybrid_metadata_split_caches_only_prompt_tail_boundary():
     hash_block_size = 2
     physical_block_size = 2 * hash_block_size
     kv_cache_config = KVCacheConfig(

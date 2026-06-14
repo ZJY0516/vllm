@@ -4,7 +4,6 @@
 import functools
 import gc
 import itertools
-import os
 import threading
 import time
 from collections import defaultdict
@@ -2308,8 +2307,7 @@ class GPUModelRunner(
         mamba_checkpoint_state_indices_by_group_cpu = None
         hash_block_size = self.cache_config.hash_block_size
         if (
-            os.getenv("VLLM_MAMBA_CHECKPOINT_METADATA_SPLIT") == "1"
-            and self.cache_config.mamba_cache_mode == "align"
+            self.cache_config.mamba_cache_mode == "align"
             and hash_block_size is not None
             and hash_block_size < self.cache_config.block_size
             and num_scheduled_tokens is not None
