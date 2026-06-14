@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     KVCacheBlock,
+    KVCacheBlockListWithHitLength,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -328,6 +329,15 @@ class KVCacheCoordinator(ABC):
         """Called when a new step is started."""
         for manager in self.single_type_managers:
             manager.new_step_starts()
+
+    def take_mamba_checkpoint_block_ids(self) -> dict[int, dict[str, int]]:
+        """Drain pending Mamba checkpoint block IDs by group and request ID."""
+        ids_by_group: dict[int, dict[str, int]] = {}
+        for group_id, manager in enumerate(self.single_type_managers):
+            ids = manager.take_mamba_checkpoint_block_ids()
+            if ids:
+                ids_by_group[group_id] = ids
+        return ids_by_group
 
 
 class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
@@ -715,6 +725,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for group_id in first_group.group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
+                    if isinstance(blks, KVCacheBlockListWithHitLength):
+                        blks.hit_length = hit_length
 
         # Uncached shared prefix detection: If any attn. group cached a longer prefix
         # than the current prefix, it is an uncached common prefix across requests:

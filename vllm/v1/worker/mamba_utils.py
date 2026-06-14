@@ -202,6 +202,13 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
     batch_memcpy_kernel[grid](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=BLOCK_SIZE)
 
 
+def warmup_batch_memcpy_kernel(device: torch.device) -> None:
+    src_ptrs = torch.zeros(1, dtype=torch.int64, device=device)
+    dst_ptrs = torch.zeros(1, dtype=torch.int64, device=device)
+    sizes = torch.zeros(1, dtype=torch.int32, device=device)
+    batch_memcpy(src_ptrs, dst_ptrs, sizes)
+
+
 def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:
     mamba_group_ids: list[int] = []
     mamba_specs: list[MambaSpec] = []
@@ -551,6 +558,7 @@ class MambaBuffers:
         device: torch.device,
         with_postprocess_align: bool,
     ) -> "MambaBuffers":
+        warmup_batch_memcpy_kernel(device)
         return cls(
             preprocess=MambaCopyBuffers.create(
                 max_num_reqs, kv_cache_config, copy_funcs, make_buffer

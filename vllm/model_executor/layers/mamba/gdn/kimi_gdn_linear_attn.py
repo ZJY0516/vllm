@@ -318,42 +318,24 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
         )
         if attn_metadata_narrowed.num_prefills > 0:
-            q_proj_states = q_proj_states.transpose(0, 1)
-            k_proj_states = k_proj_states.transpose(0, 1)
-            v_proj_states = v_proj_states.transpose(0, 1)
-            q = causal_conv1d_fn(
-                q_proj_states,
-                q_conv_weights,
-                self.q_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_q,
+            assert non_spec_state_indices_tensor is not None
+            assert has_initial_state is not None
+            q, k, v = self._causal_conv1d_prefill_with_optional_checkpoint(
+                q_proj_states=q_proj_states,
+                k_proj_states=k_proj_states,
+                v_proj_states=v_proj_states,
+                q_conv_weights=q_conv_weights,
+                k_conv_weights=k_conv_weights,
+                v_conv_weights=v_conv_weights,
+                conv_state_q=conv_state_q,
+                conv_state_k=conv_state_k,
+                conv_state_v=conv_state_v,
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
-            k = causal_conv1d_fn(
-                k_proj_states,
-                k_conv_weights,
-                self.k_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_k,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
-            v = causal_conv1d_fn(
-                v_proj_states,
-                v_conv_weights,
-                self.v_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_v,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata_narrowed,
-            ).transpose(0, 1)
+                attn_metadata=attn_metadata_narrowed,
+                num_actual_tokens=num_actual_tokens,
+            )
         else:
             assert non_spec_state_indices_tensor is not None
             decode_conv_indices = non_spec_state_indices_tensor[
@@ -397,21 +379,24 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             zero_idx = non_spec_state_indices_tensor[~has_initial_state]
             recurrent_state[zero_idx] = 0
             initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = chunk_kda_with_fused_gate(
-                q=q,
-                k=k,
-                v=v,
-                raw_g=g1,
-                beta=beta,
-                A_log=self.A_log,
-                g_bias=self.dt_bias,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=non_spec_query_start_loc,
+            core_attn_out_non_spec, last_recurrent_state = (
+                self._chunk_kda_prefill_with_optional_internal_split(
+                    q=q,
+                    k=k,
+                    v=v,
+                    raw_g=g1,
+                    beta=beta,
+                    initial_state=initial_state,
+                    cu_seqlens=non_spec_query_start_loc,
+                    attn_metadata=attn_metadata_narrowed,
+                    split_query_start_loc=(
+                        attn_metadata_narrowed.prefill_checkpoint_split_query_start_loc
+                    ),
+                    tail_query_start_loc=(
+                        attn_metadata_narrowed.prefill_checkpoint_tail_query_start_loc
+                    ),
+                    recurrent_state=recurrent_state,
+                )
             )
             # Init cache
             recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
@@ -442,3 +427,182 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
             0, :num_actual_tokens
         ]
+
+    def _chunk_kda_prefill_with_optional_internal_split(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        raw_g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        split_query_start_loc: torch.Tensor | None,
+        tail_query_start_loc: torch.Tensor | None,
+        recurrent_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        split_pos, checkpoint_state_idx = attn_metadata.get_prefill_checkpoint()
+        if (
+            split_pos <= 0
+            or initial_state.shape[0] != 1
+            or checkpoint_state_idx is None
+        ):
+            return chunk_kda_with_fused_gate(
+                q=q,
+                k=k,
+                v=v,
+                raw_g=raw_g,
+                beta=beta,
+                A_log=self.A_log,
+                g_bias=self.dt_bias,
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+            )
+
+        assert split_query_start_loc is not None
+        assert tail_query_start_loc is not None
+        first_out, split_state = chunk_kda_with_fused_gate(
+            q=q[:, :split_pos],
+            k=k[:, :split_pos],
+            v=v[:, :split_pos],
+            raw_g=raw_g[:, :split_pos],
+            beta=beta[:, :split_pos],
+            A_log=self.A_log,
+            g_bias=self.dt_bias,
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=split_query_start_loc,
+        )
+        checkpoint_state = split_state
+        if checkpoint_state.dtype != recurrent_state.dtype:
+            checkpoint_state = checkpoint_state.to(recurrent_state.dtype)
+        recurrent_state[checkpoint_state_idx] = checkpoint_state
+        second_out, last_recurrent_state = chunk_kda_with_fused_gate(
+            q=q[:, split_pos:],
+            k=k[:, split_pos:],
+            v=v[:, split_pos:],
+            raw_g=raw_g[:, split_pos:],
+            beta=beta[:, split_pos:],
+            A_log=self.A_log,
+            g_bias=self.dt_bias,
+            initial_state=split_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=tail_query_start_loc,
+        )
+        output = torch.empty_like(q)
+        output[:, :split_pos] = first_out
+        output[:, split_pos:] = second_out
+        return output, last_recurrent_state
+
+    def _causal_conv1d_prefill_with_optional_checkpoint(
+        self,
+        *,
+        q_proj_states: torch.Tensor,
+        k_proj_states: torch.Tensor,
+        v_proj_states: torch.Tensor,
+        q_conv_weights: torch.Tensor,
+        k_conv_weights: torch.Tensor,
+        v_conv_weights: torch.Tensor,
+        conv_state_q: torch.Tensor,
+        conv_state_k: torch.Tensor,
+        conv_state_v: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor | None,
+        attn_metadata: GDNAttentionMetadata,
+        num_actual_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        split_pos, checkpoint_state_idx = attn_metadata.get_prefill_checkpoint()
+        if (
+            split_pos <= 0
+            or checkpoint_state_idx is None
+            or cache_indices.numel() != 1
+            or query_start_loc is None
+        ):
+            q_proj_states = q_proj_states.transpose(0, 1)
+            k_proj_states = k_proj_states.transpose(0, 1)
+            v_proj_states = v_proj_states.transpose(0, 1)
+            q = causal_conv1d_fn(
+                q_proj_states,
+                q_conv_weights,
+                self.q_conv1d.bias,
+                activation="silu",
+                conv_states=conv_state_q,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                metadata=attn_metadata,
+            ).transpose(0, 1)
+            k = causal_conv1d_fn(
+                k_proj_states,
+                k_conv_weights,
+                self.k_conv1d.bias,
+                activation="silu",
+                conv_states=conv_state_k,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                metadata=attn_metadata,
+            ).transpose(0, 1)
+            v = causal_conv1d_fn(
+                v_proj_states,
+                v_conv_weights,
+                self.v_conv1d.bias,
+                activation="silu",
+                conv_states=conv_state_v,
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                metadata=attn_metadata,
+            ).transpose(0, 1)
+            return q, k, v
+
+        split_query_start_loc = attn_metadata.prefill_checkpoint_split_query_start_loc
+        tail_query_start_loc = attn_metadata.prefill_checkpoint_tail_query_start_loc
+        tail_has_initial_state = attn_metadata.prefill_checkpoint_tail_has_initial_state
+        assert split_query_start_loc is not None
+        assert tail_query_start_loc is not None
+        assert tail_has_initial_state is not None
+
+        outputs: list[torch.Tensor] = []
+        for proj_states, conv_weights, bias, conv_state in (
+            (q_proj_states, q_conv_weights, self.q_conv1d.bias, conv_state_q),
+            (k_proj_states, k_conv_weights, self.k_conv1d.bias, conv_state_k),
+            (v_proj_states, v_conv_weights, self.v_conv1d.bias, conv_state_v),
+        ):
+            conv_state[checkpoint_state_idx] = conv_state[cache_indices]
+            first = causal_conv1d_fn(
+                proj_states[:split_pos].transpose(0, 1),
+                conv_weights,
+                bias,
+                activation="silu",
+                conv_states=conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=checkpoint_state_idx,
+                query_start_loc=split_query_start_loc,
+                metadata=None,
+            ).transpose(0, 1)
+            conv_state[cache_indices] = conv_state[checkpoint_state_idx]
+            second = causal_conv1d_fn(
+                proj_states[split_pos:].transpose(0, 1),
+                conv_weights,
+                bias,
+                activation="silu",
+                conv_states=conv_state,
+                has_initial_state=tail_has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=tail_query_start_loc,
+                metadata=None,
+            ).transpose(0, 1)
+            output = torch.empty_like(proj_states)
+            output[:split_pos] = first
+            output[split_pos:] = second
+            outputs.append(output)
+
+        return outputs[0], outputs[1], outputs[2]

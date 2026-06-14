@@ -10,7 +10,6 @@ from typing import Any
 import torch
 
 from vllm.config import CacheConfig, VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import extract_layer_index
@@ -34,8 +33,6 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
-
-logger = init_logger(__name__)
 
 
 @triton.jit
@@ -572,22 +569,26 @@ def copy_kv_cache_blocks_inplace(
                 for src_block_id, dst_block_id, num_tokens in group_copies:
                     if copy_full_blocks:
                         num_tokens = kv_cache_spec.block_size
-                    for offset in range(blocks_per_kv_block):
-                        tokens_to_copy = min(
-                            kernel_block_size,
-                            num_tokens - offset * kernel_block_size,
+                    num_tokens = min(num_tokens, kv_cache_spec.block_size)
+                    num_full_kernel_blocks, partial_tokens = divmod(
+                        num_tokens, kernel_block_size
+                    )
+                    src_start = src_block_id * blocks_per_kv_block
+                    dst_start = dst_block_id * blocks_per_kv_block
+                    if num_full_kernel_blocks > 0:
+                        src_blocks = kv_cache.narrow(
+                            block_dim, src_start, num_full_kernel_blocks
                         )
-                        if tokens_to_copy <= 0:
-                            break
-                        src = src_block_id * blocks_per_kv_block + offset
-                        dst = dst_block_id * blocks_per_kv_block + offset
-                        src_block = kv_cache.select(block_dim, src)
-                        dst_block = kv_cache.select(block_dim, dst)
-                        if tokens_to_copy == kernel_block_size:
-                            dst_block.copy_(src_block, non_blocking=True)
-                            continue
-                        dst_block.narrow(token_dim, 0, tokens_to_copy).copy_(
-                            src_block.narrow(token_dim, 0, tokens_to_copy),
+                        dst_blocks = kv_cache.narrow(
+                            block_dim, dst_start, num_full_kernel_blocks
+                        )
+                        dst_blocks.copy_(src_blocks, non_blocking=True)
+                    if partial_tokens > 0:
+                        offset = num_full_kernel_blocks
+                        src_block = kv_cache.select(block_dim, src_start + offset)
+                        dst_block = kv_cache.select(block_dim, dst_start + offset)
+                        dst_block.narrow(token_dim, 0, partial_tokens).copy_(
+                            src_block.narrow(token_dim, 0, partial_tokens),
                             non_blocking=True,
                         )
         elif isinstance(kv_cache_spec, MambaSpec):

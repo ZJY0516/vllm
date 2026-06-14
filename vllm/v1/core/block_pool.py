@@ -353,11 +353,46 @@ class BlockPool:
         block_hash_with_group_id = make_block_hash_with_group_id(
             block_hash, kv_cache_group_id
         )
+        existing = self.cached_block_hash_to_block.get_one_block(
+            block_hash_with_group_id
+        )
+        already_cached = block.block_hash == block_hash_with_group_id or (
+            existing is not None and existing.block_id == block.block_id
+        )
         self._insert_block_hash(
             block_hash_with_group_id,
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+        if self.enable_kv_cache_events and not already_cached:
+            parent_block_hash: ExternalBlockHash | None = None
+            if num_hash_blocks > 1:
+                parent_block_hash = maybe_convert_block_hash(
+                    request.block_hashes[num_hash_blocks - 2]
+                )
+
+            block_start = (num_hash_blocks - 1) * self.hash_block_size
+            block_end = num_hash_blocks * self.hash_block_size
+            extra_keys, _ = generate_block_hash_extra_keys(
+                request, block_start, block_end, 0
+            )
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[maybe_convert_block_hash(block_hash)],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=request.all_token_ids[block_start:block_end],
+                    block_size=self.hash_block_size,
+                    lora_id=request.lora_request.adapter_id
+                    if request.lora_request
+                    else None,
+                    medium=MEDIUM_GPU,
+                    lora_name=request.lora_request.name
+                    if request.lora_request
+                    else None,
+                    extra_keys=[extra_keys],
+                    group_idx=kv_cache_group_id,
+                )
+            )
         return block_hash_with_group_id
 
     def _insert_block_hash(

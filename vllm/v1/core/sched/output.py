@@ -242,6 +242,9 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     # Each tuple is (kv_cache_group_id, src_block_id, dst_block_id, num_tokens).
     copy_block_ids: list[tuple[int, int, int, int]] | None = None
+    # Mamba checkpoint snapshot blocks materialized inside a scheduled chunk.
+    # Mapping: kv_cache_group_id -> request_id -> snapshot block_id.
+    mamba_checkpoint_block_ids: dict[int, dict[str, int]] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

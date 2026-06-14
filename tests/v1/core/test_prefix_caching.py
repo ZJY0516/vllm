@@ -25,6 +25,7 @@ from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager, Request
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
     get_block_hash,
@@ -35,6 +36,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -1068,7 +1070,11 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
     # Next, validate scheduler logic for num_uncached_common_prefix_tokens > 0
     # Create minimal mock with just the needed attributes
     mock = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=block_size), use_eagle=False
+        cache_config=SimpleNamespace(block_size=block_size),
+        kv_cache_manager=SimpleNamespace(
+            block_pool=SimpleNamespace(hash_block_size=block_size)
+        ),
+        use_eagle=False,
     )
     num_new_tokens_adjusted = Scheduler._mamba_block_aligned_split(
         self=mock,
@@ -1083,6 +1089,41 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
     manager.free(req_0)
     manager.free(req_1)
     manager.free(req_2)
+
+
+def test_mamba_align_split_uses_physical_chunks_then_hash_tail():
+    hash_block_size = 2
+    mamba_block_size = 4 * hash_block_size
+    req = make_request("0", list(range(15)), hash_block_size, sha256)
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=mamba_block_size),
+        kv_cache_manager=SimpleNamespace(
+            block_pool=SimpleNamespace(hash_block_size=hash_block_size)
+        ),
+        use_eagle=False,
+    )
+
+    num_new_tokens = Scheduler._mamba_block_aligned_split(
+        self=mock,
+        request=req,
+        num_new_tokens=10,
+    )
+    assert num_new_tokens == mamba_block_size
+
+    num_new_tokens = Scheduler._mamba_block_aligned_split(
+        self=mock,
+        request=req,
+        num_new_tokens=15,
+    )
+    assert num_new_tokens == 14
+
+    req.num_computed_tokens = mamba_block_size
+    num_new_tokens = Scheduler._mamba_block_aligned_split(
+        self=mock,
+        request=req,
+        num_new_tokens=7,
+    )
+    assert num_new_tokens == 6
 
 
 def test_hybrid_model_mamba_align_with_dynamic_draft_tokens():
@@ -2399,6 +2440,65 @@ def test_block_stored_event_group_idx_out_of_bounds(monkeypatch):
     assert warnings == ["Group index `1` not in KV cache metadata"]
 
 
+def test_cache_block_alias_kv_cache_events():
+    hash_block_size = 4
+    kv_cache_group_id = 2
+
+    pool = BlockPool(
+        num_gpu_blocks=2,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        enable_kv_cache_events=True,
+    )
+    req = make_request(
+        "req_alias_events",
+        prompt_token_ids=list(range(hash_block_size * 2)),
+        block_size=hash_block_size,
+        hash_fn=sha256,
+    )
+
+    block = pool.get_new_blocks(1)[0]
+    alias_hash = pool.cache_block_alias(
+        request=req,
+        block=block,
+        num_tokens=hash_block_size * 2,
+        kv_cache_group_id=kv_cache_group_id,
+    )
+
+    events = pool.take_events()
+    assert len(events) == 1
+    stored_event = events[0]
+    assert isinstance(stored_event, BlockStored)
+    assert alias_hash is not None
+    assert stored_event.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(req.block_hashes[1])
+    ]
+    assert stored_event.parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
+        req.block_hashes[0]
+    )
+    assert stored_event.token_ids == req.all_token_ids[hash_block_size:]
+    assert stored_event.block_size == hash_block_size
+    assert stored_event.group_idx == kv_cache_group_id
+
+    duplicate_alias_hash = pool.cache_block_alias(
+        request=req,
+        block=block,
+        num_tokens=hash_block_size * 2,
+        kv_cache_group_id=kv_cache_group_id,
+    )
+    assert duplicate_alias_hash == alias_hash
+    assert pool.take_events() == []
+
+    pool.free_blocks([block])
+    pool.get_new_blocks(1)
+    events = pool.take_events()
+    assert len(events) == 1
+    removed_event = events[0]
+    assert isinstance(removed_event, BlockRemoved)
+    assert removed_event.block_hashes == stored_event.block_hashes
+    assert removed_event.group_idx == kv_cache_group_id
+
+
 @pytest.mark.parametrize("group_id", [0, 1, 2])
 def test_block_removed_event_group_idx(group_id: int):
     """
@@ -3052,6 +3152,316 @@ def test_hybrid_mamba_align_partial_hash_hit():
     mamba_new_block_ids = new_blocks.get_block_ids()[1]
     assert len(mamba_new_block_ids) == 1
     assert mamba_new_block_ids[0] != partial_mamba_block[0].block_id
+    assert manager.get_blocks("1").get_block_ids()[1][1] == mamba_new_block_ids[0]
+    assert (
+        1,
+        partial_mamba_block[0].block_id,
+        mamba_new_block_ids[0],
+        mamba_block_size,
+    ) in manager.take_copy_block_ids()
+    assert manager.get_blocks("1").blocks[1][1].block_hash_num_tokens == 8
+
+
+def test_hybrid_mamba_align_partial_hash_hit_crosses_state_block():
+    hash_block_size = 2
+    mamba_block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=40,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, sha256)
+    computed_blocks, num_computed = manager.get_computed_blocks(req0)
+    assert num_computed == 0
+    blocks = manager.allocate_slots(req0, 6, num_computed, computed_blocks)
+    assert blocks is not None
+    manager.free(req0)
+    manager.new_step_starts()
+
+    partial_mamba_block = manager.block_pool.get_cached_block(
+        req0.block_hashes[2], kv_cache_group_ids=[1]
+    )
+    assert partial_mamba_block is not None
+
+    req1 = make_request(
+        "1",
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+        hash_block_size,
+        sha256,
+    )
+    computed_blocks, num_computed = manager.get_computed_blocks(req1)
+    assert num_computed == 6
+
+    new_blocks = manager.allocate_slots(req1, 6, num_computed, computed_blocks)
+    assert new_blocks is not None
+    mamba_new_block_ids = new_blocks.get_block_ids()[1]
+    assert len(mamba_new_block_ids) == 2
+
+    mamba_block_ids = manager.get_blocks("1").get_block_ids()[1]
+    assert mamba_block_ids[1] == mamba_new_block_ids[0]
+    assert mamba_block_ids[2] == mamba_new_block_ids[1]
+    assert (
+        1,
+        partial_mamba_block[0].block_id,
+        mamba_new_block_ids[0],
+        mamba_block_size,
+    ) in manager.take_copy_block_ids()
+
+
+def test_hybrid_mamba_align_caches_chunk_end_and_final_hash_tail():
+    hash_block_size = 2
+    mamba_block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=40,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req = make_request(
+        "0",
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4],
+        hash_block_size,
+        sha256,
+    )
+    computed_blocks, num_computed = manager.get_computed_blocks(req)
+    assert num_computed == 0
+    blocks = manager.allocate_slots(req, 8, num_computed, computed_blocks)
+    assert blocks is not None
+
+    mamba_manager = manager.coordinator.single_type_managers[1]
+    assert isinstance(mamba_manager, MambaManager)
+    mamba_block_hashes = BlockHashListWithBlockSize(
+        req.block_hashes, hash_block_size, mamba_block_size
+    )
+    assert (
+        manager.block_pool.get_cached_block(
+            mamba_block_hashes[1], kv_cache_group_ids=[1]
+        )
+        is not None
+    )
+    assert len(mamba_manager._delayed_snapshot_blocks) == 0
+
+    # A smaller intermediate chunk can end at a hash boundary inside a physical
+    # Mamba block, such as 6 here. We should not create a public cache entry
+    # for that intermediate partial boundary.
+    assert mamba_manager._cache_partial_snapshot(req, 6) is None
+    assert len(mamba_manager._delayed_snapshot_blocks) == 0
+
+    req.num_computed_tokens = 8
+    blocks = manager.allocate_slots(req, 2, 0)
+    assert blocks is not None
+    assert (
+        manager.block_pool.get_cached_block(req.block_hashes[4], kv_cache_group_ids=[1])
+        is not None
+    )
+    assert len(mamba_manager._delayed_snapshot_blocks) == 1
+
+
+def test_hybrid_mamba_align_metadata_checkpoint_snapshot(monkeypatch):
+    monkeypatch.setenv("VLLM_MAMBA_CHECKPOINT_METADATA_SPLIT", "1")
+    hash_block_size = 2
+    mamba_block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=40,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=hash_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req = make_request(
+        "0",
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5],
+        hash_block_size,
+        sha256,
+    )
+    computed_blocks, num_computed = manager.get_computed_blocks(req)
+    assert num_computed == 0
+    blocks = manager.allocate_slots(
+        req, len(req.all_token_ids), num_computed, computed_blocks
+    )
+    assert blocks is not None
+
+    checkpoint_blocks = manager.take_mamba_checkpoint_block_ids()
+    assert set(checkpoint_blocks) == {1}
+    checkpoint_block_id = checkpoint_blocks[1]["0"]
+    cached = manager.block_pool.get_cached_block(
+        req.block_hashes[4], kv_cache_group_ids=[1]
+    )
+    assert cached is not None
+    assert cached[0].block_id == checkpoint_block_id
+
+
+def test_hybrid_metadata_split_caches_only_prompt_tail_boundary(monkeypatch):
+    monkeypatch.setenv("VLLM_MAMBA_CHECKPOINT_METADATA_SPLIT", "1")
+    hash_block_size = 2
+    physical_block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=80,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=physical_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=physical_block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req = make_request(
+        "0",
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5],
+        hash_block_size,
+        sha256,
+    )
+    computed_blocks, num_computed = manager.get_computed_blocks(req)
+    assert num_computed == 0
+    assert manager.allocate_slots(req, 8, num_computed, computed_blocks) is not None
+
+    # The first chunk caches full physical blocks at 4 and 8 tokens, but it
+    # must not create fine-grained aliases for every hash boundary inside them.
+    for hash_idx in (0, 2):
+        assert (
+            manager.block_pool.get_cached_block(
+                req.block_hashes[hash_idx], kv_cache_group_ids=[0]
+            )
+            is None
+        )
+        assert (
+            manager.block_pool.get_cached_block(
+                req.block_hashes[hash_idx], kv_cache_group_ids=[1]
+            )
+            is None
+        )
+
+    req.num_computed_tokens = 8
+    assert manager.allocate_slots(req, 3, 0) is not None
+
+    checkpoint_blocks = manager.take_mamba_checkpoint_block_ids()
+    assert set(checkpoint_blocks) == {1}
+    checkpoint_block_id = checkpoint_blocks[1]["0"]
+
+    # Only the final prompt tail boundary at 10 tokens is cached as a fine
+    # alias. Intermediate partial boundaries like 2 and 6 stay uncached.
+    for hash_idx in (0, 2):
+        assert (
+            manager.block_pool.get_cached_block(
+                req.block_hashes[hash_idx], kv_cache_group_ids=[0]
+            )
+            is None
+        )
+        assert (
+            manager.block_pool.get_cached_block(
+                req.block_hashes[hash_idx], kv_cache_group_ids=[1]
+            )
+            is None
+        )
+
+    full_tail = manager.block_pool.get_cached_block(
+        req.block_hashes[4], kv_cache_group_ids=[0]
+    )
+    assert full_tail is not None
+    assert full_tail[0].block_hash_num_tokens == 10
+
+    mamba_tail = manager.block_pool.get_cached_block(
+        req.block_hashes[4], kv_cache_group_ids=[1]
+    )
+    assert mamba_tail is not None
+    assert mamba_tail[0].block_id == checkpoint_block_id
+    assert mamba_tail[0].block_hash_num_tokens == 10
 
 
 def test_hybrid_full_attention_partial_hash_hit_uses_cow():
@@ -3116,6 +3526,90 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
         full_new_block_ids[0],
         2,
     ) in manager.take_copy_block_ids()
+
+
+def test_hybrid_partial_hash_truncates_full_attention_hit_length():
+    hash_block_size = 2
+    block_size = 2 * hash_block_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=24,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    pool = manager.block_pool
+    req = make_request(
+        "0",
+        [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+        hash_block_size,
+        sha256,
+    )
+
+    full_blocks = pool.get_new_blocks(3)
+    pool.cache_full_blocks(
+        request=req,
+        blocks=full_blocks,
+        num_cached_blocks=0,
+        num_full_blocks=2,
+        block_size=block_size,
+        kv_cache_group_id=0,
+    )
+    pool.cache_block_alias(
+        request=req,
+        block=full_blocks[2],
+        num_tokens=10,
+        kv_cache_group_id=0,
+    )
+
+    mamba_block = pool.get_new_blocks(1)[0]
+    pool.cache_block_alias(
+        request=req,
+        block=mamba_block,
+        num_tokens=6,
+        kv_cache_group_id=1,
+    )
+
+    computed_blocks, num_computed = manager.get_computed_blocks(req)
+    assert num_computed == 6
+    assert [len(group) for group in computed_blocks.blocks] == [2, 2]
+    assert computed_blocks.blocks[0].hit_length == 6
+
+    blocks = manager.allocate_slots(
+        req,
+        len(req.all_token_ids) - num_computed,
+        num_computed,
+        computed_blocks,
+    )
+    assert blocks is not None
+    copy_block_ids = manager.take_copy_block_ids()
+    assert any(
+        group_id == 0 and src == full_blocks[1].block_id and copy_tokens == 2
+        for group_id, src, _dst, copy_tokens in copy_block_ids
+    )
 
 
 def test_hybrid_local_kv_retention_interval_aligns_in_manager(monkeypatch):
