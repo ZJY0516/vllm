@@ -491,7 +491,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
         )
-        self.kv_caches_dict = kv_caches_dict
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -834,8 +833,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         if scheduler_output.copy_block_ids:
+            kv_caches = {
+                layer_name: layer.kv_cache
+                for layer_name, layer in (
+                    self.compilation_config.static_forward_context.items()
+                )
+                if hasattr(layer, "kv_cache")
+            }
             copy_kv_cache_blocks_inplace(
-                self.kv_caches_dict,
+                kv_caches,
                 self.attn_groups,
                 self.kernel_block_sizes,
                 self.cache_config.cache_dtype,
