@@ -361,17 +361,17 @@ class BlockPool:
         block: KVCacheBlock,
         num_tokens: int,
         kv_cache_group_id: int,
+        block_size: int | None = None,
     ) -> BlockHashWithGroupId | None:
         """Cache an alias for a physical block at hash-block granularity."""
-        if num_tokens % self.hash_block_size != 0:
-            return None
-        num_hash_blocks = num_tokens // self.hash_block_size
-        if num_hash_blocks == 0 or num_hash_blocks > len(request.block_hashes):
-            return None
         if block.is_null:
             return None
 
-        block_hash = request.block_hashes[num_hash_blocks - 1]
+        block_hash = self.get_block_alias_hash(request, num_tokens, block_size)
+        if block_hash is None:
+            return None
+        block_size = block_size or self.hash_block_size
+        num_hash_blocks = num_tokens // self.hash_block_size
         block_hash_with_group_id = make_block_hash_with_group_id(
             block_hash, kv_cache_group_id
         )
@@ -387,14 +387,15 @@ class BlockPool:
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
         if self.enable_kv_cache_events and not already_cached:
-            parent_block_hash: ExternalBlockHash | None = None
-            if num_hash_blocks > 1:
-                parent_block_hash = maybe_convert_block_hash(
-                    request.block_hashes[num_hash_blocks - 2]
-                )
-
-            block_start = (num_hash_blocks - 1) * self.hash_block_size
-            block_end = num_hash_blocks * self.hash_block_size
+            parent_hash, block_start = self.get_block_alias_parent_hash_and_start(
+                request, num_tokens, block_size
+            )
+            parent_block_hash = (
+                maybe_convert_block_hash(parent_hash)
+                if parent_hash is not None
+                else None
+            )
+            block_end = num_tokens
             extra_keys, _ = generate_block_hash_extra_keys(
                 request, block_start, block_end, 0
             )
@@ -403,7 +404,7 @@ class BlockPool:
                     block_hashes=[maybe_convert_block_hash(block_hash)],
                     parent_block_hash=parent_block_hash,
                     token_ids=request.all_token_ids[block_start:block_end],
-                    block_size=self.hash_block_size,
+                    block_size=block_end - block_start,
                     lora_id=request.lora_request.adapter_id
                     if request.lora_request
                     else None,
@@ -416,6 +417,52 @@ class BlockPool:
                 )
             )
         return block_hash_with_group_id
+
+    def get_block_alias_hash(
+        self,
+        request: Request,
+        num_tokens: int,
+        block_size: int | None = None,
+    ) -> BlockHash | None:
+        if num_tokens % self.hash_block_size != 0:
+            return None
+        num_hash_blocks = num_tokens // self.hash_block_size
+        if num_hash_blocks == 0 or num_hash_blocks > len(request.block_hashes):
+            return None
+
+        block_size = block_size or self.hash_block_size
+        if block_size == self.hash_block_size:
+            return request.block_hashes[num_hash_blocks - 1]
+
+        get_partial_block_hashes = getattr(
+            request.block_hashes, "get_partial_block_hashes", None
+        )
+        if get_partial_block_hashes is not None:
+            return get_partial_block_hashes(block_size)[num_hash_blocks - 1]
+        return request.block_hashes[num_hash_blocks - 1]
+
+    def get_block_alias_parent_hash_and_start(
+        self,
+        request: Request,
+        num_tokens: int,
+        block_size: int,
+    ) -> tuple[BlockHash | None, int]:
+        if block_size == self.hash_block_size:
+            num_hash_blocks = num_tokens // self.hash_block_size
+            parent_hash = (
+                request.block_hashes[num_hash_blocks - 2]
+                if num_hash_blocks > 1
+                else None
+            )
+            return parent_hash, (num_hash_blocks - 1) * self.hash_block_size
+
+        full_block_idx = num_tokens // block_size
+        block_start = full_block_idx * block_size
+        if full_block_idx == 0:
+            return None, block_start
+
+        full_block_hashes = request.block_hashes.get_block_hashes(block_size)
+        return full_block_hashes[full_block_idx - 1], block_start
 
     def _insert_block_hash(
         self,

@@ -725,6 +725,42 @@ class RequestBlockHasher:
             curr_mm_idx=0,
         )
 
+    def get_partial_block_hashes(
+        self, request: Request, block_size: int
+    ) -> list[BlockHash]:
+        if block_size == self.block_size:
+            return request.block_hashes
+
+        assert block_size % self.block_size == 0
+        full_block_hashes = self.get_block_hashes(request, block_size)
+        partial_block_hashes: list[BlockHash] = []
+
+        for hash_idx in range(len(request.block_hashes)):
+            num_tokens = (hash_idx + 1) * self.block_size
+            if num_tokens % block_size == 0:
+                full_block_idx = num_tokens // block_size - 1
+                partial_block_hashes.append(full_block_hashes[full_block_idx])
+                continue
+
+            full_block_idx = num_tokens // block_size
+            block_start = full_block_idx * block_size
+            parent_block_hash = (
+                full_block_hashes[full_block_idx - 1] if full_block_idx > 0 else None
+            )
+            extra_keys, _ = generate_block_hash_extra_keys(
+                request, block_start, num_tokens, 0
+            )
+            partial_block_hashes.append(
+                hash_block_tokens(
+                    self.caching_hash_fn,
+                    parent_block_hash,
+                    request.all_token_ids[block_start:num_tokens],
+                    extra_keys,
+                )
+            )
+
+        return partial_block_hashes
+
     def _compute_block_hashes(
         self,
         *,
@@ -2157,48 +2193,33 @@ def get_kv_cache_configs(
 
 class BlockHashListWithBlockSize:
     """
-    Pair direct full-block hashes with finer-grained hashes.
+    Pair direct full-block hashes with partial-boundary hashes.
 
     `block_hashes` are direct hashes computed at `target_block_size`.
-    `fine_block_hashes` are direct hashes computed at `hash_block_size`.
-    Full-block lookup uses `block_hashes`; partial lookup can probe
-    `fine_block_hashes` for a hash boundary inside a full cache block.
+    `partial_block_hashes` are lookup keys for hash-block boundaries. For
+    boundaries inside a target cache block, the key is computed from the
+    previous full-block key plus the current block's partial tail tokens.
+    Full-block lookup uses `block_hashes`; partial lookup probes
+    `partial_block_hashes` for a hash boundary inside a full cache block.
 
     Args:
         block_hashes: Direct block hashes computed at `target_block_size`.
-        fine_block_hashes: Direct block hashes computed at `hash_block_size`.
-        hash_block_size: Block size at which `fine_block_hashes` were computed.
+        partial_block_hashes: Partial-boundary hashes at `hash_block_size`
+            granularity.
+        hash_block_size: Block size at which `partial_block_hashes` are indexed.
         target_block_size: Block size at which `block_hashes` were computed.
     """
 
     def __init__(
         self,
         block_hashes: list[BlockHash],
-        fine_block_hashes_or_hash_block_size: list[BlockHash] | int,
-        hash_block_size_or_target_block_size: int,
-        target_block_size: int | None = None,
+        partial_block_hashes: list[BlockHash],
+        hash_block_size: int,
+        target_block_size: int,
     ):
-        if target_block_size is None:
-            # Backward-compatible path: `block_hashes` are fine-grained hashes,
-            # and full-block keys are derived by concatenating them.
-            fine_block_hashes = block_hashes
-            hash_block_size = cast(int, fine_block_hashes_or_hash_block_size)
-            target_block_size = hash_block_size_or_target_block_size
-            assert target_block_size % hash_block_size == 0
-            scale_factor = target_block_size // hash_block_size
-            self.block_hashes = [
-                BlockHash(b"".join(fine_block_hashes[i : i + scale_factor]))
-                for i in range(0, len(fine_block_hashes), scale_factor)
-                if i + scale_factor <= len(fine_block_hashes)
-            ]
-            self.fine_block_hashes = fine_block_hashes
-        else:
-            self.block_hashes = block_hashes
-            self.fine_block_hashes = cast(
-                list[BlockHash], fine_block_hashes_or_hash_block_size
-            )
-            hash_block_size = hash_block_size_or_target_block_size
         assert target_block_size % hash_block_size == 0
+        self.block_hashes = block_hashes
+        self.partial_block_hashes = partial_block_hashes
         self.scale_factor = target_block_size // hash_block_size
 
     def __len__(self) -> int:

@@ -31,20 +31,20 @@ if TYPE_CHECKING:
 
 
 class RequestBlockHashes(list["BlockHash"]):
-    """Fine-grained hashes that can compute full hashes for promotion.
+    """Fine-grained hashes with larger-block views.
 
     The list itself stores hashes at the prefix-cache hash block size. When a
     partially cached block becomes a full cache block, the cache must promote it
     to the direct full-block hash for the larger KV cache block size instead of
     concatenating fine-grained hashes. The request reference is only used to
-    recompute that direct full-block hash from the original tokens and extra
-    hash keys.
+    recompute larger-block hashes from the original tokens and extra hash keys.
     """
 
     def __init__(self, request: "Request") -> None:
         super().__init__()
         self.request_ref = weakref.ref(request)
         self._by_block_size: dict[int, list[BlockHash]] = {}
+        self._partial_by_block_size: dict[int, list[BlockHash]] = {}
 
     def get_block_hashes(self, block_size: int) -> list["BlockHash"]:
         request = self.request_ref()
@@ -56,8 +56,23 @@ class RequestBlockHashes(list["BlockHash"]):
             self._by_block_size[block_size] = get_block_hashes(request, block_size)
         return self._by_block_size[block_size]
 
+    def get_partial_block_hashes(self, block_size: int) -> list["BlockHash"]:
+        request = self.request_ref()
+        assert request is not None
+        get_partial_block_hashes = getattr(
+            request._block_hasher, "get_partial_block_hashes", None
+        )
+        if get_partial_block_hashes is None:
+            return self
+        if block_size not in self._partial_by_block_size:
+            self._partial_by_block_size[block_size] = get_partial_block_hashes(
+                request, block_size
+            )
+        return self._partial_by_block_size[block_size]
+
     def clear_cached_views(self) -> None:
         self._by_block_size.clear()
+        self._partial_by_block_size.clear()
 
 
 @dataclass

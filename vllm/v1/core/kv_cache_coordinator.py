@@ -632,12 +632,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 return block_hashes
             get_block_hashes = getattr(block_hashes, "get_block_hashes", None)
             if get_block_hashes is None:
-                return BlockHashListWithBlockSize(
-                    block_hashes, self.hash_block_size, kv_cache_spec.block_size
+                raise RuntimeError(
+                    "Direct block hashes are required when KV cache block size "
+                    "differs from hash_block_size."
                 )
+            get_partial_block_hashes = getattr(
+                block_hashes, "get_partial_block_hashes", get_block_hashes
+            )
             return BlockHashListWithBlockSize(
                 get_block_hashes(kv_cache_spec.block_size),
-                block_hashes,
+                get_partial_block_hashes(kv_cache_spec.block_size),
                 self.hash_block_size,
                 kv_cache_spec.block_size,
             )
@@ -759,12 +763,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 return block_hashes
             get_block_hashes = getattr(block_hashes, "get_block_hashes", None)
             if get_block_hashes is None:
-                return BlockHashListWithBlockSize(
-                    block_hashes, self.hash_block_size, kv_cache_spec.block_size
+                raise RuntimeError(
+                    "Direct block hashes are required when KV cache block size "
+                    "differs from hash_block_size."
                 )
+            get_partial_block_hashes = getattr(
+                block_hashes, "get_partial_block_hashes", get_block_hashes
+            )
             return BlockHashListWithBlockSize(
                 get_block_hashes(kv_cache_spec.block_size),
-                block_hashes,
+                get_partial_block_hashes(kv_cache_spec.block_size),
                 self.hash_block_size,
                 kv_cache_spec.block_size,
             )

@@ -269,11 +269,19 @@ def test_partial_block_promotes_to_direct_full_block_hash():
     assert blocks is not None
     manager.cache_blocks(req0, req0.num_tokens)
 
-    partial_hash = req0.block_hashes[2]
+    partial_hashes = req0.block_hashes.get_partial_block_hashes(block_size)
+    partial_hash = partial_hashes[2]
+    assert partial_hash != req0.block_hashes[2]
     partial_full_block = manager.block_pool.get_cached_block(
         partial_hash, kv_cache_group_ids=[0]
     )
     assert partial_full_block is not None
+    assert (
+        manager.block_pool.get_cached_block(
+            req0.block_hashes[2], kv_cache_group_ids=[0]
+        )
+        is None
+    )
 
     req0.append_output_token_ids([3, 3])
     manager.cache_blocks(req0, req0.num_tokens)
@@ -291,6 +299,10 @@ def test_partial_block_promotes_to_direct_full_block_hash():
         manager.block_pool.get_cached_block(promoted_full_hash, kv_cache_group_ids=[0])
         == partial_full_block
     )
+    assert (
+        manager.block_pool.get_cached_block(partial_hash, kv_cache_group_ids=[0])
+        is None
+    )
 
     req1 = make_request("1", [0, 0, 1, 1, 2, 2, 3, 3, 4], hash_block_size, hash_fn)
     computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
@@ -300,6 +312,65 @@ def test_partial_block_promotes_to_direct_full_block_hash():
         req0_blocks[1].block_id,
     ]
     assert num_computed_tokens == 2 * block_size
+
+
+def test_partial_tail_hash_uses_previous_full_block_parent():
+    hash_block_size = 2
+    block_size = 6
+    token_ids = [0, 0, 1, 1, 2, 2, 3, 3, 4, 4]
+    req = make_request("0", token_ids, hash_block_size, sha256)
+
+    full_hashes = req.block_hashes.get_block_hashes(block_size)
+    partial_hashes = req.block_hashes.get_partial_block_hashes(block_size)
+
+    assert partial_hashes[2] == full_hashes[0]
+    assert partial_hashes[3] == hash_block_tokens(
+        sha256,
+        full_hashes[0],
+        token_ids[block_size : block_size + hash_block_size],
+    )
+    assert partial_hashes[4] == hash_block_tokens(
+        sha256,
+        full_hashes[0],
+        token_ids[block_size : block_size + 2 * hash_block_size],
+    )
+    assert partial_hashes[4] != hash_block_tokens(
+        sha256,
+        partial_hashes[3],
+        token_ids[block_size + hash_block_size : block_size + 2 * hash_block_size],
+    )
+
+    pool = BlockPool(
+        num_gpu_blocks=2,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        enable_kv_cache_events=True,
+    )
+    block = pool.get_new_blocks(1)[0]
+    alias_hash = pool.cache_block_alias(
+        request=req,
+        block=block,
+        num_tokens=len(token_ids),
+        kv_cache_group_id=0,
+        block_size=block_size,
+    )
+    assert alias_hash is not None
+    assert get_block_hash(alias_hash) == partial_hashes[4]
+    assert pool.get_cached_block(partial_hashes[4], kv_cache_group_ids=[0]) == [block]
+    assert pool.get_cached_block(req.block_hashes[4], kv_cache_group_ids=[0]) is None
+
+    events = pool.take_events()
+    assert len(events) == 1
+    stored_event = events[0]
+    assert isinstance(stored_event, BlockStored)
+    assert stored_event.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(partial_hashes[4])
+    ]
+    assert stored_event.parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
+        full_hashes[0]
+    )
+    assert stored_event.token_ids == token_ids[block_size:]
+    assert stored_event.block_size == len(token_ids) - block_size
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -3213,8 +3284,9 @@ def test_hybrid_mamba_align_partial_hash_hit():
 
     # The Mamba group cannot form a full 4-token block for tokens [4, 6), but
     # it should still be registered under the chained hash for that boundary.
+    partial_mamba_hash = req0.block_hashes.get_partial_block_hashes(mamba_block_size)[2]
     partial_mamba_block = manager.block_pool.get_cached_block(
-        req0.block_hashes[2], kv_cache_group_ids=[1]
+        partial_mamba_hash, kv_cache_group_ids=[1]
     )
     assert partial_mamba_block is not None
     assert partial_mamba_block[0].block_hash_num_tokens == 6
@@ -3283,8 +3355,9 @@ def test_hybrid_mamba_align_partial_hash_hit_crosses_state_block():
     manager.free(req0)
     manager.new_step_starts()
 
+    partial_mamba_hash = req0.block_hashes.get_partial_block_hashes(mamba_block_size)[2]
     partial_mamba_block = manager.block_pool.get_cached_block(
-        req0.block_hashes[2], kv_cache_group_ids=[1]
+        partial_mamba_hash, kv_cache_group_ids=[1]
     )
     assert partial_mamba_block is not None
 
@@ -3378,9 +3451,9 @@ def test_hybrid_mamba_align_caches_chunk_end_and_final_hash_tail():
     req.num_computed_tokens = 8
     blocks = manager.allocate_slots(req, 2, 0)
     assert blocks is not None
-    assert (
-        manager.block_pool.get_cached_block(req.block_hashes[4], kv_cache_group_ids=[1])
-        is not None
+    partial_mamba_hash = req.block_hashes.get_partial_block_hashes(mamba_block_size)[4]
+    assert manager.block_pool.get_cached_block(
+        partial_mamba_hash, kv_cache_group_ids=[1]
     )
     assert len(mamba_manager._delayed_snapshot_blocks) == 1
 
@@ -3435,8 +3508,9 @@ def test_hybrid_mamba_align_metadata_checkpoint_snapshot():
     checkpoint_blocks = manager.take_mamba_checkpoint_block_ids()
     assert set(checkpoint_blocks) == {1}
     checkpoint_block_id = checkpoint_blocks[1]["0"]
+    partial_mamba_hash = req.block_hashes.get_partial_block_hashes(mamba_block_size)[4]
     cached = manager.block_pool.get_cached_block(
-        req.block_hashes[4], kv_cache_group_ids=[1]
+        partial_mamba_hash, kv_cache_group_ids=[1]
     )
     assert cached is not None
     assert cached[0].block_id == checkpoint_block_id
@@ -3525,14 +3599,15 @@ def test_hybrid_metadata_split_caches_only_prompt_tail_boundary():
             is None
         )
 
+    partial_hash = req.block_hashes.get_partial_block_hashes(physical_block_size)[4]
     full_tail = manager.block_pool.get_cached_block(
-        req.block_hashes[4], kv_cache_group_ids=[0]
+        partial_hash, kv_cache_group_ids=[0]
     )
     assert full_tail is not None
     assert full_tail[0].block_hash_num_tokens == 10
 
     mamba_tail = manager.block_pool.get_cached_block(
-        req.block_hashes[4], kv_cache_group_ids=[1]
+        partial_hash, kv_cache_group_ids=[1]
     )
     assert mamba_tail is not None
     assert mamba_tail[0].block_id == checkpoint_block_id
@@ -3580,8 +3655,9 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
     manager.free(req0)
     manager.new_step_starts()
 
+    partial_full_hash = req0.block_hashes.get_partial_block_hashes(block_size)[2]
     partial_full_block = manager.block_pool.get_cached_block(
-        req0.block_hashes[2], kv_cache_group_ids=[0]
+        partial_full_hash, kv_cache_group_ids=[0]
     )
     assert partial_full_block is not None
 
@@ -3658,6 +3734,7 @@ def test_hybrid_partial_hash_truncates_full_attention_hit_length():
         block=full_blocks[2],
         num_tokens=10,
         kv_cache_group_id=0,
+        block_size=block_size,
     )
 
     mamba_block = pool.get_new_blocks(1)[0]
@@ -3666,6 +3743,7 @@ def test_hybrid_partial_hash_truncates_full_attention_hit_length():
         block=mamba_block,
         num_tokens=6,
         kv_cache_group_id=1,
+        block_size=block_size,
     )
 
     computed_blocks, num_computed = manager.get_computed_blocks(req)
