@@ -3,6 +3,7 @@
 
 import enum
 import time
+import weakref
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -27,6 +28,36 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+
+class RequestBlockHashes(list["BlockHash"]):
+    """Fine-grained hashes that can compute full hashes for promotion.
+
+    The list itself stores hashes at the prefix-cache hash block size. When a
+    partially cached block becomes a full cache block, the cache must promote it
+    to the direct full-block hash for the larger KV cache block size instead of
+    concatenating fine-grained hashes. The request reference is only used to
+    recompute that direct full-block hash from the original tokens and extra
+    hash keys.
+    """
+
+    def __init__(self, request: "Request") -> None:
+        super().__init__()
+        self.request_ref = weakref.ref(request)
+        self._by_block_size: dict[int, list[BlockHash]] = {}
+
+    def get_block_hashes(self, block_size: int) -> list["BlockHash"]:
+        request = self.request_ref()
+        assert request is not None
+        get_block_hashes = getattr(request._block_hasher, "get_block_hashes", None)
+        if get_block_hashes is None:
+            return self
+        if block_size not in self._by_block_size:
+            self._by_block_size[block_size] = get_block_hashes(request, block_size)
+        return self._by_block_size[block_size]
+
+    def clear_cached_views(self) -> None:
+        self._by_block_size.clear()
 
 
 @dataclass
@@ -172,7 +203,7 @@ class Request:
 
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
-        self.block_hashes: list[BlockHash] = []
+        self.block_hashes: RequestBlockHashes = RequestBlockHashes(self)
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
         # immediate garbage collection via reference counting.
@@ -229,6 +260,7 @@ class Request:
             self._all_token_ids.extend(token_ids)
 
         self.update_block_hashes()
+        self.block_hashes.clear_cached_views()
 
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""

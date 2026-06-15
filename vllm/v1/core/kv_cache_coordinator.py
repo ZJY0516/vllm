@@ -630,8 +630,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             if kv_cache_spec.block_size == self.hash_block_size:
                 return block_hashes
+            get_block_hashes = getattr(block_hashes, "get_block_hashes", None)
+            if get_block_hashes is None:
+                return BlockHashListWithBlockSize(
+                    block_hashes, self.hash_block_size, kv_cache_spec.block_size
+                )
             return BlockHashListWithBlockSize(
-                block_hashes, self.hash_block_size, kv_cache_spec.block_size
+                get_block_hashes(kv_cache_spec.block_size),
+                block_hashes,
+                self.hash_block_size,
+                kv_cache_spec.block_size,
             )
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -749,8 +757,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             if kv_cache_spec.block_size == self.hash_block_size:
                 return block_hashes
+            get_block_hashes = getattr(block_hashes, "get_block_hashes", None)
+            if get_block_hashes is None:
+                return BlockHashListWithBlockSize(
+                    block_hashes, self.hash_block_size, kv_cache_spec.block_size
+                )
             return BlockHashListWithBlockSize(
-                block_hashes, self.hash_block_size, kv_cache_spec.block_size
+                get_block_hashes(kv_cache_spec.block_size),
+                block_hashes,
+                self.hash_block_size,
+                kv_cache_spec.block_size,
             )
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)

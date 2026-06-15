@@ -246,7 +246,6 @@ class BlockPool:
         if num_cached_blocks >= num_full_blocks:
             return
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
-        assert len(request.block_hashes) >= num_full_blocks
         assert block_mask is None or len(block_mask) == len(new_full_blocks)
         if block_size == self.hash_block_size:
             # Common case.
@@ -255,11 +254,15 @@ class BlockPool:
             # block_size is a multiple of hash_block_size. This happens when
             # different KV cache groups have different block sizes.
             assert block_size % self.hash_block_size == 0
-            # Recalculate block_hashes at the granularity of block_size, using
-            # the original block_hashes (at the granularity of hash_block_size).
+            # Use direct full-block hashes at block_size. Keep the finer hashes
+            # available for partial-block aliases.
             block_hashes = BlockHashListWithBlockSize(
-                request.block_hashes, self.hash_block_size, block_size
+                request.block_hashes.get_block_hashes(block_size),
+                request.block_hashes,
+                self.hash_block_size,
+                block_size,
             )
+        assert len(block_hashes) >= num_full_blocks
 
         new_block_hashes = block_hashes[num_cached_blocks:]
         new_hashes: list[ExternalBlockHash] | None = (
@@ -272,6 +275,25 @@ class BlockPool:
             if blk.is_null or (block_mask is not None and not block_mask[i]):
                 continue
             block_hash = new_block_hashes[i]
+            num_hash_tokens = (num_cached_blocks + i + 1) * block_size
+            old_block_hash = blk.block_hash
+            if (
+                old_block_hash is not None
+                and blk.block_hash_num_tokens is not None
+                and blk.block_hash_num_tokens < num_hash_tokens
+            ):
+                self.cached_block_hash_to_block.pop(old_block_hash, blk.block_id)
+                if self.enable_kv_cache_events:
+                    self.kv_event_queue.append(
+                        BlockRemoved(
+                            block_hashes=[
+                                maybe_convert_block_hash(get_block_hash(old_block_hash))
+                            ],
+                            medium=MEDIUM_GPU,
+                            group_idx=get_group_id(old_block_hash),
+                        )
+                    )
+                blk.reset_hash()
 
             # Update and added the full block to the cache.
             block_hash_with_group_id = make_block_hash_with_group_id(
@@ -280,7 +302,7 @@ class BlockPool:
             self._insert_block_hash(
                 block_hash_with_group_id,
                 blk,
-                num_tokens=(num_cached_blocks + i + 1) * block_size,
+                num_tokens=num_hash_tokens,
             )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))

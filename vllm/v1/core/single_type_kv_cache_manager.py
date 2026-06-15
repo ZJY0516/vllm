@@ -563,7 +563,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         block_pool: BlockPool,
         block_size: int,
     ) -> tuple[list[KVCacheBlock], ...]:
-        fine_block_hashes = block_hashes.block_hashes
+        fine_block_hashes = block_hashes.fine_block_hashes
         scale_factor = block_hashes.scale_factor
         hash_block_size = block_size // scale_factor
         max_num_hash_blocks = min(
@@ -1317,7 +1317,7 @@ class MambaManager(SingleTypeKVCacheManager):
 
         block_size = kv_cache_spec.block_size
         if isinstance(block_hashes, BlockHashListWithBlockSize):
-            fine_block_hashes = block_hashes.block_hashes
+            fine_block_hashes = block_hashes.fine_block_hashes
             scale_factor = block_hashes.scale_factor
             hash_block_size = block_size // scale_factor
             max_num_hash_blocks = min(

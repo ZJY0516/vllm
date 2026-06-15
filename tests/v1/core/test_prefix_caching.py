@@ -25,7 +25,6 @@ from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager, Request
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
-    BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
     get_block_hash,
@@ -221,6 +220,86 @@ def make_kv_cache_config_three_types(
             ),
         ],
     )
+
+
+def test_partial_block_promotes_to_direct_full_block_hash():
+    hash_block_size = 2
+    block_size = 4
+    hash_fn = sha256
+    kv_cache_config = KVCacheConfig(
+        num_blocks=12,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+
+    req0 = make_request("0", [0, 0, 1, 1, 2, 2], hash_block_size, hash_fn)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    blocks = manager.allocate_slots(
+        req0,
+        req0.num_tokens,
+        num_computed_tokens,
+        computed_blocks,
+    )
+    assert blocks is not None
+    manager.cache_blocks(req0, req0.num_tokens)
+
+    partial_hash = req0.block_hashes[2]
+    partial_full_block = manager.block_pool.get_cached_block(
+        partial_hash, kv_cache_group_ids=[0]
+    )
+    assert partial_full_block is not None
+
+    req0.append_output_token_ids([3, 3])
+    manager.cache_blocks(req0, req0.num_tokens)
+
+    full_hashes = req0.block_hashes.get_block_hashes(block_size)
+    promoted_full_hash = full_hashes[1]
+    concat_hash = BlockHash(req0.block_hashes[2] + req0.block_hashes[3])
+    assert promoted_full_hash != concat_hash
+    assert promoted_full_hash == hash_block_tokens(
+        hash_fn,
+        full_hashes[0],
+        req0.all_token_ids[block_size : 2 * block_size],
+    )
+    assert (
+        manager.block_pool.get_cached_block(promoted_full_hash, kv_cache_group_ids=[0])
+        == partial_full_block
+    )
+
+    req1 = make_request("1", [0, 0, 1, 1, 2, 2, 3, 3, 4], hash_block_size, hash_fn)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
+    req0_blocks = manager.get_blocks("0").blocks[0]
+    assert computed_blocks.get_block_ids()[0] == [
+        req0_blocks[0].block_id,
+        req0_blocks[1].block_id,
+    ]
+    assert num_computed_tokens == 2 * block_size
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -3281,9 +3360,7 @@ def test_hybrid_mamba_align_caches_chunk_end_and_final_hash_tail():
 
     mamba_manager = manager.coordinator.single_type_managers[1]
     assert isinstance(mamba_manager, MambaManager)
-    mamba_block_hashes = BlockHashListWithBlockSize(
-        req.block_hashes, hash_block_size, mamba_block_size
-    )
+    mamba_block_hashes = req.block_hashes.get_block_hashes(mamba_block_size)
     assert (
         manager.block_pool.get_cached_block(
             mamba_block_hashes[1], kv_cache_group_ids=[1]
