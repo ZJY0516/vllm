@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -341,11 +340,9 @@ class Scheduler(SchedulerInterface):
                 < last_cache_position
                 < num_computed_tokens_after_sched
             ):
-                # Force a final tail chunk at the last hash boundary.
-                if os.getenv("VLLM_MAMBA_CHECKPOINT_METADATA_SPLIT") != "1":
-                    num_new_tokens = last_cache_position - num_computed_tokens
-            else:
-                # prefill the last few tokens
+                # The final reusable prompt tail may cross a hash boundary.
+                # KDA/GDN materializes the Mamba checkpoint inside the forward
+                # pass, so this chunk does not need to be split here.
                 pass
 
             # Marconi cache admission optimization:

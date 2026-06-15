@@ -1115,7 +1115,7 @@ def test_mamba_align_split_uses_physical_chunks_then_hash_tail():
         request=req,
         num_new_tokens=15,
     )
-    assert num_new_tokens == 14
+    assert num_new_tokens == 15
 
     req.num_computed_tokens = mamba_block_size
     num_new_tokens = Scheduler._mamba_block_aligned_split(
@@ -1123,7 +1123,7 @@ def test_mamba_align_split_uses_physical_chunks_then_hash_tail():
         request=req,
         num_new_tokens=7,
     )
-    assert num_new_tokens == 6
+    assert num_new_tokens == 7
 
 
 def test_hybrid_model_mamba_align_with_dynamic_draft_tokens():

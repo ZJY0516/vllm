@@ -53,6 +53,7 @@ class GDNAttentionMetadata:
     non_spec_query_start_loc: torch.Tensor | None = (
         None  # shape: [batch - num_spec_decodes + 1,]
     )
+    non_spec_query_start_loc_cpu: torch.Tensor | None = None
 
     spec_state_indices_tensor: torch.Tensor | None = None  # shape: [batch, num_spec]
     non_spec_state_indices_tensor: torch.Tensor | None = (
@@ -71,31 +72,16 @@ class GDNAttentionMetadata:
     prefill_query_start_loc: torch.Tensor | None = None
     prefill_state_indices: torch.Tensor | None = None
     prefill_has_initial_state: torch.Tensor | None = None
+    non_spec_checkpoint_offsets_cpu: torch.Tensor | None = None
+    non_spec_checkpoint_state_indices_cpu: torch.Tensor | None = None
+    non_spec_checkpoint_state_indices: torch.Tensor | None = None
     prefill_checkpoint_offsets_cpu: torch.Tensor | None = None
     prefill_checkpoint_state_indices: torch.Tensor | None = None
-    prefill_checkpoint_split_pos: int = -1
-    prefill_checkpoint_split_query_start_loc: torch.Tensor | None = None
-    prefill_checkpoint_tail_query_start_loc: torch.Tensor | None = None
-    prefill_checkpoint_tail_has_initial_state: torch.Tensor | None = None
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
-
-    def get_prefill_checkpoint(self) -> tuple[int, torch.Tensor | None]:
-        """Return the pre-validated single prefill checkpoint, if any."""
-        if self.prefill_checkpoint_split_pos <= 0:
-            return -1, None
-        if (
-            self.prefill_checkpoint_state_indices is None
-            or self.prefill_checkpoint_state_indices.numel() != 1
-        ):
-            return -1, None
-        return (
-            self.prefill_checkpoint_split_pos,
-            self.prefill_checkpoint_state_indices,
-        )
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -182,15 +168,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             (self.decode_cudagraph_max_bs,),
             dtype=torch.int32,
             device=device,
-        )
-        self.prefill_checkpoint_split_query_start_loc: torch.Tensor = torch.empty(
-            (2,), dtype=torch.int32, device=device
-        )
-        self.prefill_checkpoint_tail_query_start_loc: torch.Tensor = torch.empty(
-            (2,), dtype=torch.int32, device=device
-        )
-        self.prefill_checkpoint_tail_has_initial_state: torch.Tensor = torch.empty(
-            (1,), dtype=torch.bool, device=device
         )
 
     def build(  # type: ignore[override]
@@ -377,10 +354,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_checkpoint_offsets_cpu: torch.Tensor | None = None
         prefill_checkpoint_state_indices_cpu: torch.Tensor | None = None
         prefill_checkpoint_state_indices: torch.Tensor | None = None
-        prefill_checkpoint_split_pos = -1
-        prefill_checkpoint_split_query_start_loc: torch.Tensor | None = None
-        prefill_checkpoint_tail_query_start_loc: torch.Tensor | None = None
-        prefill_checkpoint_tail_has_initial_state: torch.Tensor | None = None
         if num_prefills > 0:
             from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 
@@ -425,41 +398,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     )
                 )
                 assert prefill_checkpoint_offsets_cpu is not None
-                if (
-                    num_prefills == 1
-                    and prefill_checkpoint_offsets_cpu.numel() == 1
-                    and prefill_checkpoint_state_indices_cpu.numel() == 1
-                ):
-                    checkpoint_state_idx = int(
-                        prefill_checkpoint_state_indices_cpu[0].item()
-                    )
-                    split_pos = int(prefill_checkpoint_offsets_cpu[0].item())
-                    assert prefill_query_start_loc_cpu is not None
-                    num_prefill_actual_tokens = int(
-                        prefill_query_start_loc_cpu[-1].item()
-                    )
-                    if (
-                        checkpoint_state_idx >= 0
-                        and split_pos > 0
-                        and split_pos < num_prefill_actual_tokens
-                    ):
-                        split_query_start_loc = (
-                            self.prefill_checkpoint_split_query_start_loc
-                        )
-                        tail_query_start_loc = (
-                            self.prefill_checkpoint_tail_query_start_loc
-                        )
-                        split_query_start_loc[0] = 0
-                        split_query_start_loc[1] = split_pos
-                        tail_query_start_loc[0] = 0
-                        tail_query_start_loc[1] = num_prefill_actual_tokens - split_pos
-                        self.prefill_checkpoint_tail_has_initial_state[0] = True
-                        prefill_checkpoint_split_pos = split_pos
-                        prefill_checkpoint_split_query_start_loc = split_query_start_loc
-                        prefill_checkpoint_tail_query_start_loc = tail_query_start_loc
-                        prefill_checkpoint_tail_has_initial_state = (
-                            self.prefill_checkpoint_tail_has_initial_state
-                        )
 
             if self.gdn_prefill_backend == "cutedsl":
                 from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
@@ -602,20 +540,22 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             prefill_query_start_loc=prefill_query_start_loc,
             prefill_state_indices=prefill_state_indices,
             prefill_has_initial_state=prefill_has_initial_state,
+            non_spec_checkpoint_offsets_cpu=non_spec_checkpoint_offsets_cpu,
+            non_spec_checkpoint_state_indices_cpu=(
+                non_spec_checkpoint_state_indices_cpu
+            ),
+            non_spec_checkpoint_state_indices=(
+                non_spec_checkpoint_state_indices_cpu.to(
+                    query_start_loc.device, non_blocking=True
+                )
+                if non_spec_checkpoint_state_indices_cpu is not None
+                else None
+            ),
             prefill_checkpoint_offsets_cpu=prefill_checkpoint_offsets_cpu,
             prefill_checkpoint_state_indices=prefill_checkpoint_state_indices,
-            prefill_checkpoint_split_pos=prefill_checkpoint_split_pos,
-            prefill_checkpoint_split_query_start_loc=(
-                prefill_checkpoint_split_query_start_loc
-            ),
-            prefill_checkpoint_tail_query_start_loc=(
-                prefill_checkpoint_tail_query_start_loc
-            ),
-            prefill_checkpoint_tail_has_initial_state=(
-                prefill_checkpoint_tail_has_initial_state
-            ),
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             spec_sequence_masks=spec_sequence_masks,
