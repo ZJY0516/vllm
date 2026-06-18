@@ -319,10 +319,6 @@ class SingleTypeKVCacheManager(ABC):
         """Drain and return pending KV copies as (group, src, dst, tokens)."""
         return []
 
-    def take_mamba_checkpoint_block_ids(self) -> dict[str, int]:
-        """Drain and return pending Mamba checkpoint blocks by request ID."""
-        return {}
-
     def cache_blocks(
         self,
         request: Request,
@@ -1276,7 +1272,6 @@ class MambaManager(SingleTypeKVCacheManager):
         self._active_snapshot_blocks: list[KVCacheBlock] = []
         self._delayed_snapshot_source_blocks: list[KVCacheBlock] = []
         self._active_snapshot_source_blocks: list[KVCacheBlock] = []
-        self._pending_checkpoint_blocks: dict[str, KVCacheBlock] = {}
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1632,9 +1627,6 @@ class MambaManager(SingleTypeKVCacheManager):
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
-            partial_hash = self._cache_metadata_checkpoint_snapshot(request, num_tokens)
-            if partial_hash is not None:
-                self.cached_blocks_this_step.add(partial_hash)
             partial_hash = self._cache_partial_snapshot(request, num_tokens)
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
@@ -1715,63 +1707,6 @@ class MambaManager(SingleTypeKVCacheManager):
             )
         )
         return partial_hash
-
-    def _cache_metadata_checkpoint_snapshot(
-        self,
-        request: Request,
-        num_tokens: int,
-    ) -> BlockHashWithGroupId | None:
-        if self.block_size == self.block_pool.hash_block_size:
-            return None
-        if num_tokens != request.num_prompt_tokens:
-            return None
-
-        checkpoint_tokens = (
-            request.num_prompt_tokens // self.block_pool.hash_block_size
-        ) * self.block_pool.hash_block_size
-        if checkpoint_tokens == 0 or checkpoint_tokens >= num_tokens:
-            return None
-        if checkpoint_tokens % self.block_size == 0:
-            return None
-
-        request_id = request.request_id
-        if request_id in self._pending_checkpoint_blocks:
-            return None
-
-        num_hash_blocks = checkpoint_tokens // self.block_pool.hash_block_size
-        if num_hash_blocks > len(request.block_hashes):
-            return None
-        block_hash = self.block_pool.get_block_alias_hash(
-            request, checkpoint_tokens, self.block_size
-        )
-        if block_hash is None:
-            return None
-        if self.block_pool.get_cached_block(block_hash, [self.kv_cache_group_id]):
-            return None
-
-        snapshot_block = self.block_pool.get_new_blocks(1)[0]
-        partial_hash = self.block_pool.cache_block_alias(
-            request=request,
-            block=snapshot_block,
-            num_tokens=checkpoint_tokens,
-            kv_cache_group_id=self.kv_cache_group_id,
-            block_size=self.block_size,
-        )
-        if partial_hash is None:
-            self.block_pool.free_blocks([snapshot_block], prepend=True)
-            return None
-
-        self._pending_checkpoint_blocks[request_id] = snapshot_block
-        self._delayed_snapshot_blocks.append(snapshot_block)
-        return partial_hash
-
-    def take_mamba_checkpoint_block_ids(self) -> dict[str, int]:
-        ids = {
-            req_id: block.block_id
-            for req_id, block in self._pending_checkpoint_blocks.items()
-        }
-        self._pending_checkpoint_blocks = {}
-        return ids
 
     def take_copy_block_ids(self) -> list[tuple[int, int, int, int]]:
         ids = self._copy_block_ids

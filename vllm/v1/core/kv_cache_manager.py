@@ -603,10 +603,6 @@ class KVCacheManager:
             ids.extend(mgr.take_copy_block_ids())
         return ids
 
-    def take_mamba_checkpoint_block_ids(self) -> dict[int, dict[str, int]]:
-        """Drain pending Mamba checkpoint block IDs by group and request ID."""
-        return self.coordinator.take_mamba_checkpoint_block_ids()
-
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         self.coordinator.new_step_starts()

@@ -320,7 +320,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         if attn_metadata_narrowed.num_prefills > 0:
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
-            q, k, v = self._causal_conv1d_prefill_with_optional_checkpoint(
+            q, k, v = self._causal_conv1d_prefill(
                 q_proj_states=q_proj_states,
                 k_proj_states=k_proj_states,
                 v_proj_states=v_proj_states,
@@ -334,7 +334,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
                 attn_metadata=attn_metadata_narrowed,
-                num_actual_tokens=num_actual_tokens,
             )
         else:
             assert non_spec_state_indices_tensor is not None
@@ -379,18 +378,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             zero_idx = non_spec_state_indices_tensor[~has_initial_state]
             recurrent_state[zero_idx] = 0
             initial_state = recurrent_state[non_spec_state_indices_tensor].contiguous()
-            core_attn_out_non_spec, last_recurrent_state = (
-                self._chunk_kda_prefill_with_optional_internal_split(
-                    q=q,
-                    k=k,
-                    v=v,
-                    raw_g=g1,
-                    beta=beta,
-                    initial_state=initial_state,
-                    cu_seqlens=non_spec_query_start_loc,
-                    attn_metadata=attn_metadata_narrowed,
-                    recurrent_state=recurrent_state,
-                )
+            core_attn_out_non_spec, last_recurrent_state = self._chunk_kda_prefill(
+                q=q,
+                k=k,
+                v=v,
+                raw_g=g1,
+                beta=beta,
+                initial_state=initial_state,
+                cu_seqlens=non_spec_query_start_loc,
             )
             # Init cache
             recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
@@ -422,63 +417,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             0, :num_actual_tokens
         ]
 
-    @staticmethod
-    def _make_cu(lengths: list[int], device: torch.device) -> torch.Tensor:
-        values = [0]
-        for length in lengths:
-            values.append(values[-1] + length)
-        return torch.tensor(values, dtype=torch.int32, device=device)
-
-    @staticmethod
-    def _select_segments_4d(
-        tensors: tuple[torch.Tensor, ...],
-        segments: list[tuple[int, int, int, bool]],
-    ) -> tuple[torch.Tensor, ...]:
-        return tuple(
-            torch.cat([tensor[:, start:end] for start, end, _, _ in segments], dim=1)
-            for tensor in tensors
-        )
-
-    @staticmethod
-    def _select_segments_2d(
-        tensor: torch.Tensor,
-        segments: list[tuple[int, int, int, bool]],
-    ) -> torch.Tensor:
-        return torch.cat([tensor[start:end] for start, end, _, _ in segments], dim=0)
-
-    @staticmethod
-    def _get_non_spec_checkpoint_splits(
-        attn_metadata: GDNAttentionMetadata,
-    ) -> list[tuple[int, int]]:
-        query_start_loc_cpu = attn_metadata.non_spec_query_start_loc_cpu
-        checkpoint_offsets_cpu = attn_metadata.non_spec_checkpoint_offsets_cpu
-        checkpoint_state_indices_cpu = (
-            attn_metadata.non_spec_checkpoint_state_indices_cpu
-        )
-        if (
-            query_start_loc_cpu is None
-            or checkpoint_offsets_cpu is None
-            or checkpoint_state_indices_cpu is None
-        ):
-            return []
-
-        num_rows = min(
-            query_start_loc_cpu.numel() - 1,
-            checkpoint_offsets_cpu.numel(),
-            checkpoint_state_indices_cpu.numel(),
-        )
-        splits: list[tuple[int, int]] = []
-        for row_idx in range(num_rows):
-            checkpoint_state_idx = int(checkpoint_state_indices_cpu[row_idx].item())
-            offset = int(checkpoint_offsets_cpu[row_idx].item())
-            row_len = int(
-                (query_start_loc_cpu[row_idx + 1] - query_start_loc_cpu[row_idx]).item()
-            )
-            if checkpoint_state_idx >= 0 and 0 < offset < row_len:
-                splits.append((row_idx, offset))
-        return splits
-
-    def _chunk_kda_prefill_with_optional_internal_split(
+    def _chunk_kda_prefill(
         self,
         *,
         q: torch.Tensor,
@@ -488,149 +427,22 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         beta: torch.Tensor,
         initial_state: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        attn_metadata: GDNAttentionMetadata,
-        recurrent_state: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        splits = self._get_non_spec_checkpoint_splits(attn_metadata)
-        if not splits:
-            return chunk_kda_with_fused_gate(
-                q=q,
-                k=k,
-                v=v,
-                raw_g=raw_g,
-                beta=beta,
-                A_log=self.A_log,
-                g_bias=self.dt_bias,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-            )
-
-        device = q.device
-        phase1_segments: list[tuple[int, int, int, bool]] = []
-        phase2_segments: list[tuple[int, int, int, bool]] = []
-        assert attn_metadata.non_spec_query_start_loc_cpu is not None
-        query_start_loc_cpu = attn_metadata.non_spec_query_start_loc_cpu
-        num_rows = min(initial_state.shape[0], query_start_loc_cpu.numel() - 1)
-        splits = [(row_idx, offset) for row_idx, offset in splits if row_idx < num_rows]
-        if not splits:
-            return chunk_kda_with_fused_gate(
-                q=q,
-                k=k,
-                v=v,
-                raw_g=raw_g,
-                beta=beta,
-                A_log=self.A_log,
-                g_bias=self.dt_bias,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-            )
-        split_by_row = {row_idx: offset for row_idx, offset in splits}
-        for row_idx in range(num_rows):
-            start = int(query_start_loc_cpu[row_idx].item())
-            end = int(query_start_loc_cpu[row_idx + 1].item())
-            if start >= end:
-                continue
-            offset = split_by_row.get(row_idx)
-            if offset is None:
-                phase1_segments.append((start, end, row_idx, False))
-            else:
-                split_abs = start + offset
-                phase1_segments.append((start, split_abs, row_idx, True))
-                phase2_segments.append((split_abs, end, row_idx, False))
-
-        phase1_q, phase1_k, phase1_v = self._select_segments_4d(
-            (q, k, v), phase1_segments
-        )
-        phase1_raw_g, phase1_beta = self._select_segments_4d(
-            (raw_g, beta), phase1_segments
-        )
-        phase1_initial_state = initial_state[
-            torch.tensor(
-                [row_idx for _, _, row_idx, _ in phase1_segments],
-                dtype=torch.long,
-                device=device,
-            )
-        ]
-        phase1_out, phase1_final_state = chunk_kda_with_fused_gate(
-            q=phase1_q,
-            k=phase1_k,
-            v=phase1_v,
-            raw_g=phase1_raw_g,
-            beta=phase1_beta,
+        return chunk_kda_with_fused_gate(
+            q=q,
+            k=k,
+            v=v,
+            raw_g=raw_g,
+            beta=beta,
             A_log=self.A_log,
             g_bias=self.dt_bias,
-            initial_state=phase1_initial_state,
+            initial_state=initial_state,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
-            cu_seqlens=self._make_cu(
-                [end - start for start, end, _, _ in phase1_segments], device
-            ),
+            cu_seqlens=cu_seqlens,
         )
 
-        output = torch.empty_like(q)
-        last_recurrent_state = initial_state.clone()
-        checkpoint_states: list[torch.Tensor] = []
-        checkpoint_rows: list[int] = []
-        phase1_offset = 0
-        for seg_idx, (start, end, row_idx, is_checkpoint) in enumerate(phase1_segments):
-            length = end - start
-            output[:, start:end] = phase1_out[:, phase1_offset : phase1_offset + length]
-            phase1_offset += length
-            if is_checkpoint:
-                checkpoint_states.append(phase1_final_state[seg_idx])
-                checkpoint_rows.append(row_idx)
-            else:
-                last_recurrent_state[row_idx] = phase1_final_state[seg_idx]
-
-        if not phase2_segments:
-            return output, last_recurrent_state
-
-        assert attn_metadata.non_spec_checkpoint_state_indices is not None
-        checkpoint_row_tensor = torch.tensor(
-            checkpoint_rows, dtype=torch.long, device=device
-        )
-        checkpoint_state_indices = attn_metadata.non_spec_checkpoint_state_indices[
-            checkpoint_row_tensor
-        ].long()
-        checkpoint_state_tensor = torch.stack(checkpoint_states, dim=0)
-        recurrent_state[checkpoint_state_indices] = checkpoint_state_tensor.to(
-            recurrent_state.dtype
-        )
-
-        phase2_q, phase2_k, phase2_v = self._select_segments_4d(
-            (q, k, v), phase2_segments
-        )
-        phase2_raw_g, phase2_beta = self._select_segments_4d(
-            (raw_g, beta), phase2_segments
-        )
-        second_out, phase2_final_state = chunk_kda_with_fused_gate(
-            q=phase2_q,
-            k=phase2_k,
-            v=phase2_v,
-            raw_g=phase2_raw_g,
-            beta=phase2_beta,
-            A_log=self.A_log,
-            g_bias=self.dt_bias,
-            initial_state=checkpoint_state_tensor,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=self._make_cu(
-                [end - start for start, end, _, _ in phase2_segments], device
-            ),
-        )
-        phase2_offset = 0
-        for seg_idx, (start, end, row_idx, _) in enumerate(phase2_segments):
-            length = end - start
-            output[:, start:end] = second_out[:, phase2_offset : phase2_offset + length]
-            phase2_offset += length
-            last_recurrent_state[row_idx] = phase2_final_state[seg_idx]
-        return output, last_recurrent_state
-
-    def _causal_conv1d_prefill_with_optional_checkpoint(
+    def _causal_conv1d_prefill(
         self,
         *,
         q_proj_states: torch.Tensor,
@@ -646,191 +458,41 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor | None,
         attn_metadata: GDNAttentionMetadata,
-        num_actual_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        splits = self._get_non_spec_checkpoint_splits(attn_metadata)
-        if not splits or query_start_loc is None:
-            q_proj_states = q_proj_states.transpose(0, 1)
-            k_proj_states = k_proj_states.transpose(0, 1)
-            v_proj_states = v_proj_states.transpose(0, 1)
-            q = causal_conv1d_fn(
-                q_proj_states,
-                q_conv_weights,
-                self.q_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_q,
-                has_initial_state=has_initial_state,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                metadata=attn_metadata,
-            ).transpose(0, 1)
-            k = causal_conv1d_fn(
-                k_proj_states,
-                k_conv_weights,
-                self.k_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_k,
-                has_initial_state=has_initial_state,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                metadata=attn_metadata,
-            ).transpose(0, 1)
-            v = causal_conv1d_fn(
-                v_proj_states,
-                v_conv_weights,
-                self.v_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_v,
-                has_initial_state=has_initial_state,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                metadata=attn_metadata,
-            ).transpose(0, 1)
-            return q, k, v
-
-        device = q_proj_states.device
-        assert attn_metadata.non_spec_query_start_loc_cpu is not None
-        query_start_loc_cpu = attn_metadata.non_spec_query_start_loc_cpu
-        num_rows = min(cache_indices.numel(), query_start_loc_cpu.numel() - 1)
-        splits = [(row_idx, offset) for row_idx, offset in splits if row_idx < num_rows]
-        if not splits:
-            q_proj_states = q_proj_states.transpose(0, 1)
-            k_proj_states = k_proj_states.transpose(0, 1)
-            v_proj_states = v_proj_states.transpose(0, 1)
-            q = causal_conv1d_fn(
-                q_proj_states,
-                q_conv_weights,
-                self.q_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_q,
-                has_initial_state=has_initial_state,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                metadata=attn_metadata,
-            ).transpose(0, 1)
-            k = causal_conv1d_fn(
-                k_proj_states,
-                k_conv_weights,
-                self.k_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_k,
-                has_initial_state=has_initial_state,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                metadata=attn_metadata,
-            ).transpose(0, 1)
-            v = causal_conv1d_fn(
-                v_proj_states,
-                v_conv_weights,
-                self.v_conv1d.bias,
-                activation="silu",
-                conv_states=conv_state_v,
-                has_initial_state=has_initial_state,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                metadata=attn_metadata,
-            ).transpose(0, 1)
-            return q, k, v
-        split_by_row = {row_idx: offset for row_idx, offset in splits}
-        phase1_segments: list[tuple[int, int, int, bool]] = []
-        phase2_segments: list[tuple[int, int, int, bool]] = []
-        for row_idx in range(num_rows):
-            start = int(query_start_loc_cpu[row_idx].item())
-            end = int(query_start_loc_cpu[row_idx + 1].item())
-            if start >= end:
-                continue
-            offset = split_by_row.get(row_idx)
-            if offset is None:
-                phase1_segments.append((start, end, row_idx, False))
-            else:
-                split_abs = start + offset
-                phase1_segments.append((start, split_abs, row_idx, True))
-                phase2_segments.append((split_abs, end, row_idx, False))
-
-        phase1_req_indices = torch.tensor(
-            [row_idx for _, _, row_idx, _ in phase1_segments],
-            dtype=torch.long,
-            device=device,
-        )
-        checkpoint_rows = [row_idx for row_idx, _ in splits]
-        checkpoint_row_tensor = torch.tensor(
-            checkpoint_rows,
-            dtype=torch.long,
-            device=device,
-        )
-        assert attn_metadata.non_spec_checkpoint_state_indices is not None
-        checkpoint_state_indices = attn_metadata.non_spec_checkpoint_state_indices[
-            checkpoint_row_tensor
-        ].long()
-        source_state_indices = cache_indices[checkpoint_row_tensor].long()
-
-        def build_cache_indices(
-            segments: list[tuple[int, int, int, bool]],
-        ) -> torch.Tensor:
-            pieces = []
-            for _, _, row_idx, is_checkpoint in segments:
-                if is_checkpoint:
-                    assert attn_metadata.non_spec_checkpoint_state_indices is not None
-                    pieces.append(
-                        attn_metadata.non_spec_checkpoint_state_indices[
-                            row_idx : row_idx + 1
-                        ]
-                    )
-                else:
-                    pieces.append(cache_indices[row_idx : row_idx + 1])
-            return torch.cat(pieces, dim=0).to(dtype=torch.int32)
-
-        outputs: list[torch.Tensor] = []
-        for proj_states, conv_weights, bias, conv_state in (
-            (q_proj_states, q_conv_weights, self.q_conv1d.bias, conv_state_q),
-            (k_proj_states, k_conv_weights, self.k_conv1d.bias, conv_state_k),
-            (v_proj_states, v_conv_weights, self.v_conv1d.bias, conv_state_v),
-        ):
-            conv_state[checkpoint_state_indices] = conv_state[source_state_indices]
-            first = causal_conv1d_fn(
-                self._select_segments_2d(proj_states, phase1_segments).transpose(0, 1),
-                conv_weights,
-                bias,
-                activation="silu",
-                conv_states=conv_state,
-                has_initial_state=has_initial_state[phase1_req_indices],
-                cache_indices=build_cache_indices(phase1_segments),
-                query_start_loc=self._make_cu(
-                    [end - start for start, end, _, _ in phase1_segments],
-                    device,
-                ),
-                metadata=None,
-            ).transpose(0, 1)
-            conv_state[source_state_indices] = conv_state[checkpoint_state_indices]
-            second = causal_conv1d_fn(
-                self._select_segments_2d(proj_states, phase2_segments).transpose(0, 1),
-                conv_weights,
-                bias,
-                activation="silu",
-                conv_states=conv_state,
-                has_initial_state=torch.ones(
-                    len(phase2_segments), dtype=torch.bool, device=device
-                ),
-                cache_indices=cache_indices[checkpoint_row_tensor].to(
-                    dtype=torch.int32
-                ),
-                query_start_loc=self._make_cu(
-                    [end - start for start, end, _, _ in phase2_segments],
-                    device,
-                ),
-                metadata=None,
-            ).transpose(0, 1)
-            output = torch.empty_like(proj_states)
-            phase1_offset = 0
-            for start, end, _, _ in phase1_segments:
-                length = end - start
-                output[start:end] = first[phase1_offset : phase1_offset + length]
-                phase1_offset += length
-            phase2_offset = 0
-            for start, end, _, _ in phase2_segments:
-                length = end - start
-                output[start:end] = second[phase2_offset : phase2_offset + length]
-                phase2_offset += length
-            outputs.append(output)
-
-        return outputs[0], outputs[1], outputs[2]
+        q_proj_states = q_proj_states.transpose(0, 1)
+        k_proj_states = k_proj_states.transpose(0, 1)
+        v_proj_states = v_proj_states.transpose(0, 1)
+        q = causal_conv1d_fn(
+            q_proj_states,
+            q_conv_weights,
+            self.q_conv1d.bias,
+            activation="silu",
+            conv_states=conv_state_q,
+            has_initial_state=has_initial_state,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            metadata=attn_metadata,
+        ).transpose(0, 1)
+        k = causal_conv1d_fn(
+            k_proj_states,
+            k_conv_weights,
+            self.k_conv1d.bias,
+            activation="silu",
+            conv_states=conv_state_k,
+            has_initial_state=has_initial_state,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            metadata=attn_metadata,
+        ).transpose(0, 1)
+        v = causal_conv1d_fn(
+            v_proj_states,
+            v_conv_weights,
+            self.v_conv1d.bias,
+            activation="silu",
+            conv_states=conv_state_v,
+            has_initial_state=has_initial_state,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            metadata=attn_metadata,
+        ).transpose(0, 1)
+        return q, k, v

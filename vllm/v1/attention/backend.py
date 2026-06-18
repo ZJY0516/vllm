@@ -411,14 +411,6 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
-    mamba_checkpoint_offsets_cpu: torch.Tensor | None = None
-    """(batch_size,) CPU tensor. Offset inside each request's scheduled query
-    where a Mamba checkpoint should be materialized, or -1 when none."""
-
-    mamba_checkpoint_state_indices_cpu: torch.Tensor | None = None
-    """(batch_size,) CPU tensor. Snapshot Mamba state block id for the
-    checkpoint, or -1 when none."""
-
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
     """(batch_size,) CPU upper bound on seq_lens. Precise for prefill rows
     and for all rows outside async spec decode; optimistic for async-spec
@@ -515,12 +507,6 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
-            mamba_checkpoint_offsets_cpu=maybe_slice_reqs(
-                self.mamba_checkpoint_offsets_cpu
-            ),
-            mamba_checkpoint_state_indices_cpu=maybe_slice_reqs(
-                self.mamba_checkpoint_state_indices_cpu
-            ),
         )
 
 

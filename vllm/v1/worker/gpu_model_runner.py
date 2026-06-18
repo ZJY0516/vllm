@@ -2231,7 +2231,6 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
-        mamba_checkpoint_block_ids: dict[int, dict[str, int]] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         Returns:
@@ -2316,57 +2315,6 @@ class GPUModelRunner(
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
-        mamba_checkpoint_offsets_cpu = None
-        mamba_checkpoint_state_indices_by_group_cpu = None
-        hash_block_size = self.cache_config.hash_block_size
-        if (
-            self.cache_config.mamba_cache_mode == "align"
-            and hash_block_size is not None
-            and hash_block_size < self.cache_config.block_size
-            and num_scheduled_tokens is not None
-            and mamba_checkpoint_block_ids is not None
-            and not self.use_async_spec_decode
-        ):
-            mamba_checkpoint_offsets_cpu = torch.full(
-                (num_reqs_padded,),
-                -1,
-                dtype=torch.int32,
-                device="cpu",
-            )
-            mamba_checkpoint_state_indices_by_group_cpu = {}
-            for kv_cache_gid, req_to_block_id in mamba_checkpoint_block_ids.items():
-                state_indices_cpu = torch.full(
-                    (num_reqs_padded,),
-                    -1,
-                    dtype=torch.int32,
-                    device="cpu",
-                )
-                for req_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                    block_id = req_to_block_id.get(req_id)
-                    if block_id is not None:
-                        state_indices_cpu[req_idx] = block_id
-                mamba_checkpoint_state_indices_by_group_cpu[kv_cache_gid] = (
-                    state_indices_cpu
-                )
-            assert num_computed_tokens_cpu is not None
-            for req_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                num_scheduled = num_scheduled_tokens.get(req_id, 0)
-                if num_scheduled <= 0:
-                    continue
-                if not any(
-                    req_id in req_to_block_id
-                    for req_to_block_id in mamba_checkpoint_block_ids.values()
-                ):
-                    continue
-                num_computed = int(num_computed_tokens_cpu[req_idx].item())
-                num_prompt = int(num_prompt_tokens_cpu[req_idx].item())
-                checkpoint_pos = num_prompt // hash_block_size * hash_block_size
-                chunk_end = num_computed + num_scheduled
-                if num_computed < checkpoint_pos < chunk_end:
-                    mamba_checkpoint_offsets_cpu[req_idx] = (
-                        checkpoint_pos - num_computed
-                    )
-
         # Compute mm_prefix bidirectional ranges before building
         # attention metadata so builders handle them during build().
         # Ranges exceeding sliding_window are skipped to prevent
@@ -2406,8 +2354,6 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,
-            mamba_checkpoint_offsets_cpu=mamba_checkpoint_offsets_cpu,
-            mamba_checkpoint_state_indices_cpu=None,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
         )
@@ -2529,11 +2475,6 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
-            if mamba_checkpoint_state_indices_by_group_cpu is not None:
-                cm.mamba_checkpoint_state_indices_cpu = (
-                    mamba_checkpoint_state_indices_by_group_cpu.get(kv_cache_gid)
-                )
-
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
                     self.drafter,
@@ -4335,9 +4276,6 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
-                    mamba_checkpoint_block_ids=(
-                        scheduler_output.mamba_checkpoint_block_ids
-                    ),
                 )
             )
 

@@ -350,15 +350,6 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.new_step_starts()
 
-    def take_mamba_checkpoint_block_ids(self) -> dict[int, dict[str, int]]:
-        """Drain pending Mamba checkpoint block IDs by group and request ID."""
-        ids_by_group: dict[int, dict[str, int]] = {}
-        for group_id, manager in enumerate(self.single_type_managers):
-            ids = manager.take_mamba_checkpoint_block_ids()
-            if ids:
-                ids_by_group[group_id] = ids
-        return ids_by_group
-
 
 class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
     """

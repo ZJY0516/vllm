@@ -189,24 +189,3 @@ def test_has_initial_state_after_reclassification():
     assert meta.has_initial_state is not None
     # req0 has context_lens = 65 - 1 = 64 > 0, so has_initial_state[0] = True
     assert meta.has_initial_state[0].item() is True
-
-
-def test_multiple_prefill_checkpoints_are_exposed_to_backend():
-    builder = _create_gdn_builder()
-    batch = BatchSpec(seq_lens=[45, 77], query_lens=[45, 77])
-    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
-    common.mamba_checkpoint_offsets_cpu = torch.tensor([32, 64], dtype=torch.int32)
-    common.mamba_checkpoint_state_indices_cpu = torch.tensor(
-        [101, 102], dtype=torch.int32
-    )
-
-    meta = builder.build(common_prefix_len=0, common_attn_metadata=common)
-
-    assert meta.non_spec_query_start_loc_cpu is not None
-    assert meta.non_spec_query_start_loc_cpu.tolist() == [0, 45, 122]
-    assert meta.non_spec_checkpoint_offsets_cpu is not None
-    assert meta.non_spec_checkpoint_offsets_cpu.tolist() == [32, 64]
-    assert meta.non_spec_checkpoint_state_indices_cpu is not None
-    assert meta.non_spec_checkpoint_state_indices_cpu.tolist() == [101, 102]
-    assert meta.non_spec_checkpoint_state_indices is not None
-    assert meta.non_spec_checkpoint_state_indices.tolist() == [101, 102]

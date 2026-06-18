@@ -348,10 +348,10 @@ class Scheduler(SchedulerInterface):
                 < last_cache_position
                 < num_computed_tokens_after_sched
             ):
-                # The final reusable prompt tail may cross a hash boundary.
-                # KDA/GDN materializes the Mamba checkpoint inside the forward
-                # pass, so this chunk does not need to be split here.
-                pass
+                # Stop at the final reusable prompt hash boundary. The Mamba
+                # running state at the end of this scheduler step is then the
+                # checkpoint state that can be registered in the prefix cache.
+                num_new_tokens = last_cache_position - num_computed_tokens
 
             # Marconi cache admission optimization:
             # cache common prefixes by scheduling num_new_tokens = common prefix length
@@ -1006,10 +1006,6 @@ class Scheduler(SchedulerInterface):
             else None
         )
         copy_block_ids = self.kv_cache_manager.take_copy_block_ids() or None
-        mamba_checkpoint_block_ids = (
-            self.kv_cache_manager.take_mamba_checkpoint_block_ids() or None
-        )
-
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
@@ -1034,7 +1030,6 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             copy_block_ids=copy_block_ids,
-            mamba_checkpoint_block_ids=mamba_checkpoint_block_ids,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
         )
 

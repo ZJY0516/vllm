@@ -1265,7 +1265,7 @@ def test_mamba_align_split_uses_physical_chunks_then_hash_tail():
         request=req,
         num_new_tokens=15,
     )
-    assert num_new_tokens == 15
+    assert num_new_tokens == 14
 
     req.num_computed_tokens = mamba_block_size
     num_new_tokens = Scheduler._mamba_block_aligned_split(
@@ -1273,7 +1273,28 @@ def test_mamba_align_split_uses_physical_chunks_then_hash_tail():
         request=req,
         num_new_tokens=7,
     )
-    assert num_new_tokens == 7
+    assert num_new_tokens == 6
+
+    req = make_request("1", list(range(25)), 4, sha256)
+    mock = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=20),
+        kv_cache_manager=SimpleNamespace(block_pool=SimpleNamespace(hash_block_size=4)),
+        use_eagle=False,
+    )
+    num_new_tokens = Scheduler._mamba_block_aligned_split(
+        self=mock,
+        request=req,
+        num_new_tokens=20,
+    )
+    assert num_new_tokens == 20
+
+    req.num_computed_tokens = 20
+    num_new_tokens = Scheduler._mamba_block_aligned_split(
+        self=mock,
+        request=req,
+        num_new_tokens=5,
+    )
+    assert num_new_tokens == 4
 
 
 def test_hybrid_model_mamba_align_with_dynamic_draft_tokens():
@@ -3458,7 +3479,7 @@ def test_hybrid_mamba_align_caches_chunk_end_and_final_hash_tail():
     assert len(mamba_manager._delayed_snapshot_blocks) == 1
 
 
-def test_hybrid_mamba_align_metadata_checkpoint_snapshot():
+def test_hybrid_mamba_align_does_not_checkpoint_inside_chunk():
     hash_block_size = 2
     mamba_block_size = 2 * hash_block_size
     kv_cache_config = KVCacheConfig(
@@ -3505,18 +3526,14 @@ def test_hybrid_mamba_align_metadata_checkpoint_snapshot():
     )
     assert blocks is not None
 
-    checkpoint_blocks = manager.take_mamba_checkpoint_block_ids()
-    assert set(checkpoint_blocks) == {1}
-    checkpoint_block_id = checkpoint_blocks[1]["0"]
     partial_mamba_hash = req.block_hashes.get_partial_block_hashes(mamba_block_size)[4]
     cached = manager.block_pool.get_cached_block(
         partial_mamba_hash, kv_cache_group_ids=[1]
     )
-    assert cached is not None
-    assert cached[0].block_id == checkpoint_block_id
+    assert cached is None
 
 
-def test_hybrid_metadata_split_caches_only_prompt_tail_boundary():
+def test_hybrid_scheduler_split_caches_only_prompt_tail_boundary():
     hash_block_size = 2
     physical_block_size = 2 * hash_block_size
     kv_cache_config = KVCacheConfig(
@@ -3577,11 +3594,7 @@ def test_hybrid_metadata_split_caches_only_prompt_tail_boundary():
         )
 
     req.num_computed_tokens = 8
-    assert manager.allocate_slots(req, 3, 0) is not None
-
-    checkpoint_blocks = manager.take_mamba_checkpoint_block_ids()
-    assert set(checkpoint_blocks) == {1}
-    checkpoint_block_id = checkpoint_blocks[1]["0"]
+    assert manager.allocate_slots(req, 2, 0) is not None
 
     # Only the final prompt tail boundary at 10 tokens is cached as a fine
     # alias. Intermediate partial boundaries like 2 and 6 stay uncached.
@@ -3610,8 +3623,14 @@ def test_hybrid_metadata_split_caches_only_prompt_tail_boundary():
         partial_hash, kv_cache_group_ids=[1]
     )
     assert mamba_tail is not None
-    assert mamba_tail[0].block_id == checkpoint_block_id
     assert mamba_tail[0].block_hash_num_tokens == 10
+
+    req.num_computed_tokens = 10
+    assert manager.allocate_slots(req, 1, 0) is not None
+    assert (
+        manager.block_pool.get_cached_block(partial_hash, kv_cache_group_ids=[1])
+        == mamba_tail
+    )
 
 
 def test_hybrid_full_attention_partial_hash_hit_uses_cow():
