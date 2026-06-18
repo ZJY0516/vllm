@@ -9,7 +9,6 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
-    BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
     KVCacheBlockListWithHitLength,
@@ -28,7 +27,7 @@ from vllm.v1.kv_cache_interface import (
     TQFullAttentionSpec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestBlockHashes
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -571,30 +570,33 @@ class FullAttentionManager(SingleTypeKVCacheManager):
     @classmethod
     def _find_fine_grained_cache_hit(
         cls,
-        block_hashes: BlockHashListWithBlockSize,
+        block_hashes: RequestBlockHashes,
         max_length: int,
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
         block_size: int,
     ) -> tuple[list[KVCacheBlock], ...]:
-        partial_block_hashes = block_hashes.partial_block_hashes
-        scale_factor = block_hashes.scale_factor
-        hash_block_size = block_size // scale_factor
-        max_num_hash_blocks = min(
-            max_length // hash_block_size,
-            len(partial_block_hashes),
+        partial_cache_unit = block_pool.partial_cache_unit
+        assert partial_cache_unit is not None
+        assert block_size % partial_cache_unit == 0
+        scale_factor = block_size // partial_cache_unit
+        full_block_hashes = block_hashes.get_block_hashes(block_size)
+        max_num_partial_units = min(
+            max_length // partial_cache_unit,
+            len(block_hashes),
         )
 
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
             KVCacheBlockListWithHitLength() for _ in range(len(kv_cache_group_ids))
         )
-        for fine_idx in range(max_num_hash_blocks - 1, -1, -1):
+        for fine_idx in range(max_num_partial_units - 1, -1, -1):
+            num_tokens = (fine_idx + 1) * partial_cache_unit
             is_full_block_boundary = (fine_idx + 1) % scale_factor == 0
             if is_full_block_boundary:
-                block_hash = block_hashes[fine_idx // scale_factor]
+                block_hash = full_block_hashes[fine_idx // scale_factor]
                 last_block_idx = fine_idx // scale_factor
             else:
-                block_hash = partial_block_hashes[fine_idx]
+                block_hash = block_hashes.get_partial_block_hash(block_size, num_tokens)
                 last_block_idx = fine_idx // scale_factor
 
             cached_tail = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
@@ -605,7 +607,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             prefix_ok = True
             for block_idx in range(last_block_idx):
                 cached_prefix = block_pool.get_cached_block(
-                    block_hashes[block_idx], kv_cache_group_ids
+                    full_block_hashes[block_idx], kv_cache_group_ids
                 )
                 if not cached_prefix:
                     prefix_ok = False
@@ -621,7 +623,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                 computed.extend(prefix)
                 computed.append(cached)
                 assert isinstance(computed, KVCacheBlockListWithHitLength)
-                computed.hit_length = (fine_idx + 1) * hash_block_size
+                computed.hit_length = num_tokens
             break
 
         return computed_blocks
@@ -651,7 +653,11 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         block_size = kv_cache_spec.block_size
         if dcp_world_size * pcp_world_size > 1:
             block_size *= dcp_world_size * pcp_world_size
-        if isinstance(block_hashes, BlockHashListWithBlockSize):
+        if (
+            isinstance(block_hashes, RequestBlockHashes)
+            and block_pool.partial_cache_unit is not None
+            and block_size != block_pool.partial_cache_unit
+        ):
             computed_blocks = cls._find_fine_grained_cache_hit(
                 block_hashes=block_hashes,
                 max_length=max_length,
@@ -810,7 +816,8 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         retention_interval: int | None = None,
     ) -> None:
         super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
-        if self.block_size == self.block_pool.hash_block_size:
+        partial_cache_unit = self.block_pool.partial_cache_unit
+        if partial_cache_unit is None or self.block_size == partial_cache_unit:
             return
         self._cache_final_prompt_hash_tail_only(request, num_tokens)
 
@@ -819,14 +826,17 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
     ) -> None:
-        hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
+        partial_cache_unit = self.block_pool.partial_cache_unit
+        assert partial_cache_unit is not None
+        boundary_tokens = (
+            request.num_prompt_tokens // partial_cache_unit * partial_cache_unit
+        )
         if boundary_tokens == 0 or boundary_tokens > num_tokens:
             return
         if boundary_tokens % self.block_size == 0:
             return
 
-        hash_idx = boundary_tokens // hash_block_size - 1
+        hash_idx = boundary_tokens // partial_cache_unit - 1
         num_cached_hash_blocks = self.num_cached_hash_block.get(request.request_id, 0)
         if num_cached_hash_blocks > hash_idx:
             return
@@ -1330,20 +1340,29 @@ class MambaManager(SingleTypeKVCacheManager):
         )
 
         block_size = kv_cache_spec.block_size
-        if isinstance(block_hashes, BlockHashListWithBlockSize):
-            partial_block_hashes = block_hashes.partial_block_hashes
-            scale_factor = block_hashes.scale_factor
-            hash_block_size = block_size // scale_factor
-            max_num_hash_blocks = min(
-                max_length // hash_block_size,
-                len(partial_block_hashes),
+        if (
+            isinstance(block_hashes, RequestBlockHashes)
+            and block_pool.partial_cache_unit is not None
+            and block_size != block_pool.partial_cache_unit
+        ):
+            partial_cache_unit = block_pool.partial_cache_unit
+            assert partial_cache_unit is not None
+            assert block_size % partial_cache_unit == 0
+            scale_factor = block_size // partial_cache_unit
+            full_block_hashes = block_hashes.get_block_hashes(block_size)
+            max_num_partial_units = min(
+                max_length // partial_cache_unit,
+                len(block_hashes),
             )
-            for fine_idx in range(max_num_hash_blocks - 1, -1, -1):
+            for fine_idx in range(max_num_partial_units - 1, -1, -1):
+                num_tokens = (fine_idx + 1) * partial_cache_unit
                 is_full_block_boundary = (fine_idx + 1) % scale_factor == 0
                 if is_full_block_boundary:
-                    block_hash = block_hashes[fine_idx // scale_factor]
+                    block_hash = full_block_hashes[fine_idx // scale_factor]
                 else:
-                    block_hash = partial_block_hashes[fine_idx]
+                    block_hash = block_hashes.get_partial_block_hash(
+                        block_size, num_tokens
+                    )
                 if cached_block := block_pool.get_cached_block(
                     block_hash, kv_cache_group_ids
                 ):
@@ -1352,7 +1371,7 @@ class MambaManager(SingleTypeKVCacheManager):
                         computed.extend([block_pool.null_block] * block_idx)
                         computed.append(cached)
                         assert isinstance(computed, KVCacheBlockListWithHitLength)
-                        computed.hit_length = (fine_idx + 1) * hash_block_size
+                        computed.hit_length = num_tokens
                     break
             return computed_blocks
 
@@ -1468,7 +1487,8 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             if (
                 num_tokens % self.block_size != 0
-                and num_tokens % self.block_pool.hash_block_size == 0
+                and self.block_pool.partial_cache_unit is not None
+                and num_tokens % self.block_pool.partial_cache_unit == 0
             ):
                 num_required_blocks += 1
             num_new_blocks = (
@@ -1663,15 +1683,16 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
     ) -> BlockHashWithGroupId | None:
-        if self.block_size == self.block_pool.hash_block_size:
+        partial_cache_unit = self.block_pool.partial_cache_unit
+        if partial_cache_unit is None or self.block_size == partial_cache_unit:
             return None
         if num_tokens % self.block_size == 0:
             return None
-        if num_tokens % self.block_pool.hash_block_size != 0:
+        if num_tokens % partial_cache_unit != 0:
             return None
         latest_prompt_hash_boundary = (
-            request.num_prompt_tokens // self.block_pool.hash_block_size
-        ) * self.block_pool.hash_block_size
+            request.num_prompt_tokens // partial_cache_unit
+        ) * partial_cache_unit
         if num_tokens != latest_prompt_hash_boundary:
             return None
 

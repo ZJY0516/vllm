@@ -29,7 +29,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestBlockHashes
 
 
 def _validate_prefix_cache_retention_interval(
@@ -96,6 +96,7 @@ class KVCacheCoordinator(ABC):
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
+            partial_cache_unit=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
         )
@@ -638,23 +639,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 - The number of tokens of the longest cache hit.
         """
 
-        def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
+        def _get_block_hashes(
+            kv_cache_spec: KVCacheSpec,
+            manager_cls: type[SingleTypeKVCacheManager],
+        ) -> BlockHashList:
             if kv_cache_spec.block_size == self.hash_block_size:
                 return block_hashes
-            get_block_hashes = getattr(block_hashes, "get_block_hashes", None)
-            if get_block_hashes is None:
-                raise RuntimeError(
-                    "Direct block hashes are required when KV cache block size "
-                    "differs from hash_block_size."
-                )
-            get_partial_block_hashes = getattr(
-                block_hashes, "get_partial_block_hashes", get_block_hashes
-            )
+            if isinstance(block_hashes, RequestBlockHashes):
+                if self.enable_partial_hash_hits and manager_cls in (
+                    FullAttentionManager,
+                    MambaManager,
+                ):
+                    return block_hashes
+                return block_hashes.get_block_hashes(kv_cache_spec.block_size)
             return BlockHashListWithBlockSize(
-                get_block_hashes(kv_cache_spec.block_size),
-                get_partial_block_hashes(kv_cache_spec.block_size),
-                self.hash_block_size,
-                kv_cache_spec.block_size,
+                block_hashes, self.hash_block_size, kv_cache_spec.block_size
             )
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -706,7 +705,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         curr_hit_length + spec.block_size, max_cache_hit_length
                     )
                 hit_blocks = manager_cls.find_longest_cache_hit(
-                    block_hashes=_get_block_hashes(spec),
+                    block_hashes=_get_block_hashes(spec, manager_cls),
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
                     block_pool=self.block_pool,
@@ -769,23 +768,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             (blocks_per_group, hit_lengths_per_group)
         """
 
-        def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
+        def _get_block_hashes(
+            kv_cache_spec: KVCacheSpec,
+            manager_cls: type[SingleTypeKVCacheManager],
+        ) -> BlockHashList:
             if kv_cache_spec.block_size == self.hash_block_size:
                 return block_hashes
-            get_block_hashes = getattr(block_hashes, "get_block_hashes", None)
-            if get_block_hashes is None:
-                raise RuntimeError(
-                    "Direct block hashes are required when KV cache block size "
-                    "differs from hash_block_size."
-                )
-            get_partial_block_hashes = getattr(
-                block_hashes, "get_partial_block_hashes", get_block_hashes
-            )
+            if isinstance(block_hashes, RequestBlockHashes):
+                if self.enable_partial_hash_hits and manager_cls in (
+                    FullAttentionManager,
+                    MambaManager,
+                ):
+                    return block_hashes
+                return block_hashes.get_block_hashes(kv_cache_spec.block_size)
             return BlockHashListWithBlockSize(
-                get_block_hashes(kv_cache_spec.block_size),
-                get_partial_block_hashes(kv_cache_spec.block_size),
-                self.hash_block_size,
-                kv_cache_spec.block_size,
+                block_hashes, self.hash_block_size, kv_cache_spec.block_size
             )
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
@@ -799,7 +796,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
             blocks = manager_cls.find_longest_cache_hit(
-                block_hashes=_get_block_hashes(spec),
+                block_hashes=_get_block_hashes(spec, manager_cls),
                 max_length=max_cache_hit_length,
                 kv_cache_group_ids=group_ids,
                 block_pool=self.block_pool,

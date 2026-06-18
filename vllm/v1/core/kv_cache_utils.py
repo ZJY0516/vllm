@@ -125,8 +125,7 @@ class KVCacheBlock:
     # when the block is full and cached.
     _block_hash: BlockHashWithGroupId | None = None
     # Number of prefix tokens covered by _block_hash. For full blocks this is
-    # the block boundary, while partial Mamba-align entries can end at a finer
-    # hash-block boundary inside a physical block.
+    # the full block boundary; partial aliases can end inside a cache block.
     _block_hash_num_tokens: int | None = None
 
     # Used to construct a doubly linked list for free blocks.
@@ -690,32 +689,32 @@ def resolve_kv_cache_block_sizes(
 
 
 class RequestBlockHasher:
-    """Compute request block hashes at one or more block sizes."""
+    """Compute request hashes at full-block and partial-cache boundaries."""
 
     def __init__(
         self,
-        block_size: int,
+        partial_cache_unit: int,
         caching_hash_fn: Callable[[Any], bytes],
     ) -> None:
-        self.block_size = block_size
+        self.partial_cache_unit = partial_cache_unit
         self.caching_hash_fn = caching_hash_fn
 
     def __call__(self, request: Request) -> list[BlockHash]:
-        start_token_idx = len(request.block_hashes) * self.block_size
+        start_token_idx = len(request.block_hashes) * self.partial_cache_unit
         prev_block_hash_value = (
             request.block_hashes[-1] if request.block_hashes else None
         )
         curr_mm_idx = -1 if start_token_idx > 0 else 0
         return self._compute_block_hashes(
             request=request,
-            block_size=self.block_size,
+            block_size=self.partial_cache_unit,
             start_token_idx=start_token_idx,
             prev_block_hash_value=prev_block_hash_value,
             curr_mm_idx=curr_mm_idx,
         )
 
     def get_block_hashes(self, request: Request, block_size: int) -> list[BlockHash]:
-        if block_size == self.block_size:
+        if block_size == self.partial_cache_unit:
             return request.block_hashes
         return self._compute_block_hashes(
             request=request,
@@ -725,41 +724,34 @@ class RequestBlockHasher:
             curr_mm_idx=0,
         )
 
-    def get_partial_block_hashes(
-        self, request: Request, block_size: int
-    ) -> list[BlockHash]:
-        if block_size == self.block_size:
-            return request.block_hashes
+    def get_partial_block_hash(
+        self, request: Request, block_size: int, num_tokens: int
+    ) -> BlockHash:
+        assert num_tokens % self.partial_cache_unit == 0
+        if block_size == self.partial_cache_unit:
+            return request.block_hashes[num_tokens // self.partial_cache_unit - 1]
 
-        assert block_size % self.block_size == 0
+        assert block_size % self.partial_cache_unit == 0
         full_block_hashes = self.get_block_hashes(request, block_size)
-        partial_block_hashes: list[BlockHash] = []
+        if num_tokens % block_size == 0:
+            full_block_idx = num_tokens // block_size - 1
+            return full_block_hashes[full_block_idx]
 
-        for hash_idx in range(len(request.block_hashes)):
-            num_tokens = (hash_idx + 1) * self.block_size
-            if num_tokens % block_size == 0:
-                full_block_idx = num_tokens // block_size - 1
-                partial_block_hashes.append(full_block_hashes[full_block_idx])
-                continue
-
-            full_block_idx = num_tokens // block_size
-            block_start = full_block_idx * block_size
-            parent_block_hash = (
-                full_block_hashes[full_block_idx - 1] if full_block_idx > 0 else None
-            )
-            extra_keys, _ = generate_block_hash_extra_keys(
-                request, block_start, num_tokens, 0
-            )
-            partial_block_hashes.append(
-                hash_block_tokens(
-                    self.caching_hash_fn,
-                    parent_block_hash,
-                    request.all_token_ids[block_start:num_tokens],
-                    extra_keys,
-                )
-            )
-
-        return partial_block_hashes
+        full_block_idx = num_tokens // block_size
+        block_start = full_block_idx * block_size
+        parent_block_hash = (
+            full_block_hashes[full_block_idx - 1] if full_block_idx > 0 else None
+        )
+        curr_mm_idx = -1 if block_start > 0 else 0
+        extra_keys, _ = generate_block_hash_extra_keys(
+            request, block_start, num_tokens, curr_mm_idx
+        )
+        return hash_block_tokens(
+            self.caching_hash_fn,
+            parent_block_hash,
+            request.all_token_ids[block_start:num_tokens],
+            extra_keys,
+        )
 
     def _compute_block_hashes(
         self,
@@ -802,13 +794,13 @@ class RequestBlockHasher:
 
 
 def get_request_block_hasher(
-    block_size: int,
+    partial_cache_unit: int,
     caching_hash_fn: Callable[[Any], bytes],
 ) -> Callable[[Request], list[BlockHash]]:
     """
     Returns a function which computes the list of un-computed block hashes
     of a request."""
-    return RequestBlockHasher(block_size, caching_hash_fn)
+    return RequestBlockHasher(partial_cache_unit, caching_hash_fn)
 
 
 def _check_enough_kv_cache_memory(
@@ -2188,37 +2180,47 @@ def get_kv_cache_configs(
 
 class BlockHashListWithBlockSize:
     """
-    Pair direct full-block hashes with partial-boundary hashes.
+    Convert block-hash granularity from `hash_block_size` to `target_block_size`.
+    Used when KV cache groups have different block sizes: `hash_block_size`
+    is the size used to compute the original `block_hashes`; `target_block_size`
+    is the group's actual block size.
 
-    `block_hashes` are direct hashes computed at `target_block_size`.
-    `partial_block_hashes` are lookup keys for hash-block boundaries. For
-    boundaries inside a target cache block, the key is computed from the
-    previous full-block key plus the current block's partial tail tokens.
-    Full-block lookup uses `block_hashes`; partial lookup probes
-    `partial_block_hashes` for a hash boundary inside a full cache block.
+    Currently, only scaling up by an integer factor is supported (i.e.,
+    `target_block_size` is a multiple of `hash_block_size`). Conversion is
+    performed lazily on access for efficiency, by concatenating consecutive
+    hashes at `hash_block_size` to form each hash at `target_block_size`.
+
+    Example (`hash_block_size` = 16, `target_block_size` = 32):
+    concatenating two 16-size hashes yields one 32-size hash:
+
+    Block hashes with block_size 16:
+    | Token Range | 0-15 | 16-31 | 32-47 | 48-63 |
+    |-------------|------|-------|-------|-------|
+    | Hash        | A    | B     | C     | D     |
+
+    Block hashes with block_size 32:
+    | Token Range | 0-31 | 32-63 |
+    |-------------|------|-------|
+    | Hash        | AB   | CD    |
 
     Args:
-        block_hashes: Direct block hashes computed at `target_block_size`.
-        partial_block_hashes: Partial-boundary hashes at `hash_block_size`
-            granularity.
-        hash_block_size: Block size at which `partial_block_hashes` are indexed.
-        target_block_size: Block size at which `block_hashes` were computed.
+        block_hashes: Block hashes to convert, computed at `hash_block_size`.
+        hash_block_size: Block size at which `block_hashes` were computed.
+        target_block_size: Desired block size; must be a multiple of `hash_block_size`.
     """
 
     def __init__(
         self,
         block_hashes: list[BlockHash],
-        partial_block_hashes: list[BlockHash],
         hash_block_size: int,
         target_block_size: int,
     ):
-        assert target_block_size % hash_block_size == 0
         self.block_hashes = block_hashes
-        self.partial_block_hashes = partial_block_hashes
+        assert target_block_size % hash_block_size == 0
         self.scale_factor = target_block_size // hash_block_size
 
     def __len__(self) -> int:
-        return len(self.block_hashes)
+        return len(self.block_hashes) // self.scale_factor
 
     @overload
     def __getitem__(self, idx: int) -> BlockHash: ...
@@ -2237,10 +2239,13 @@ class BlockHashListWithBlockSize:
         raise TypeError(f"Invalid index type: {type(idx)!r}")
 
     def __iter__(self) -> Iterator[BlockHash]:
-        return iter(self.block_hashes)
+        for i in range(len(self)):
+            yield self._get_value_at(i)
 
     def _get_value_at(self, idx: int) -> BlockHash:
-        return self.block_hashes[idx]
+        base = idx * self.scale_factor
+        end = base + self.scale_factor
+        return BlockHash(b"".join(self.block_hashes[base:end]))
 
 
 BlockHashList = list[BlockHash] | BlockHashListWithBlockSize

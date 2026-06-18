@@ -269,8 +269,7 @@ def test_partial_block_promotes_to_direct_full_block_hash():
     assert blocks is not None
     manager.cache_blocks(req0, req0.num_tokens)
 
-    partial_hashes = req0.block_hashes.get_partial_block_hashes(block_size)
-    partial_hash = partial_hashes[2]
+    partial_hash = req0.block_hashes.get_partial_block_hash(block_size, 6)
     assert partial_hash != req0.block_hashes[2]
     partial_full_block = manager.block_pool.get_cached_block(
         partial_hash, kv_cache_group_ids=[0]
@@ -321,22 +320,24 @@ def test_partial_tail_hash_uses_previous_full_block_parent():
     req = make_request("0", token_ids, hash_block_size, sha256)
 
     full_hashes = req.block_hashes.get_block_hashes(block_size)
-    partial_hashes = req.block_hashes.get_partial_block_hashes(block_size)
+    partial_hash_6 = req.block_hashes.get_partial_block_hash(block_size, 6)
+    partial_hash_8 = req.block_hashes.get_partial_block_hash(block_size, 8)
+    partial_hash_10 = req.block_hashes.get_partial_block_hash(block_size, 10)
 
-    assert partial_hashes[2] == full_hashes[0]
-    assert partial_hashes[3] == hash_block_tokens(
+    assert partial_hash_6 == full_hashes[0]
+    assert partial_hash_8 == hash_block_tokens(
         sha256,
         full_hashes[0],
         token_ids[block_size : block_size + hash_block_size],
     )
-    assert partial_hashes[4] == hash_block_tokens(
+    assert partial_hash_10 == hash_block_tokens(
         sha256,
         full_hashes[0],
         token_ids[block_size : block_size + 2 * hash_block_size],
     )
-    assert partial_hashes[4] != hash_block_tokens(
+    assert partial_hash_10 != hash_block_tokens(
         sha256,
-        partial_hashes[3],
+        partial_hash_8,
         token_ids[block_size + hash_block_size : block_size + 2 * hash_block_size],
     )
 
@@ -344,6 +345,7 @@ def test_partial_tail_hash_uses_previous_full_block_parent():
         num_gpu_blocks=2,
         enable_caching=True,
         hash_block_size=hash_block_size,
+        partial_cache_unit=hash_block_size,
         enable_kv_cache_events=True,
     )
     block = pool.get_new_blocks(1)[0]
@@ -355,8 +357,8 @@ def test_partial_tail_hash_uses_previous_full_block_parent():
         block_size=block_size,
     )
     assert alias_hash is not None
-    assert get_block_hash(alias_hash) == partial_hashes[4]
-    assert pool.get_cached_block(partial_hashes[4], kv_cache_group_ids=[0]) == [block]
+    assert get_block_hash(alias_hash) == partial_hash_10
+    assert pool.get_cached_block(partial_hash_10, kv_cache_group_ids=[0]) == [block]
     assert pool.get_cached_block(req.block_hashes[4], kv_cache_group_ids=[0]) is None
 
     events = pool.take_events()
@@ -364,7 +366,7 @@ def test_partial_tail_hash_uses_previous_full_block_parent():
     stored_event = events[0]
     assert isinstance(stored_event, BlockStored)
     assert stored_event.block_hashes == [
-        kv_cache_utils.maybe_convert_block_hash(partial_hashes[4])
+        kv_cache_utils.maybe_convert_block_hash(partial_hash_10)
     ]
     assert stored_event.parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
         full_hashes[0]
@@ -2619,6 +2621,7 @@ def test_cache_block_alias_kv_cache_events():
         num_gpu_blocks=2,
         enable_caching=True,
         hash_block_size=hash_block_size,
+        partial_cache_unit=hash_block_size,
         enable_kv_cache_events=True,
     )
     req = make_request(
@@ -3305,7 +3308,7 @@ def test_hybrid_mamba_align_partial_hash_hit():
 
     # The Mamba group cannot form a full 4-token block for tokens [4, 6), but
     # it should still be registered under the chained hash for that boundary.
-    partial_mamba_hash = req0.block_hashes.get_partial_block_hashes(mamba_block_size)[2]
+    partial_mamba_hash = req0.block_hashes.get_partial_block_hash(mamba_block_size, 6)
     partial_mamba_block = manager.block_pool.get_cached_block(
         partial_mamba_hash, kv_cache_group_ids=[1]
     )
@@ -3376,7 +3379,7 @@ def test_hybrid_mamba_align_partial_hash_hit_crosses_state_block():
     manager.free(req0)
     manager.new_step_starts()
 
-    partial_mamba_hash = req0.block_hashes.get_partial_block_hashes(mamba_block_size)[2]
+    partial_mamba_hash = req0.block_hashes.get_partial_block_hash(mamba_block_size, 6)
     partial_mamba_block = manager.block_pool.get_cached_block(
         partial_mamba_hash, kv_cache_group_ids=[1]
     )
@@ -3472,7 +3475,7 @@ def test_hybrid_mamba_align_caches_chunk_end_and_final_hash_tail():
     req.num_computed_tokens = 8
     blocks = manager.allocate_slots(req, 2, 0)
     assert blocks is not None
-    partial_mamba_hash = req.block_hashes.get_partial_block_hashes(mamba_block_size)[4]
+    partial_mamba_hash = req.block_hashes.get_partial_block_hash(mamba_block_size, 10)
     assert manager.block_pool.get_cached_block(
         partial_mamba_hash, kv_cache_group_ids=[1]
     )
@@ -3526,7 +3529,7 @@ def test_hybrid_mamba_align_does_not_checkpoint_inside_chunk():
     )
     assert blocks is not None
 
-    partial_mamba_hash = req.block_hashes.get_partial_block_hashes(mamba_block_size)[4]
+    partial_mamba_hash = req.block_hashes.get_partial_block_hash(mamba_block_size, 10)
     cached = manager.block_pool.get_cached_block(
         partial_mamba_hash, kv_cache_group_ids=[1]
     )
@@ -3612,7 +3615,7 @@ def test_hybrid_scheduler_split_caches_only_prompt_tail_boundary():
             is None
         )
 
-    partial_hash = req.block_hashes.get_partial_block_hashes(physical_block_size)[4]
+    partial_hash = req.block_hashes.get_partial_block_hash(physical_block_size, 10)
     full_tail = manager.block_pool.get_cached_block(
         partial_hash, kv_cache_group_ids=[0]
     )
@@ -3674,7 +3677,7 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
     manager.free(req0)
     manager.new_step_starts()
 
-    partial_full_hash = req0.block_hashes.get_partial_block_hashes(block_size)[2]
+    partial_full_hash = req0.block_hashes.get_partial_block_hash(block_size, 6)
     partial_full_block = manager.block_pool.get_cached_block(
         partial_full_hash, kv_cache_group_ids=[0]
     )
