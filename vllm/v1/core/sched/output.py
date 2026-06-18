@@ -240,6 +240,10 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # CoW copies to apply after zeroing new blocks and before forward.
+    # Each tuple is (kv_cache_group_id, src_block_id, dst_block_id, num_tokens).
+    copy_block_ids: list[tuple[int, int, int, int]] | None = None
+
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0

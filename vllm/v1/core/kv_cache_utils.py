@@ -182,6 +182,18 @@ class KVCacheBlock:
         )
 
 
+class KVCacheBlockListWithHitLength(list[KVCacheBlock]):
+    """A block list carrying the exact token length it represents."""
+
+    def __init__(
+        self,
+        blocks: Sequence[KVCacheBlock] = (),
+        hit_length: int | None = None,
+    ) -> None:
+        super().__init__(blocks)
+        self.hit_length = hit_length
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python
