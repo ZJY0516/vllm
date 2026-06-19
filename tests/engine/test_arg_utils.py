@@ -477,12 +477,15 @@ def test_prefix_cache_default():
     assert not engine_args.enable_prefix_caching
 
 
-def test_hash_block_size_cli_arg():
+def test_partial_cache_unit_cli_arg():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    args = parser.parse_args(["--hash-block-size", "32"])
+    args = parser.parse_args(["--partial-cache-unit", "32"])
 
     engine_args = EngineArgs.from_cli_args(args=args)
-    assert engine_args.hash_block_size == 32
+    assert engine_args.partial_cache_unit == 32
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--hash-block-size", "32"])
 
 
 @pytest.mark.parametrize(

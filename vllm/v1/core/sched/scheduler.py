@@ -262,6 +262,7 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             scheduler_block_size=self.block_size,
             hash_block_size=hash_block_size,
+            partial_cache_unit=self.cache_config.partial_cache_unit,
             metrics_collector=self.kv_metrics_collector,
             watermark=self.scheduler_config.watermark,
         )
@@ -352,12 +353,15 @@ class Scheduler(SchedulerInterface):
             # finer hash boundary even when it is not physical-block aligned.
             physical_block_size = self.cache_config.block_size
             hash_block_size = self.kv_cache_manager.block_pool.hash_block_size
+            cache_boundary_unit = (
+                self.kv_cache_manager.block_pool.partial_cache_unit or hash_block_size
+            )
             last_cache_position = (
-                request.num_tokens - request.num_tokens % hash_block_size
+                request.num_tokens - request.num_tokens % cache_boundary_unit
             )
             # eagle prune
             if self.use_eagle:
-                last_cache_position = max(last_cache_position - hash_block_size, 0)
+                last_cache_position = max(last_cache_position - cache_boundary_unit, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
 
             if num_computed_tokens_after_sched < last_cache_position:
@@ -378,13 +382,15 @@ class Scheduler(SchedulerInterface):
             # Marconi cache admission optimization:
             # cache common prefixes by scheduling num_new_tokens = common prefix length
             if (
-                num_uncached_common_prefix_tokens >= hash_block_size
+                num_uncached_common_prefix_tokens >= cache_boundary_unit
                 and num_new_tokens > num_uncached_common_prefix_tokens
             ):
                 num_new_tokens = num_uncached_common_prefix_tokens
-                # Keep alignment to hash block size. The next scheduling round
+                # Keep alignment to cache boundary size. The next scheduling round
                 # will still stop at any intervening physical Mamba boundary.
-                num_new_tokens = num_new_tokens // hash_block_size * hash_block_size
+                num_new_tokens = (
+                    num_new_tokens // cache_boundary_unit * cache_boundary_unit
+                )
         return num_new_tokens
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:

@@ -146,6 +146,7 @@ class EngineCore:
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
+        partial_cache_unit = vllm_config.cache_config.partial_cache_unit
 
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
@@ -214,8 +215,9 @@ class EngineCore:
             )
             init_none_hash(caching_hash_fn)
 
+            request_hash_block_size = partial_cache_unit or hash_block_size
             self.request_block_hasher = get_request_block_hasher(
-                hash_block_size, caching_hash_fn
+                request_hash_block_size, caching_hash_fn
             )
 
         self.step_fn = (

@@ -647,6 +647,19 @@ def resolve_kv_cache_block_sizes(
 
     if len(groups) <= 1:  # Single group: block_size * dcp * pcp
         bs = cache_config.block_size * dcp * pcp
+        partial_cache_unit = cache_config.partial_cache_unit
+        if partial_cache_unit is not None:
+            if partial_cache_unit > bs:
+                raise ValueError(
+                    f"Invalid partial_cache_unit={partial_cache_unit}; it must "
+                    f"be less than or equal to hash_block_size={bs}."
+                )
+            if bs % partial_cache_unit != 0:
+                raise ValueError(
+                    f"Invalid partial_cache_unit={partial_cache_unit}; "
+                    f"cache block size {bs} must be divisible by "
+                    "partial_cache_unit."
+                )
         return bs, bs
 
     if dcp != 1 or pcp != 1:
@@ -685,6 +698,19 @@ def resolve_kv_cache_block_sizes(
             f"block sizes must be divisible by hash_block_size. "
             f"Got group block sizes={group_block_sizes}."
         )
+    partial_cache_unit = cache_config.partial_cache_unit
+    if partial_cache_unit is not None:
+        if partial_cache_unit > hash_block_size:
+            raise ValueError(
+                f"Invalid partial_cache_unit={partial_cache_unit}; it must be "
+                f"less than or equal to hash_block_size={hash_block_size}."
+            )
+        if any(bs % partial_cache_unit != 0 for bs in group_block_sizes):
+            raise ValueError(
+                f"Invalid partial_cache_unit={partial_cache_unit}; all KV "
+                "cache group block sizes must be divisible by "
+                f"partial_cache_unit. Got group block sizes={group_block_sizes}."
+            )
     return scheduler_block_size, hash_block_size
 
 
