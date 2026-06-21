@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     KVCacheBlock,
+    kv_cache_group_is_replicated,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -87,13 +88,37 @@ class KVCacheCoordinator(ABC):
         )
         self.scheduler_block_size = scheduler_block_size
 
-        self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
-        )
+        # Sparse-MLA replicate-K: when num_blocks_per_group is set, each KV-cache
+        # group gets its OWN block pool (own block-id space [0, N_g)), so the
+        # replicated indexer group cannot starve the sharded main group's pool.
+        # Otherwise all groups share one pool (default for every other model).
+        num_groups = len(kv_cache_config.kv_cache_groups)
+        num_blocks_per_group = kv_cache_config.num_blocks_per_group
+        self.uses_per_group_pools = num_blocks_per_group is not None
+        if num_blocks_per_group is not None:
+            assert len(num_blocks_per_group) == num_groups
+            self.block_pools = [
+                BlockPool(
+                    num_gpu_blocks=nb,
+                    enable_caching=enable_caching,
+                    hash_block_size=hash_block_size,
+                    enable_kv_cache_events=enable_kv_cache_events,
+                    metrics_collector=metrics_collector,
+                )
+                for nb in num_blocks_per_group
+            ]
+        else:
+            shared_pool = BlockPool(
+                num_gpu_blocks=kv_cache_config.num_blocks,
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+            )
+            self.block_pools = [shared_pool] * num_groups
+        # Representative pool for code paths that don't distinguish groups
+        # (single-group models, prefix-cache reset/evict aggregation).
+        self.block_pool = self.block_pools[0]
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -108,11 +133,22 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[i],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
-                pcp_world_size=pcp_world_size,
+                # Sparse-MLA replicate-K: the replicated indexer group is NOT
+                # CP-sharded (dcp=pcp=1 -> manager keeps block_size, allocates
+                # the full per-rank capacity).
+                dcp_world_size=(
+                    1
+                    if kv_cache_group_is_replicated(kv_cache_group)
+                    else dcp_world_size
+                ),
+                pcp_world_size=(
+                    1
+                    if kv_cache_group_is_replicated(kv_cache_group)
+                    else pcp_world_size
+                ),
                 scheduler_block_size=self.scheduler_block_size,
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
@@ -159,29 +195,122 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        return sum(
+            self._blocks_to_allocate_per_group(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                num_encoder_tokens,
+                total_computed_tokens,
+                num_tokens_main_model,
+                apply_admission_cap=apply_admission_cap,
+            )
+        )
+
+    def _blocks_to_allocate_per_group(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> list[int]:
+        """Per-group block counts needed for the request (parallel to
+        ``single_type_managers``); the sum is ``get_num_blocks_to_allocate``."""
+        per_group: list[int] = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_encoder_tokens,
-                    [],
-                    0,
-                    num_encoder_tokens,
-                    apply_admission_cap=apply_admission_cap,
+                per_group.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_encoder_tokens,
+                        [],
+                        0,
+                        num_encoder_tokens,
+                        apply_admission_cap=apply_admission_cap,
+                    )
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_tokens,
-                    new_computed_blocks[i],
-                    total_computed_tokens,
-                    num_tokens_main_model,
-                    apply_admission_cap=apply_admission_cap,
+                per_group.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_tokens,
+                        new_computed_blocks[i],
+                        total_computed_tokens,
+                        num_tokens_main_model,
+                        apply_admission_cap=apply_admission_cap,
+                    )
                 )
-        return num_blocks_to_allocate
+        return per_group
+
+    def has_free_blocks(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        watermark: float = 0.0,
+        reserved_blocks: int = 0,
+        apply_admission_cap: bool = False,
+    ) -> bool:
+        """Admission check. With per-group pools (replicate-K) each group's pool
+        is checked independently (the replicated indexer pool would otherwise be
+        masked by the larger main pool); otherwise the shared pool is checked
+        against the summed demand. Watermark is a fraction of each checked pool."""
+        per_group = self._blocks_to_allocate_per_group(
+            request_id,
+            num_tokens,
+            new_computed_blocks,
+            num_encoder_tokens,
+            total_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap=apply_admission_cap,
+        )
+        if self.uses_per_group_pools:
+            for need, pool in zip(per_group, self.block_pools):
+                watermark_blocks = int(watermark * pool.num_gpu_blocks)
+                required = need + watermark_blocks + reserved_blocks
+                if required > pool.get_num_free_blocks():
+                    return False
+            return True
+        watermark_blocks = int(watermark * self.block_pool.num_gpu_blocks)
+        required = sum(per_group) + watermark_blocks + reserved_blocks
+        return required <= self.block_pool.get_num_free_blocks()
+
+    def unique_block_pools(self) -> list[BlockPool]:
+        """Distinct block pools (``block_pools`` repeats the shared pool when all
+        groups share one; per-group pools are distinct)."""
+        seen: set[int] = set()
+        pools: list[BlockPool] = []
+        for pool in self.block_pools:
+            if id(pool) not in seen:
+                seen.add(id(pool))
+                pools.append(pool)
+        return pools
+
+    def get_kv_cache_usage(self) -> float:
+        """Aggregate KV cache usage across all (per-group) block pools."""
+        pools = self.unique_block_pools()
+        total = sum(p.num_gpu_blocks for p in pools)
+        if total == 0:
+            return 0.0
+        free = sum(p.get_num_free_blocks() for p in pools)
+        return 1.0 - free / total
+
+    def reset_prefix_cache(self) -> bool:
+        return all(pool.reset_prefix_cache() for pool in self.unique_block_pools())
+
+    def take_events(self) -> list:
+        events: list = []
+        for pool in self.unique_block_pools():
+            events.extend(pool.take_events())
+        return events
 
     def allocate_new_computed_blocks(
         self,
@@ -544,8 +673,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             g.kv_cache_spec.block_size % hash_block_size == 0
             for g in kv_cache_config.kv_cache_groups
         ), "block_size must be divisible by hash_block_size"
-        assert dcp_world_size == 1, "DCP not support hybrid attn now."
-        assert pcp_world_size == 1, "PCP not support hybrid attn now."
+        # Sparse-MLA replicate-K is the one hybrid+CP case we support: the
+        # replicated indexer group runs at dcp=1 while the sharded main MLA group
+        # runs at the global dcp. Allow CP when a replicated group is present;
+        # other hybrid models (Mamba+attn, SWA) still disallow CP.
+        has_replicated = any(
+            kv_cache_group_is_replicated(g) for g in kv_cache_config.kv_cache_groups
+        )
+        assert dcp_world_size == 1 or has_replicated, "DCP not support hybrid attn now."
+        assert pcp_world_size == 1 or has_replicated, "PCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
 
     def verify_and_split_kv_cache_groups(self) -> None:
@@ -688,14 +824,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     _max_length = min(
                         curr_hit_length + spec.block_size, max_cache_hit_length
                     )
+                # Sparse-MLA replicate-K: groups can have different DCP world
+                # sizes (replicated indexer = 1, sharded main = global). Pass the
+                # per-group value so cache-hit length accounts for how many
+                # tokens each block covers.
+                group_mgr = self.single_type_managers[group_ids[0]]
                 hit_blocks = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
+                    block_pool=group_mgr.block_pool,
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self.scheduler_block_size,
+                    dcp_world_size=group_mgr.dcp_world_size,
+                    pcp_world_size=group_mgr.pcp_world_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * spec.block_size
                 if drop_eagle_block:
@@ -757,10 +900,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 block_hashes=_get_block_hashes(spec),
                 max_length=max_cache_hit_length,
                 kv_cache_group_ids=group_ids,
-                block_pool=self.block_pool,
+                block_pool=self.single_type_managers[group_ids[0]].block_pool,
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self.scheduler_block_size,
+                dcp_world_size=self.single_type_managers[group_ids[0]].dcp_world_size,
+                pcp_world_size=self.single_type_managers[group_ids[0]].pcp_world_size,
             )
             group_hit = len(blocks[0]) * spec.block_size
             for gid, blks in zip(group_ids, blocks):

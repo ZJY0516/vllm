@@ -308,9 +308,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        # Sparse-MLA replicate-K: the indexer K cache is replicated (not
+        # CP-sharded), so its block table spans the full (unsharded) sequence
+        # (total_cp = 1). Sharded caches use the real CP world size.
+        indexer_total_cp = (
+            1
+            if getattr(self.kv_cache_spec, "is_replicated", False)
+            else get_total_cp_world_size()
+        )
         max_num_blocks_per_req = cdiv(
             self.vllm_config.model_config.max_model_len,
-            self.kv_cache_spec.block_size * get_total_cp_world_size(),
+            self.kv_cache_spec.block_size * indexer_total_cp,
         )
         self.expanded_block_table_buffer = torch.zeros(
             (

@@ -2414,3 +2414,49 @@ def test_hma_not_disabled_when_kv_events_enabled():
     assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False, (
         "kv_events_config must not force-disable the hybrid KV cache manager."
     )
+
+
+def _mla_spec(head_size: int, *, replicated: bool, cache_dtype_str=None):
+    return MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=head_size,
+        dtype=torch.uint8,
+        cache_dtype_str=cache_dtype_str,
+        is_replicated=replicated,
+    )
+
+
+def test_mla_replicate_k_grouping_split():
+    """Sparse-MLA replicate-K: the replicated indexer cache must form its own
+    KV-cache group, separate from the sharded main MLA cache, even though both
+    share the same block_size."""
+    main = _mla_spec(576, replicated=False, cache_dtype_str="fp8_ds_mla")
+    idx = _mla_spec(132, replicated=True)
+    spec = {"mla.0": main, "mla.1": main, "idx.0": idx, "idx.1": idx}
+
+    groups = kv_cache_utils._get_kv_cache_groups_mla_replicate(spec)
+    assert groups is not None and len(groups) == 2
+    # Sharded group first, replicated group second.
+    sharded, replicated = groups
+    assert set(sharded.layer_names) == {"mla.0", "mla.1"}
+    assert set(replicated.layer_names) == {"idx.0", "idx.1"}
+    assert not kv_cache_utils.kv_cache_group_is_replicated(sharded)
+    assert kv_cache_utils.kv_cache_group_is_replicated(replicated)
+
+
+def test_mla_replicate_k_grouping_noop_without_replicated():
+    """No replicated spec -> helper returns None (normal grouping path)."""
+    main = _mla_spec(576, replicated=False, cache_dtype_str="fp8_ds_mla")
+    spec = {"mla.0": main, "mla.1": main}
+    assert kv_cache_utils._get_kv_cache_groups_mla_replicate(spec) is None
+
+
+def test_mla_replicate_spec_storage_and_merge():
+    """Replicated marker does not change storage_block_size (block stays 64) and
+    survives merge."""
+    idx = _mla_spec(132, replicated=True)
+    assert idx.is_replicated is True
+    assert idx.storage_block_size == 64  # block_size unchanged for replicate-K
+    merged = MLAAttentionSpec.merge([idx, idx])
+    assert merged.is_replicated is True

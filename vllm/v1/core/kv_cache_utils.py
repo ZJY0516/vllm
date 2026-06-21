@@ -590,6 +590,16 @@ def hash_block_tokens(
     )
 
 
+def kv_cache_group_is_replicated(group: KVCacheGroupSpec) -> bool:
+    """True if this KV cache group is CP-replicated (sparse-MLA indexer)."""
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        specs: Iterable[KVCacheSpec] = spec.kv_cache_specs.values()
+    else:
+        specs = [spec]
+    return any(isinstance(s, MLAAttentionSpec) and s.is_replicated for s in specs)
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -617,13 +627,26 @@ def resolve_kv_cache_block_sizes(
         bs = cache_config.block_size * dcp * pcp
         return bs, bs
 
-    if dcp != 1 or pcp != 1:
+    # Sparse-MLA "replicate-K": the replicated indexer group is NOT CP-sharded
+    # (dcp=1, fine block_size), the sharded main MLA group is (block_size*dcp).
+    # This is the only multi-group + CP case we allow; use per-group EFFECTIVE
+    # block sizes so the scheduler aligns to the coarsest (sharded) group while
+    # prefix-cache hashing can stay fine-grained (the replicated group).
+    has_replicated = any(kv_cache_group_is_replicated(g) for g in groups)
+    if (dcp != 1 or pcp != 1) and not has_replicated:
         raise ValueError(
             "Hybrid KV cache groups with multiple block sizes do not "
             "support context parallelism (dcp_world_size/pcp_world_size > 1)."
         )
 
-    group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+    if has_replicated:
+        group_block_sizes = [
+            g.kv_cache_spec.block_size
+            * (1 if kv_cache_group_is_replicated(g) else dcp * pcp)
+            for g in groups
+        ]
+    else:
+        group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors
@@ -901,20 +924,40 @@ def get_max_concurrency_for_kv_cache_config(
 ) -> float:
     """
     Get the maximum concurrency for the given KV cache configuration.
+
+    The block pool counts SLOTS (block ids), not bytes. A block id is allocated
+    once per group (shared by all layers in the group), so a max-length request
+    consumes ``cdiv(max_model_len, block_size * cp)`` slots per group, where cp =
+    1 for a CP-replicated group (it stores every token) and dcp*pcp for a sharded
+    group. The byte-based estimate undercounts pool pressure for heterogeneous
+    groups (e.g. sparse-MLA replicate-K, where the replicated indexer eats dcp×
+    more slots than the sharded main MLA) — so compute it slot-based here.
     """
-    num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
-    )
-    max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
-        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
-    )
-    memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
-    )
-    num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
-    max_concurrency = kv_cache_config.num_blocks / num_block_per_request
-    return max_concurrency
+    groups = kv_cache_config.kv_cache_groups
+    # Pool slots a max-length request consumes per group. ``max_memory_usage_bytes``
+    # already accounts for sliding windows and CP sharding (and replicate-K's
+    # override skips the /dcp), so cdiv(per-request bytes, bytes-per-block) is the
+    # true per-group slot count. The previous byte-ratio form (total bytes /
+    # groups[0] page) under-counted heterogeneous groups — e.g. sparse-MLA
+    # replicate-K, where the replicated indexer eats dcp× more slots than the
+    # sharded main MLA from the shared pool.
+    per_group_blocks_per_request = [
+        cdiv(
+            g.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            g.kv_cache_spec.page_size_bytes,
+        )
+        for g in groups
+    ]
+    if kv_cache_config.num_blocks_per_group is not None:
+        # Per-group pools (replicate-K B1): bottleneck is the min over groups.
+        return min(
+            nbg / max(bpr, 1)
+            for nbg, bpr in zip(
+                kv_cache_config.num_blocks_per_group, per_group_blocks_per_request
+            )
+        )
+    # Shared pool: one request draws slots from all groups out of the same pool.
+    return kv_cache_config.num_blocks / max(sum(per_group_blocks_per_request), 1)
 
 
 def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
@@ -1244,6 +1287,73 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _get_kv_cache_config_per_group_pools(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor], list[int]]:
+    """Sparse-MLA "replicate-K": give each KV-cache group its OWN block pool.
+
+    A CP-replicated group (the lightning indexer) consumes ``dcp×`` more block
+    slots per request than the sharded main MLA group (block id allocated per
+    group, replicated group stores every token), so a single shared pool lets
+    it starve the main group's sharding savings. Here each group gets its own
+    pool, sized so all groups reach the SAME token capacity:
+
+        N_g = cdiv(T, block_g * cp_g),   sum_g(N_g * bytes_per_block_g) = avail
+        => T = avail / sum_g(bytes_per_block_g / (block_g * cp_g))
+
+    Each group's tensors are indexed by that group's own block-id space
+    ``[0, N_g)``. Returns (num_blocks_total, kv_cache_tensors, num_blocks_per_group).
+    """
+    dcp = vllm_config.parallel_config.decode_context_parallel_size
+    pcp = vllm_config.parallel_config.prefill_context_parallel_size
+
+    bytes_per_block: list[int] = []
+    tokens_per_block: list[int] = []  # effective tokens per block id for the group
+    for g in kv_cache_groups:
+        spec = g.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            per_layer = spec.kv_cache_specs
+            grp_bytes = sum(s.page_size_bytes for s in per_layer.values())
+        else:
+            grp_bytes = spec.page_size_bytes * len(g.layer_names)
+        cp = 1 if kv_cache_group_is_replicated(g) else dcp * pcp
+        bytes_per_block.append(grp_bytes)
+        tokens_per_block.append(spec.block_size * cp)
+
+    denom = sum(b / t for b, t in zip(bytes_per_block, tokens_per_block))
+    capacity_tokens = available_memory / denom
+    num_blocks_per_group = [
+        may_override_num_blocks(vllm_config, max(int(capacity_tokens // t), 1))
+        for t in tokens_per_block
+    ]
+    logger.info(
+        "Sparse-MLA replicate-K per-group block pools: num_blocks_per_group=%s "
+        "(replicated=%s), balanced token capacity=%d",
+        num_blocks_per_group,
+        [kv_cache_group_is_replicated(g) for g in kv_cache_groups],
+        int(capacity_tokens),
+    )
+
+    kv_cache_tensors: list[KVCacheTensor] = []
+    for g, nb in zip(kv_cache_groups, num_blocks_per_group):
+        spec = g.kv_cache_spec
+        per_layer = (
+            spec.kv_cache_specs
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else {ln: spec for ln in g.layer_names}
+        )
+        for layer_name in g.layer_names:
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=per_layer[layer_name].page_size_bytes * nb,
+                    shared_by=[layer_name],
+                )
+            )
+    return sum(num_blocks_per_group), kv_cache_tensors, num_blocks_per_group
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1269,8 +1379,22 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    # Sparse-MLA replicate-K default: each group shares one pool (None).
+    num_blocks_per_group: list[int] | None = None
+
     # Determine how model runners should initialize the KV cache tensors.
-    if len(kv_cache_groups) == 1 and isinstance(
+    if any(kv_cache_group_is_replicated(g) for g in kv_cache_groups) and all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_groups
+    ):
+        # Sparse-MLA replicate-K: per-group block pools so the replicated indexer
+        # group does not starve the sharded main MLA group's capacity.
+        num_blocks, kv_cache_tensors, num_blocks_per_group = (
+            _get_kv_cache_config_per_group_pools(
+                vllm_config, kv_cache_groups, available_memory
+            )
+        )
+    elif len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         # Special case: all layers have the same type of KV cache but with
@@ -1329,6 +1453,7 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        num_blocks_per_group=num_blocks_per_group,
     )
 
 
@@ -1626,6 +1751,50 @@ def _annotate_eagle_groups_deepseek_v4(
             break
 
 
+def _get_kv_cache_groups_mla_replicate(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Sparse-MLA "replicate-K": split replicated MLA caches into their own group.
+
+    The lightning-indexer K cache is marked ``is_replicated`` under context
+    parallelism so it is replicated (DCP disabled, fine-grained prefix caching)
+    while the main MLA latent KV stays sharded. They share the same block_size
+    so they would otherwise merge into one group; here we keep them as two
+    separate ``UniformTypeKVCacheSpecs`` groups (sharded first, replicated
+    second), which route to the heterogeneous-page DeepseekV4 allocator.
+
+    Returns None unless the model has BOTH replicated and sharded MLA caches and
+    no other cache types (anything else falls through to the generic paths).
+    """
+    specs = list(kv_cache_spec.values())
+    if not any(isinstance(s, MLAAttentionSpec) and s.is_replicated for s in specs):
+        return None
+    if not all(isinstance(s, MLAAttentionSpec) for s in specs):
+        # Mixed with non-MLA (e.g. SWA) caches is out of scope for now.
+        return None
+    # all specs are MLAAttentionSpec here (checked above); the isinstance guard
+    # also narrows the type so mypy accepts the .is_replicated access.
+    sharded: dict[str, KVCacheSpec] = {
+        n: s
+        for n, s in kv_cache_spec.items()
+        if isinstance(s, MLAAttentionSpec) and not s.is_replicated
+    }
+    replicated: dict[str, KVCacheSpec] = {
+        n: s
+        for n, s in kv_cache_spec.items()
+        if isinstance(s, MLAAttentionSpec) and s.is_replicated
+    }
+    assert sharded and replicated, "replicate-K needs both sharded and replicated MLA"
+    groups: list[KVCacheGroupSpec] = []
+    for sub in (sharded, replicated):
+        uniform = UniformTypeKVCacheSpecs.from_specs(sub)
+        assert uniform is not None
+        groups.append(
+            KVCacheGroupSpec(layer_names=list(sub.keys()), kv_cache_spec=uniform)
+        )
+    return groups
+
+
 def get_kv_cache_groups(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> list[KVCacheGroupSpec]:
@@ -1646,6 +1815,11 @@ def get_kv_cache_groups(
         # This returns an empty list to allow for the KVCacheManager to handle
         # attention free models.
         return []
+
+    # Sparse-MLA replicate-K: keep the replicated indexer cache in its own group.
+    replicate_groups = _get_kv_cache_groups_mla_replicate(kv_cache_spec)
+    if replicate_groups is not None:
+        return replicate_groups
 
     if is_kv_cache_spec_uniform(kv_cache_spec):
         # KV cache of all layers are the same, which is true for
@@ -2053,34 +2227,62 @@ def get_kv_cache_configs(
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
-    )
-    for kv_cache_config in kv_cache_configs:
-        num_blocks_old = kv_cache_config.num_blocks
-        kv_cache_config.num_blocks = min_num_blocks
+    if any(cfg.num_blocks_per_group is not None for cfg in kv_cache_configs):
+        # Sparse-MLA replicate-K: per-group pools — reconcile each group's pool
+        # to the smallest across ranks and shrink that group's tensors by its
+        # own ratio (a tensor's size is page * N_group, not divisible by the
+        # total num_blocks).
+        num_groups = len(kv_cache_configs[0].kv_cache_groups)
+        # per-group pools are set on every rank for replicate-K; bind the
+        # narrowed lists so mypy knows they are not None.
+        per_group_lists: list[list[int]] = []
+        for cfg in kv_cache_configs:
+            assert cfg.num_blocks_per_group is not None
+            per_group_lists.append(cfg.num_blocks_per_group)
+        min_per_group = [
+            min(npg[g] for npg in per_group_lists) for g in range(num_groups)
+        ]
+        for kv_cache_config, old_per_group in zip(kv_cache_configs, per_group_lists):
+            layer_to_group = {
+                ln: gi
+                for gi, grp in enumerate(kv_cache_config.kv_cache_groups)
+                for ln in grp.layer_names
+            }
+            for tensor in kv_cache_config.kv_cache_tensors:
+                g = layer_to_group[tensor.shared_by[0]]
+                assert tensor.size % old_per_group[g] == 0
+                tensor.size = tensor.size // old_per_group[g] * min_per_group[g]
+            kv_cache_config.num_blocks_per_group = list(min_per_group)
+            kv_cache_config.num_blocks = sum(min_per_group)
+    else:
+        min_num_blocks = min(
+            kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        )
+        for kv_cache_config in kv_cache_configs:
+            num_blocks_old = kv_cache_config.num_blocks
+            kv_cache_config.num_blocks = min_num_blocks
 
-        # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            # Shrink tensor size proportionally
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
-        if len(kv_cache_config.kv_cache_groups) > 0:
-            max_model_len = vllm_config.model_config.max_model_len
-            # GPU KV cache size in tokens = max_concurrency * max_model_len:
-            # the total tokens of context the pool can hold at peak
-            # utilization. Sourcing this from the concurrency calculation
-            # handles hybrid layouts correctly.
-            num_tokens, max_concurrency = get_kv_cache_capacity(
-                vllm_config, kv_cache_config
-            )
+    if len(kv_cache_configs[0].kv_cache_groups) > 0:
+        max_model_len = vllm_config.model_config.max_model_len
+        # GPU KV cache size in tokens = max_concurrency * max_model_len:
+        # the total tokens of context the pool can hold at peak
+        # utilization. Sourcing this from the concurrency calculation
+        # handles hybrid layouts correctly.
+        num_tokens, max_concurrency = get_kv_cache_capacity(
+            vllm_config, kv_cache_configs[0]
+        )
 
-            logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
-            logger.info_once(
-                "Maximum concurrency for %s tokens per request: %.2fx",
-                f"{max_model_len:,}",
-                max_concurrency,
-            )
+        logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
+        logger.info_once(
+            "Maximum concurrency for %s tokens per request: %.2fx",
+            f"{max_model_len:,}",
+            max_concurrency,
+        )
 
     return kv_cache_configs
 

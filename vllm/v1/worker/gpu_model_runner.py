@@ -6964,17 +6964,25 @@ class GPUModelRunner(
             kv_cache_config: The KV cache configuration.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
         """
+        from vllm.v1.core.kv_cache_utils import kv_cache_group_is_replicated
+
         block_sizes = []
         max_num_blocks = []
+        dcp_world_sizes: list[int | None] = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
+        total_cp_world_size = get_total_cp_world_size()
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
-            max_num_blocks_per_req = cdiv(
-                max_model_len, block_size * get_total_cp_world_size()
-            )
+            # Sparse-MLA replicate-K: a replicated group is NOT CP-sharded, so it
+            # stores the full (unsharded) token span (total_cp=1) and its block
+            # table uses dcp=1 (every token written).
+            is_replicated = kv_cache_group_is_replicated(kv_cache_group)
+            group_total_cp = 1 if is_replicated else total_cp_world_size
+            dcp_world_sizes.append(1 if is_replicated else None)
+            max_num_blocks_per_req = cdiv(max_model_len, block_size * group_total_cp)
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 max_num_blocks_per_req = (
                     max_num_blocks_per_req
@@ -7004,6 +7012,7 @@ class GPUModelRunner(
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
                 reasoning_config=self.vllm_config.reasoning_config,
+                dcp_world_sizes=dcp_world_sizes,
             )
 
         assert self._init_block_sizes == block_sizes, (

@@ -369,10 +369,26 @@ class MLAAttentionSpec(FullAttentionSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1  # Default to 1 for no compression.
     model_version: str | None = None
+    # Sparse-MLA "replicate-K" DCP: when True this cache is REPLICATED across
+    # decode/prefill context-parallel ranks (every rank stores all tokens)
+    # instead of sharded. It forms its own KV-cache group with DCP disabled
+    # (block_size unchanged, fine-grained prefix caching), unlike the sharded
+    # main MLA latent KV. Only the lightning-indexer cache sets this (and only
+    # when CP world size > 1).
+    is_replicated: bool = False
 
     def __post_init__(self):
         super().__post_init__()
         _apply_alignment_padding(self)
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        # A replicated cache is NOT sharded across CP ranks, so each rank must
+        # budget for the full (unsharded) sequence — skip the /dcp/pcp division
+        # that FullAttentionSpec applies.
+        if self.is_replicated:
+            max_model_len = vllm_config.model_config.max_model_len
+            return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+        return super().max_memory_usage_bytes(vllm_config)
 
     @property
     def storage_block_size(self) -> int:
@@ -403,13 +419,15 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        is_replicated_set = set(spec.is_replicated for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
+            and len(is_replicated_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, and model version."
+            "quantization method, compress ratio, model version, and replication."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -421,6 +439,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            is_replicated=is_replicated_set.pop(),
         )
 
 
@@ -882,6 +901,13 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    num_blocks_per_group: list[int] | None = None
+    """Sparse-MLA replicate-K: when set, each kv-cache group gets its OWN block
+    pool of this many blocks (instead of all groups sharing one pool of
+    ``num_blocks``). Needed because a CP-replicated group (lightning indexer)
+    consumes dcp× more block slots per request than the sharded main group, and
+    a shared pool would let it starve the main group's sharding savings. None =
+    single shared pool (default, all other models)."""
 
     @property
     def has_mamba_layers(self) -> bool:

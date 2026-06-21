@@ -26,6 +26,7 @@ class BlockTable:
         device: torch.device,
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
+        dcp_world_size: int | None = None,
     ):
         """
         Args:
@@ -38,6 +39,11 @@ class BlockTable:
             kernel_block_size: The block_size of underlying attention kernel.
                 Will be the same as `block_size` if `block_size` is supported
                 by the attention kernel.
+            dcp_world_size: Per-group DCP world size override. When given (e.g.
+                ``1`` for a sparse-MLA "replicate-K" indexer group), the
+                slot_mapping is computed with this instead of the global DCP
+                size, so a replicated group writes every token (not just its
+                shard).
         """
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -97,6 +103,12 @@ class BlockTable:
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+        if dcp_world_size is not None:
+            # Per-group override (sparse-MLA replicate-K). A replicated group
+            # uses dcp=1 so the slot_mapping writes every token on every rank.
+            self.dcp_world_size = dcp_world_size
+            if dcp_world_size == 1:
+                self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
     def append_row(
@@ -234,12 +246,15 @@ class MultiGroupBlockTable:
         kernel_block_sizes: list[int],
         max_num_blocks: list[int] | None = None,
         cp_kv_cache_interleave_size: int = 1,
+        dcp_world_sizes: list[int | None] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
                 f"kernel_block_sizes length ({len(kernel_block_sizes)}) "
                 f"must match block_sizes length ({len(block_sizes)})"
             )
+        if dcp_world_sizes is None:
+            dcp_world_sizes = [None] * len(block_sizes)
         if max_num_blocks is None:
             # Note(hc): each dcp rank only store
             # (max_model_len//dcp_world_size) tokens in kvcache,
@@ -274,10 +289,14 @@ class MultiGroupBlockTable:
                 device,
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
+                dcp_world_size,
             )
-            for block_size, kernel_block_size, max_num_blocks_per_req in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks
-            )
+            for (
+                block_size,
+                kernel_block_size,
+                max_num_blocks_per_req,
+                dcp_world_size,
+            ) in zip(block_sizes, kernel_block_sizes, max_num_blocks, dcp_world_sizes)
         ]
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:

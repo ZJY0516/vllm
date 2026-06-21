@@ -587,11 +587,22 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        # Under decode/prefill context parallelism the lightning-indexer K cache
+        # is REPLICATED across CP ranks (each rank computes the global top-k from
+        # its full copy) rather than sharded like the main MLA latent KV. Marking
+        # the spec replicated puts it in its own DCP-disabled KV-cache group with
+        # block_size unchanged (fine-grained prefix caching). See replicate-K.
+        parallel_config = vllm_config.parallel_config
+        cp_world_size = (
+            parallel_config.decode_context_parallel_size
+            * parallel_config.prefill_context_parallel_size
+        )
         return MLAAttentionSpec(  # Only has one vector instead of K + V
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            is_replicated=cp_world_size > 1,
         )
 
     def forward(self): ...
