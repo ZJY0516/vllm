@@ -64,12 +64,6 @@ class CacheConfig:
     default based on the resolved KV cache groups (typically the smallest KV
     cache block size when there are multiple groups).
     """
-    partial_cache_unit: int | None = Field(default=None, gt=0)
-    """Token interval for partial prefix-cache aliases inside a cache block.
-
-    If unset, vLLM only probes and stores prefix-cache entries at normal cache
-    block boundaries.
-    """
     gpu_memory_utilization: float = Field(default=0.92, gt=0, le=1)
     """The fraction of GPU memory to be used for the model executor, which can
     range from 0 to 1. For example, a value of 0.5 would imply 50% GPU memory
@@ -211,7 +205,6 @@ class CacheConfig:
             "prefix_caching_hash_algo",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "hash_block_size",
-            "partial_cache_unit",
             "mamba_page_size_padded",
             "user_specified_block_size",
             "user_specified_mamba_block_size",

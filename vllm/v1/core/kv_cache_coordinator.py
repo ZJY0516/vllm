@@ -29,7 +29,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
-from vllm.v1.request import Request, RequestBlockHashes
+from vllm.v1.request import Request
 
 
 def _validate_prefix_cache_retention_interval(
@@ -79,7 +79,6 @@ class KVCacheCoordinator(ABC):
         pcp_world_size: int,
         scheduler_block_size: int,
         hash_block_size: int,
-        partial_cache_unit: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ):
         self.kv_cache_config = kv_cache_config
@@ -97,7 +96,6 @@ class KVCacheCoordinator(ABC):
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
-            partial_cache_unit=partial_cache_unit,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
         )
@@ -391,7 +389,6 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         pcp_world_size: int,
         scheduler_block_size: int,
         hash_block_size: int,
-        partial_cache_unit: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ):
         super().__init__(
@@ -405,7 +402,6 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
-            partial_cache_unit=partial_cache_unit,
             metrics_collector=metrics_collector,
         )
         self.num_single_type_manager = len(self.single_type_managers)
@@ -443,7 +439,6 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         scheduler_block_size: int,
         hash_block_size: int,
-        partial_cache_unit: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ):
         super().__init__(
@@ -457,7 +452,6 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
-            partial_cache_unit=partial_cache_unit,
             metrics_collector=metrics_collector,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
@@ -495,10 +489,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
         )
-        hit_length = getattr(hit_blocks[0], "hit_length", None)
-        if hit_length is None:
-            hit_length = len(hit_blocks[0]) * self.block_size
-        return hit_blocks, hit_length
+        return hit_blocks, len(hit_blocks[0]) * self.block_size
 
 
 class SpecGroup(NamedTuple):
@@ -534,7 +525,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         scheduler_block_size: int,
         hash_block_size: int,
-        partial_cache_unit: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
     ):
         super().__init__(
@@ -548,7 +538,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
-            partial_cache_unit=partial_cache_unit,
             metrics_collector=metrics_collector,
         )
         # hash_block_size: the block size used to compute block hashes.
@@ -562,12 +551,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         ), "block_size must be divisible by hash_block_size"
         assert dcp_world_size == 1, "DCP not support hybrid attn now."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
-        self.enable_partial_hash_hits = partial_cache_unit is not None and any(
-            (
-                isinstance(g.kv_cache_spec, MambaSpec)
-                and g.kv_cache_spec.mamba_cache_mode == "align"
-                and g.kv_cache_spec.block_size > partial_cache_unit
-            )
+        self.enable_partial_hash_hits = any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            and g.kv_cache_spec.mamba_cache_mode == "align"
+            and g.kv_cache_spec.block_size > hash_block_size
             for g in kv_cache_config.kv_cache_groups
         )
         self.verify_and_split_kv_cache_groups()
@@ -615,14 +602,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     self.single_type_managers[gid].use_eagle = True
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
-        # Cache hits in this coordinator are always a multiple of
-        # ``scheduler_block_size`` tokens (see ``find_longest_cache_hit``).
-        # Within an aligned region, SWA groups may only consult a subset of blocks
-        # per ``scheduler_block_size``-segment so the unused blocks also stay
-        # out of the prefix-cache hash map.
         if self.enable_partial_hash_hits:
             aligned_num_computed_tokens = num_computed_tokens
         else:
+            # Cache hits in this coordinator are always a multiple of
+            # ``scheduler_block_size`` tokens (see ``find_longest_cache_hit``).
+            # Within an aligned region, SWA groups may only consult a subset of
+            # blocks per ``scheduler_block_size``-segment so the unused blocks
+            # also stay out of the prefix-cache hash map.
             aligned_num_computed_tokens = (
                 num_computed_tokens
                 // self.scheduler_block_size
@@ -674,24 +661,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             kv_cache_spec: KVCacheSpec,
             manager_cls: type[SingleTypeKVCacheManager],
         ) -> BlockHashList:
-            if isinstance(block_hashes, RequestBlockHashes):
-                if self.enable_partial_hash_hits and manager_cls in (
-                    FullAttentionManager,
-                    MambaManager,
-                ):
-                    return block_hashes
-                return block_hashes.get_block_hashes(kv_cache_spec.block_size)
             if kv_cache_spec.block_size == self.hash_block_size:
+                return block_hashes
+            if self.enable_partial_hash_hits and manager_cls in (
+                FullAttentionManager,
+                MambaManager,
+            ):
                 return block_hashes
             return BlockHashListWithBlockSize(
                 block_hashes, self.hash_block_size, kv_cache_spec.block_size
             )
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
-        alignment_tokens = self.scheduler_block_size
-        if self.enable_partial_hash_hits:
-            assert self.block_pool.partial_cache_unit is not None
-            alignment_tokens = self.block_pool.partial_cache_unit
         hit_length = max_cache_hit_length
         longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
@@ -706,6 +687,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # ``curr_hit_length``. Each eagle group applies the drop at most once
         # per candidate length (see issue #32802).
         eagle_verified: set[int] = set()
+        alignment_tokens = (
+            self.hash_block_size
+            if self.enable_partial_hash_hits
+            else self.scheduler_block_size
+        )
 
         while True:
             curr_hit_length = hit_length
@@ -802,26 +788,25 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             kv_cache_spec: KVCacheSpec,
             manager_cls: type[SingleTypeKVCacheManager],
         ) -> BlockHashList:
-            if isinstance(block_hashes, RequestBlockHashes):
-                if self.enable_partial_hash_hits and manager_cls in (
-                    FullAttentionManager,
-                    MambaManager,
-                ):
-                    return block_hashes
-                return block_hashes.get_block_hashes(kv_cache_spec.block_size)
             if kv_cache_spec.block_size == self.hash_block_size:
+                return block_hashes
+            if self.enable_partial_hash_hits and manager_cls in (
+                FullAttentionManager,
+                MambaManager,
+            ):
                 return block_hashes
             return BlockHashListWithBlockSize(
                 block_hashes, self.hash_block_size, kv_cache_spec.block_size
             )
 
         num_groups = len(self.kv_cache_config.kv_cache_groups)
-        alignment_tokens = self.scheduler_block_size
-        if self.enable_partial_hash_hits:
-            assert self.block_pool.partial_cache_unit is not None
-            alignment_tokens = self.block_pool.partial_cache_unit
         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
         hit_lengths: list[int] = [0] * num_groups
+        alignment_tokens = (
+            self.hash_block_size
+            if self.enable_partial_hash_hits
+            else self.scheduler_block_size
+        )
 
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
             blocks = manager_cls.find_longest_cache_hit(
@@ -859,7 +844,6 @@ def get_kv_cache_coordinator(
     pcp_world_size: int,
     scheduler_block_size: int,
     hash_block_size: int,
-    partial_cache_unit: int | None = None,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
     if not enable_caching:
@@ -873,7 +857,6 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
-            partial_cache_unit=partial_cache_unit,
             metrics_collector=metrics_collector,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
@@ -888,7 +871,6 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
-            partial_cache_unit=partial_cache_unit,
             metrics_collector=metrics_collector,
         )
     return HybridKVCacheCoordinator(
@@ -902,6 +884,5 @@ def get_kv_cache_coordinator(
         pcp_world_size=pcp_world_size,
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
-        partial_cache_unit=partial_cache_unit,
         metrics_collector=metrics_collector,
     )

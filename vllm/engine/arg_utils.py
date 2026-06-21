@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import functools
 import json
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
@@ -465,6 +466,7 @@ class EngineArgs:
     numa_bind: bool = ParallelConfig.numa_bind
     numa_bind_nodes: list[int] | None = ParallelConfig.numa_bind_nodes
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
+    device_ids: list[int | str] | None = None
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
@@ -595,7 +597,6 @@ class EngineArgs:
 
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
-    partial_cache_unit: int | None = CacheConfig.partial_cache_unit
     model_loader_extra_config: dict = get_field(LoadConfig, "model_loader_extra_config")
     ignore_patterns: str | list[str] = get_field(LoadConfig, "ignore_patterns")
 
@@ -981,6 +982,20 @@ class EngineArgs:
             "--numa-bind-cpus", **parallel_kwargs["numa_bind_cpus"]
         )
         parallel_group.add_argument(
+            "--device-ids",
+            type=lambda s: [
+                int(device_id) if device_id.isdigit() else device_id
+                for device_id in (part.strip() for part in s.split(","))
+            ],
+            default=None,
+            help="Comma-separated physical GPU device IDs or UUIDs to use "
+            '(e.g. --device-ids "2,3,5,7"). Avoids setting '
+            "CUDA_VISIBLE_DEVICES, preserving full GPU topology "
+            "visibility for GPU-NIC affinity and DeepGEMM. "
+            "Note: has no effect with Ray executors; use Ray "
+            "placement groups for GPU selection instead.",
+        )
+        parallel_group.add_argument(
             "--tensor-parallel-size", "-tp", **parallel_kwargs["tensor_parallel_size"]
         )
         parallel_group.add_argument(
@@ -1148,10 +1163,6 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
-        )
-        cache_group.add_argument(
-            "--partial-cache-unit",
-            **cache_kwargs["partial_cache_unit"],
         )
         cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
@@ -1721,6 +1732,47 @@ class EngineArgs:
         )
         return SpeculativeConfig(**self.speculative_config)
 
+    def _resolve_device_ids(self) -> list[int] | None:
+        if not self.device_ids:
+            return None
+        if self.distributed_executor_backend == "ray":
+            logger.warning(
+                "--device-ids has no effect when using the Ray executor. "
+                "Use Ray placement groups for GPU selection instead."
+            )
+        ids = self.device_ids
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"--device-ids must not contain duplicates: {ids}")
+        if all(isinstance(i, str) for i in ids):
+            return [
+                current_platform.device_control_id_to_physical_device_id(i)
+                for i in cast(list[str], ids)
+            ]
+        if any(isinstance(i, str) for i in ids):
+            raise ValueError("--device-ids must not mix integer IDs and UUIDs")
+        int_ids = cast(list[int], ids)
+        # Compose with CUDA_VISIBLE_DEVICES: if CVD is set, treat
+        # --device-ids values as indices into the CVD-visible set.
+        cvd = getattr(
+            envs,
+            current_platform.device_control_env_var,
+            os.environ.get(current_platform.device_control_env_var),
+        )
+        if cvd:
+            cvd_ids = [
+                current_platform.device_control_id_to_physical_device_id(x)
+                for x in cvd.split(",")
+            ]
+            for i in int_ids:
+                if i >= len(cvd_ids):
+                    raise ValueError(
+                        f"--device-ids index {i} is out of range for "
+                        f"{current_platform.device_control_env_var}"
+                        f"={cvd} ({len(cvd_ids)} devices visible)"
+                    )
+            return [cvd_ids[i] for i in int_ids]
+        return int_ids
+
     def create_diffusion_config(self) -> DiffusionConfig | None:
         if self.diffusion_config is None:
             return None
@@ -1796,7 +1848,6 @@ class EngineArgs:
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
-            partial_cache_unit=self.partial_cache_unit,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
@@ -2035,6 +2086,7 @@ class EngineArgs:
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             _api_process_count=self._api_process_count,
             _api_process_rank=self._api_process_rank,
+            assigned_physical_gpu_ids=self._resolve_device_ids(),
             numa_bind=self.numa_bind,
             numa_bind_nodes=self.numa_bind_nodes,
             numa_bind_cpus=self.numa_bind_cpus,

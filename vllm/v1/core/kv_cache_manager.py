@@ -121,7 +121,6 @@ class KVCacheManager:
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
-        partial_cache_unit: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
     ) -> None:
@@ -152,7 +151,6 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
-            partial_cache_unit=partial_cache_unit,
             metrics_collector=self.metrics_collector,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
