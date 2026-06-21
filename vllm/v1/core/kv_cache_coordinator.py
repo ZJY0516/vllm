@@ -29,7 +29,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
-from vllm.v1.request import Request, RequestBlockHashes
+from vllm.v1.request import Request
 
 
 def _validate_prefix_cache_retention_interval(
@@ -557,8 +557,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             and g.kv_cache_spec.block_size > hash_block_size
             for g in kv_cache_config.kv_cache_groups
         )
-        if self.enable_partial_hash_hits:
-            self.block_pool.partial_cache_unit = hash_block_size
         self.verify_and_split_kv_cache_groups()
 
     def verify_and_split_kv_cache_groups(self) -> None:
@@ -665,14 +663,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         ) -> BlockHashList:
             if kv_cache_spec.block_size == self.hash_block_size:
                 return block_hashes
-            if (
-                isinstance(block_hashes, RequestBlockHashes)
-                and self.enable_partial_hash_hits
-                and manager_cls in (FullAttentionManager, MambaManager)
+            if self.enable_partial_hash_hits and manager_cls in (
+                FullAttentionManager,
+                MambaManager,
             ):
                 return block_hashes
-            if isinstance(block_hashes, RequestBlockHashes):
-                return block_hashes.get_block_hashes(kv_cache_spec.block_size)
             return BlockHashListWithBlockSize(
                 block_hashes, self.hash_block_size, kv_cache_spec.block_size
             )
@@ -795,14 +790,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         ) -> BlockHashList:
             if kv_cache_spec.block_size == self.hash_block_size:
                 return block_hashes
-            if (
-                isinstance(block_hashes, RequestBlockHashes)
-                and self.enable_partial_hash_hits
-                and manager_cls in (FullAttentionManager, MambaManager)
+            if self.enable_partial_hash_hits and manager_cls in (
+                FullAttentionManager,
+                MambaManager,
             ):
                 return block_hashes
-            if isinstance(block_hashes, RequestBlockHashes):
-                return block_hashes.get_block_hashes(kv_cache_spec.block_size)
             return BlockHashListWithBlockSize(
                 block_hashes, self.hash_block_size, kv_cache_spec.block_size
             )

@@ -1178,7 +1178,7 @@ def test_hybrid_mamba_align_partial_hash_hit():
     manager.free(req0)
     manager.new_step_starts()
 
-    partial_mamba_hash = req0.block_hashes.get_partial_block_hash(mamba_block_size, 6)
+    partial_mamba_hash = req0.block_hashes[6 // hash_block_size - 1]
     partial_mamba_block = manager.block_pool.get_cached_block(
         partial_mamba_hash, kv_cache_group_ids=[1]
     )
@@ -1246,7 +1246,7 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
     manager.free(req0)
     manager.new_step_starts()
 
-    partial_full_hash = req0.block_hashes.get_partial_block_hash(block_size, 6)
+    partial_full_hash = req0.block_hashes[6 // hash_block_size - 1]
     partial_full_block = manager.block_pool.get_cached_block(
         partial_full_hash, kv_cache_group_ids=[0]
     )
