@@ -377,6 +377,60 @@ def test_packed_kda_decode_correctness(
     assert_close("ht", dense_state, packed_state, 1e-3, err_atol=1e-3)
 
 
+@torch.inference_mode()
+def test_packed_kda_decode_uses_direct_working_state():
+    B, H, D = 4, 2, 32
+    torch.manual_seed(322)
+    mixed_qkv = torch.randn(B, 3 * H * D, dtype=torch.bfloat16, device=DEVICE)
+    raw_g = torch.randn(1, B, H, D, dtype=torch.bfloat16, device=DEVICE)
+    raw_beta = torch.randn(1, B, H, dtype=torch.bfloat16, device=DEVICE)
+    A_log = torch.randn(H, dtype=torch.float32, device=DEVICE)
+    dt_bias = torch.randn(H, D, dtype=torch.float32, device=DEVICE)
+    state_indices = torch.arange(1, B + 1, dtype=torch.int32, device=DEVICE)
+    canonical_state = torch.randn(B + 1, H, D, D, dtype=torch.float32, device=DEVICE)
+    workspace_slots = torch.tensor([3, 1, 0, 2], dtype=torch.int32, device=DEVICE)
+    initialized = torch.tensor([False, True, False, True], device=DEVICE)
+    working_state = torch.randn(B, H, D, D, dtype=torch.float32, device=DEVICE)
+
+    reference_state = canonical_state.clone()
+    reference_state[state_indices[initialized].long()] = working_state[
+        workspace_slots[initialized].long()
+    ]
+    expected, _ = fused_recurrent_kda_packed_decode(
+        mixed_qkv=mixed_qkv,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=None,
+        initial_state=reference_state,
+        state_indices=state_indices,
+    )
+    actual, _ = fused_recurrent_kda_packed_decode(
+        mixed_qkv=mixed_qkv,
+        raw_g=raw_g,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=None,
+        initial_state=canonical_state,
+        state_indices=state_indices,
+        workspace_slots=workspace_slots,
+        workspace_initialized=initialized,
+        working_state=working_state,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        canonical_state[state_indices[~initialized].long()],
+        reference_state[state_indices[~initialized].long()],
+    )
+    torch.testing.assert_close(
+        working_state[workspace_slots[initialized].long()],
+        reference_state[state_indices[initialized].long()],
+    )
+
+
 @pytest.mark.parametrize(
     ("H", "fuse_gate"),
     [(12, True), (12, False), (12, None), (96, None)],
@@ -531,19 +585,20 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
         device=DEVICE,
     )
     state_indices = torch.arange(1, num_seqs + 1, device=DEVICE).view(-1, 1).int()
-    working_base = num_seqs + 1
-    workspace_base = working_base + num_seqs
-    workspace_blocks = (num_seqs * 3 * query_len + D - 1) // D
     workspace_slots = torch.tensor([3, 1, 0, 2], dtype=torch.int32, device=DEVICE)
-    working_state_indices = (working_base + workspace_slots).view(-1, 1)
     state = 0.01 * torch.randn(
-        workspace_base + workspace_blocks,
+        num_seqs + 1,
         H,
         D,
         D,
         dtype=torch.float32,
         device=DEVICE,
     )
+    working_state = torch.empty(num_seqs, H, D, D, dtype=torch.float32, device=DEVICE)
+    replay_workspace = torch.empty(
+        num_seqs, query_len * H * 3 * D, dtype=torch.float32, device=DEVICE
+    )
+    workspace_initialized = torch.zeros(num_seqs, dtype=torch.bool, device=DEVICE)
     initial_states = state[state_indices[:, 0]].clone()
     A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.1
     dt_bias = torch.randn(H, D, dtype=torch.float32, device=DEVICE) * 0.1
@@ -600,7 +655,9 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
         state_indices,
         accepted,
         workspace_slots=workspace_slots,
-        workspace_base=workspace_base,
+        workspace_initialized=workspace_initialized,
+        working_state=working_state,
+        replay_workspace=replay_workspace,
         workspace_num_tokens=query_len,
     )
     torch.testing.assert_close(native_out1, out1, atol=0, rtol=0)
@@ -627,8 +684,8 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
         ),
         torch.zeros(1, dtype=torch.int32, device=DEVICE),
         torch.zeros(1, dtype=torch.int32, device=DEVICE),
-        torch.tensor([working_base], dtype=torch.int64, device=DEVICE),
-        torch.tensor([workspace_base], dtype=torch.int64, device=DEVICE),
+        torch.tensor([working_state.data_ptr()], dtype=torch.int64, device=DEVICE),
+        torch.tensor([replay_workspace.data_ptr()], dtype=torch.int64, device=DEVICE),
         num_seqs,
         NUM_STATE_TYPES=1,
         NUM_HEADS=H,
@@ -656,10 +713,12 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
         None,
         state,
         cu_seqlens,
-        working_state_indices,
+        state_indices,
         accepted,
         workspace_slots=workspace_slots,
-        workspace_base=workspace_base,
+        workspace_initialized=torch.ones_like(workspace_initialized),
+        working_state=working_state,
+        replay_workspace=replay_workspace,
         workspace_num_tokens=query_len,
     )
 
@@ -710,7 +769,7 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
     assert_close(
         "replay_state",
         reference_state,
-        state[working_state_indices[:, 0]],
+        working_state[workspace_slots.long()],
         3e-3,
         3e-3,
     )
@@ -721,7 +780,7 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
     ]
     torch.testing.assert_close(
         native_accepted_state,
-        state[working_state_indices[:, 0]],
+        working_state[workspace_slots.long()],
         atol=0,
         rtol=0,
     )
@@ -734,7 +793,7 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
     )
 
     plain_decode_boundary_states = torch.randn_like(reference_state)
-    state[working_state_indices[:, 0]] = plain_decode_boundary_states
+    working_state[workspace_slots.long()] = plain_decode_boundary_states
     commit_kda_spec_workspace_kernel[(num_seqs, 1, H * ((D + 31) // 32))](
         torch.ones(num_seqs, dtype=torch.int32, device=DEVICE),
         torch.zeros(num_seqs, dtype=torch.int32, device=DEVICE),
@@ -755,8 +814,8 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
         ),
         torch.zeros(1, dtype=torch.int32, device=DEVICE),
         torch.zeros(1, dtype=torch.int32, device=DEVICE),
-        torch.tensor([working_base], dtype=torch.int64, device=DEVICE),
-        torch.tensor([workspace_base], dtype=torch.int64, device=DEVICE),
+        torch.tensor([working_state.data_ptr()], dtype=torch.int64, device=DEVICE),
+        torch.tensor([replay_workspace.data_ptr()], dtype=torch.int64, device=DEVICE),
         num_seqs,
         NUM_STATE_TYPES=1,
         NUM_HEADS=H,

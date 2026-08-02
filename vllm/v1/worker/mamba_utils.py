@@ -440,8 +440,8 @@ def commit_kda_spec_workspace_kernel(
     state_block_strides_ptr,
     state_conv_widths_ptr,
     state_group_indices_ptr,
-    working_block_bases_ptr,
-    replay_block_bases_ptr,
+    working_state_ptrs_ptr,
+    replay_workspace_ptrs_ptr,
     num_reqs,
     NUM_STATE_TYPES: tl.constexpr,
     NUM_HEADS: tl.constexpr,
@@ -502,14 +502,6 @@ def commit_kda_spec_workspace_kernel(
         if WORKSPACE_SLOT_IS_REQ_IDX
         else tl.load(workspace_slots_ptr + req_idx).to(tl.int64)
     )
-    working_block_base = tl.load(working_block_bases_ptr + group_idx).to(tl.int64)
-    working_state_block_id = working_block_base + workspace_slot
-    state_block_id = tl.where(
-        is_workspace_initialized,
-        working_state_block_id,
-        canonical_state_block_id,
-    )
-
     values_per_head_block: tl.constexpr = tl.cdiv(VALUE_DIM, BLOCK_VALUE)
     head_idx = value_tile // values_per_head_block
     value_block_idx = value_tile % values_per_head_block
@@ -524,7 +516,21 @@ def commit_kda_spec_workspace_kernel(
         + value_offsets[:, None] * KEY_DIM
         + key_offsets[None, :]
     )
-    state_ptr = state_base + state_block_id * state_block_stride + state_offset
+    canonical_state_ptr = (
+        state_base + canonical_state_block_id * state_block_stride + state_offset
+    )
+    working_state_addr = tl.load(working_state_ptrs_ptr + layer_idx)
+    working_state_base = working_state_addr.to(tl.pointer_type(tl.float32))
+    working_state_ptr = (
+        working_state_base
+        + workspace_slot * NUM_HEADS * VALUE_DIM * KEY_DIM
+        + state_offset
+    )
+    state_ptr = tl.where(
+        is_workspace_initialized,
+        working_state_ptr,
+        canonical_state_ptr,
+    )
     state = tl.load(state_ptr, mask=state_mask, other=0.0).to(tl.float32)
 
     slot_elements: tl.constexpr = (
@@ -533,8 +539,8 @@ def commit_kda_spec_workspace_kernel(
     slot_offset = workspace_slot * slot_elements
     key_base: tl.constexpr = WORKSPACE_NUM_TOKENS * NUM_HEADS * VALUE_DIM
     gate_base: tl.constexpr = key_base + WORKSPACE_NUM_TOKENS * NUM_HEADS * KEY_DIM
-    replay_block_base = tl.load(replay_block_bases_ptr + group_idx).to(tl.int64)
-    replay_base = state_base + replay_block_base * state_block_stride
+    replay_workspace_addr = tl.load(replay_workspace_ptrs_ptr + layer_idx)
+    replay_base = replay_workspace_addr.to(tl.pointer_type(tl.float32))
 
     if PRECOMPUTED_NEW_COMPUTED:
         new_num_computed = tl.load(num_computed_tokens_ptr + req_idx).to(tl.int64)
@@ -606,9 +612,6 @@ def commit_kda_spec_workspace_kernel(
             )
             tl.store(boundary_ptr, state, mask=state_mask)
 
-    working_state_ptr = (
-        state_base + working_state_block_id * state_block_stride + state_offset
-    )
     tl.store(working_state_ptr, state, mask=state_mask)
 
 
@@ -722,8 +725,8 @@ class MambaSpecDecodeGPUContext:
     mamba_group_ids: list[int]
     num_groups: int
     use_kda_spec_workspace: bool
-    kda_working_block_bases: torch.Tensor
-    kda_replay_block_bases: torch.Tensor
+    kda_working_state_ptrs: torch.Tensor
+    kda_replay_workspace_ptrs: torch.Tensor
     kda_num_heads: int
     kda_value_dim: int
     kda_key_dim: int
@@ -775,15 +778,8 @@ class MambaSpecDecodeGPUContext:
         use_kda_spec_workspace = mamba_spec.use_spec_workspace
         if use_kda_spec_workspace:
             kda_num_heads, kda_value_dim, kda_key_dim = mamba_spec.shapes[-1]
-            working_block_bases = [
-                kv_cache_config.num_blocks
-                + kv_cache_config.kda_spec_workspace_block_offsets[gid]
-                for gid in mamba_group_ids
-            ]
-            replay_block_bases = [base + max_num_reqs for base in working_block_bases]
         else:
             kda_num_heads = kda_value_dim = kda_key_dim = 0
-            working_block_bases = replay_block_bases = [0] * len(mamba_group_ids)
 
         return cls(
             state_base_addrs=torch.zeros(
@@ -816,11 +812,11 @@ class MambaSpecDecodeGPUContext:
             mamba_group_ids=mamba_group_ids,
             num_groups=len(mamba_group_ids),
             use_kda_spec_workspace=use_kda_spec_workspace,
-            kda_working_block_bases=torch.tensor(
-                working_block_bases, dtype=torch.int64, device=device
+            kda_working_state_ptrs=torch.zeros(
+                num_layers, dtype=torch.int64, device=device
             ),
-            kda_replay_block_bases=torch.tensor(
-                replay_block_bases, dtype=torch.int64, device=device
+            kda_replay_workspace_ptrs=torch.zeros(
+                num_layers, dtype=torch.int64, device=device
             ),
             kda_num_heads=kda_num_heads,
             kda_value_dim=kda_value_dim,
@@ -898,11 +894,32 @@ class MambaSpecDecodeGPUContext:
             return
 
         idx = 0
+        layer_idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
             for layer_name in layer_names:
                 attention = forward_context[layer_name]
                 kv_caches: list[torch.Tensor] = attention.kv_cache
+                if self.use_kda_spec_workspace:
+                    working_state = attention.spec_working_state
+                    replay_workspace = attention.spec_replay_workspace
+                    assert working_state is not None
+                    assert replay_workspace is not None
+                    assert working_state.dtype == torch.float32
+                    assert replay_workspace.dtype == torch.float32
+                    assert tuple(working_state.shape[1:]) == (
+                        self.kda_num_heads,
+                        self.kda_value_dim,
+                        self.kda_key_dim,
+                    )
+                    expected_replay_elements = self.kda_workspace_num_tokens * (
+                        self.kda_num_heads * (self.kda_value_dim + 2 * self.kda_key_dim)
+                    )
+                    assert replay_workspace.shape[1] == expected_replay_elements
+                    self.kda_working_state_ptrs[layer_idx] = working_state.data_ptr()
+                    self.kda_replay_workspace_ptrs[layer_idx] = (
+                        replay_workspace.data_ptr()
+                    )
 
                 for state_type_idx, state in enumerate(kv_caches):
                     # Base address
@@ -983,6 +1000,7 @@ class MambaSpecDecodeGPUContext:
 
                     self.state_group_indices[idx] = group_local_idx
                     idx += 1
+                layer_idx += 1
 
         # Cache per-group block-table base addresses and per-request stride.
         # `block_tables[i]` is the persistent 2D int32 block-table tensor for
@@ -1036,8 +1054,8 @@ class MambaSpecDecodeGPUContext:
             self.state_block_strides,
             self.state_conv_widths,
             self.state_group_indices,
-            self.kda_working_block_bases,
-            self.kda_replay_block_bases,
+            self.kda_working_state_ptrs,
+            self.kda_replay_workspace_ptrs,
             num_reqs,
             NUM_STATE_TYPES=self.num_state_types,
             NUM_HEADS=self.kda_num_heads,

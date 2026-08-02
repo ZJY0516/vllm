@@ -428,6 +428,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
         set_weight_attrs(self.A_log, {"weight_loader": a_log_weight_loader(0)})
 
+        self.spec_working_state: torch.Tensor | None = None
+        self.spec_replay_workspace: torch.Tensor | None = None
+
         self.gate_lower_bound: float | None = kda_config.get("gate_lower_bound", None)
         if self.gate_lower_bound is not None:
             assert _KDA_GATE_LOGBOUND_MIN <= self.gate_lower_bound < 0, (
@@ -479,6 +482,27 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+
+    def bind_spec_workspace(
+        self,
+        working_state: torch.Tensor,
+        replay_workspace: torch.Tensor,
+    ) -> None:
+        """Bind views into the model-owned KDA workspace slabs."""
+        assert working_state.shape[1:] == (
+            self.local_num_heads,
+            self.head_dim,
+            self.head_dim,
+        )
+        expected_replay_width = (
+            (self.num_spec + 1) * self.local_num_heads * 3 * self.head_dim
+        )
+        assert replay_workspace.shape == (
+            working_state.shape[0],
+            expected_replay_width,
+        )
+        self.spec_working_state = working_state
+        self.spec_replay_workspace = replay_workspace
 
     def forward(
         self,
@@ -675,7 +699,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 ),
                 num_accepted_tokens=num_accepted_tokens,
                 workspace_slots=m.spec_workspace_slots,
-                workspace_base=m.spec_workspace_base,
+                workspace_initialized=m.spec_workspace_initialized,
+                working_state=self.spec_working_state,
+                replay_workspace=self.spec_replay_workspace,
                 workspace_num_tokens=m.spec_workspace_num_tokens,
                 out=spec_out,
             )
@@ -724,6 +750,17 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     non_spec_state_indices_tensor,
                     has_initial_state,
                 )
+                if m.non_spec_workspace_slots is not None:
+                    assert m.non_spec_workspace_initialized is not None
+                    assert self.spec_working_state is not None
+                    working_initial_state = self.spec_working_state.index_select(
+                        0, m.non_spec_workspace_slots.long()
+                    )
+                    initial_state = torch.where(
+                        m.non_spec_workspace_initialized[:, None, None, None],
+                        working_initial_state,
+                        initial_state,
+                    )
                 if self.kda_prefill_backend == "flashkda":
                     assert self.gate_lower_bound is not None
                     (
@@ -759,7 +796,27 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         use_qk_l2norm_in_kernel=True,
                         cu_seqlens=non_spec_query_start_loc,
                     )
-                recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+                if m.non_spec_workspace_slots is None:
+                    recurrent_state[non_spec_state_indices_tensor] = (
+                        last_recurrent_state
+                    )
+                else:
+                    assert m.non_spec_workspace_initialized is not None
+                    assert self.spec_working_state is not None
+                    initialized = m.non_spec_workspace_initialized[:, None, None, None]
+                    canonical_state = recurrent_state[non_spec_state_indices_tensor]
+                    recurrent_state[non_spec_state_indices_tensor] = torch.where(
+                        initialized,
+                        canonical_state,
+                        last_recurrent_state,
+                    )
+                    workspace_slots = m.non_spec_workspace_slots.long()
+                    working_state = self.spec_working_state[workspace_slots]
+                    self.spec_working_state[workspace_slots] = torch.where(
+                        initialized,
+                        last_recurrent_state,
+                        working_state,
+                    )
             else:
                 # Pure non-speculative decode.
                 assert non_spec_state_indices_tensor is not None
@@ -789,6 +846,17 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     lower_bound=self.gate_lower_bound,
                     initial_state=recurrent_state,
                     state_indices=non_spec_state_indices_tensor[: mixed_qkv_ns.size(0)],
+                    workspace_slots=(
+                        m.non_spec_workspace_slots[: mixed_qkv_ns.size(0)]
+                        if m.non_spec_workspace_slots is not None
+                        else None
+                    ),
+                    workspace_initialized=(
+                        m.non_spec_workspace_initialized[: mixed_qkv_ns.size(0)]
+                        if m.non_spec_workspace_initialized is not None
+                        else None
+                    ),
+                    working_state=self.spec_working_state,
                 )
 
         # Restore the scheduler's original token order for mixed batches.

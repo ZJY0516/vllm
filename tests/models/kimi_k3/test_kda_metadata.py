@@ -18,7 +18,6 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAMetadata,
     KimiK3KDAMetadataBuilder,
     _mamba_get_block_table_tensor,
-    _select_workspace_state_indices_kernel,
     stage_spec_decode_metadata,
 )
 from vllm.v1.attention.backend import AttentionMetadataBuilder
@@ -48,9 +47,7 @@ PRUNED_METADATA_FIELDS = {
 def _assert_matches_shared_gdn(reference, actual: KimiK3KDAMetadata):
     for field in fields(KimiK3KDAMetadata):
         actual_value = getattr(actual, field.name)
-        if field.name.startswith("spec_workspace_") or field.name == (
-            "spec_conv_state_indices"
-        ):
+        if "workspace" in field.name or field.name == "spec_conv_state_indices":
             assert actual_value in (None, 0)
             continue
         if field.name == "non_spec_conv_state_indices":
@@ -102,8 +99,6 @@ def _make_builder(
         CUDAGraphMode.FULL_AND_PIECEWISE if full_cuda_graph else CUDAGraphMode.NONE
     )
     vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
-    if use_spec_workspace:
-        vllm_config.cache_config.num_gpu_blocks = 100
     return builder_cls(
         kv_cache_spec=MambaSpec(
             block_size=BLOCK_SIZE,
@@ -124,7 +119,6 @@ def test_kda_replay_workspace_metadata_splits_conv_and_recurrent_state():
         is_prefilling=torch.tensor([False, False], dtype=torch.bool),
         kda_spec_workspace_slots_cpu=torch.tensor([4, 1], dtype=torch.int32),
         kda_spec_workspace_initialized_cpu=torch.tensor([False, True]),
-        kda_spec_workspace_block_offset=5,
     )
     builder = _make_builder(
         KimiK3KDAMetadataBuilder,
@@ -144,8 +138,8 @@ def test_kda_replay_workspace_metadata_splits_conv_and_recurrent_state():
     torch.testing.assert_close(
         actual.spec_workspace_slots, torch.tensor([4, 1], dtype=torch.int32)
     )
-    assert actual.spec_workspace_base == (
-        105 + builder.vllm_config.scheduler_config.max_num_seqs
+    torch.testing.assert_close(
+        actual.spec_workspace_initialized, torch.tensor([False, True])
     )
     assert actual.spec_workspace_num_tokens == 3
     assert actual.spec_conv_state_indices is not None
@@ -159,37 +153,13 @@ def test_kda_replay_workspace_metadata_splits_conv_and_recurrent_state():
     assert no_draft.num_spec_decodes == 0
     assert no_draft.non_spec_conv_state_indices is not None
     assert no_draft.non_spec_state_indices_tensor is not None
-    assert (
-        no_draft.non_spec_conv_state_indices[1]
-        != no_draft.non_spec_state_indices_tensor[1]
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_kda_workspace_select_preserves_canonical_state_indices():
-    state_indices = torch.tensor([[11], [22], [33]], dtype=torch.int32, device="cuda")
-    workspace_slots = torch.tensor([2, 0, 1], dtype=torch.int32, device="cuda")
-    initialized = torch.tensor([False, True, True], device="cuda")
-    canonical = torch.empty(3, dtype=torch.int32, device="cuda")
-
-    _select_workspace_state_indices_kernel[(1,)](
-        state_indices,
-        workspace_slots,
-        initialized,
-        canonical,
-        state_indices.stride(0),
-        3,
-        100,
-        BLOCK_ROWS=4,
-        num_warps=1,
-    )
-
     torch.testing.assert_close(
-        canonical.cpu(), torch.tensor([11, 22, 33], dtype=torch.int32)
+        no_draft.non_spec_workspace_slots,
+        torch.tensor([4, 1], dtype=torch.int32),
     )
     torch.testing.assert_close(
-        state_indices.cpu(),
-        torch.tensor([[11], [100], [101]], dtype=torch.int32),
+        no_draft.non_spec_workspace_initialized,
+        torch.tensor([False, True]),
     )
 
 
@@ -220,6 +190,10 @@ def test_kda_replay_workspace_metadata_is_cudagraph_stable():
     torch.testing.assert_close(
         actual.spec_workspace_slots,
         torch.tensor([4, 1], dtype=torch.int32, device=device),
+    )
+    torch.testing.assert_close(
+        actual.spec_workspace_initialized,
+        torch.tensor([False, True], device=device),
     )
 
 

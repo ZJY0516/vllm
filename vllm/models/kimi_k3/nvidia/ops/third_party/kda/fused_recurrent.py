@@ -147,6 +147,9 @@ def fused_recurrent_kda_fwd_kernel(
     dt_bias,
     out,
     state,
+    working_state,
+    replay_workspace,
+    workspace_initialized,
     cu_seqlens,
     state_indices,
     num_accepted_tokens,
@@ -165,8 +168,9 @@ def fused_recurrent_kda_fwd_kernel(
     stride_beta_token,
     stride_out_token: tl.constexpr,
     stride_state_token: tl.constexpr,
+    stride_working_slot: tl.constexpr,
+    stride_replay_slot: tl.constexpr,
     stride_indices_seq: tl.constexpr,
-    workspace_base: tl.constexpr,
     workspace_num_tokens: tl.constexpr,
     USE_REPLAY_WORKSPACE: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
@@ -209,26 +213,36 @@ def fused_recurrent_kda_fwd_kernel(
         tl.store(p_out, tl.zeros([BV], dtype=tl.float32), mask=m_v)
         return
 
-    p_state = (
+    p_canonical_state = (
         state
         + state_index * stride_state_token
         + i_h * V * K
         + o_v[:, None] * K
         + o_k[None, :]
     )
-    b_state = tl.load(p_state, mask=m_state, other=0.0).to(tl.float32)
-
     if USE_REPLAY_WORKSPACE:
         workspace_slot = tl.load(workspace_slots + i_n).to(tl.int64)
-        workspace_slot_elements: tl.constexpr = workspace_num_tokens * H * (V + 2 * K)
-        workspace_slot_offset = workspace_slot * workspace_slot_elements
-        workspace_linear_base = (
-            workspace_base * stride_state_token + workspace_slot_offset
+        is_workspace_initialized = tl.load(workspace_initialized + i_n) != 0
+        p_working_state = (
+            working_state
+            + workspace_slot * stride_working_slot
+            + i_h * V * K
+            + o_v[:, None] * K
+            + o_k[None, :]
         )
+        p_state = tl.where(
+            is_workspace_initialized,
+            p_working_state,
+            p_canonical_state,
+        )
+        workspace_linear_base = workspace_slot * stride_replay_slot
         workspace_k_offset: tl.constexpr = workspace_num_tokens * H * V
         workspace_g_offset: tl.constexpr = (
             workspace_k_offset + workspace_num_tokens * H * K
         )
+    else:
+        p_state = p_canonical_state
+    b_state = tl.load(p_state, mask=m_state, other=0.0).to(tl.float32)
     p_q = q + bos * stride_qkv_token + i_h * K + o_k
     p_k = k + bos * stride_qkv_token + i_h * K + o_k
     p_v = v + bos * stride_qkv_token + i_h * V + o_v
@@ -292,7 +306,7 @@ def fused_recurrent_kda_fwd_kernel(
         if USE_REPLAY_WORKSPACE:
             u_offset = i_t * H * V + i_h * V
             p_workspace_u = (
-                state
+                replay_workspace
                 + workspace_linear_base
                 + u_offset
                 + o_v
@@ -306,13 +320,13 @@ def fused_recurrent_kda_fwd_kernel(
                 k_offset = workspace_k_offset + i_t * H * K + i_h * K
                 g_offset = workspace_g_offset + i_t * H * K + i_h * K
                 p_workspace_k = (
-                    state
+                    replay_workspace
                     + workspace_linear_base
                     + k_offset
                     + o_k
                 )
                 p_workspace_g = (
-                    state
+                    replay_workspace
                     + workspace_linear_base
                     + g_offset
                     + o_k
@@ -382,7 +396,9 @@ def fused_recurrent_kda_fwd(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     workspace_slots: torch.Tensor | None = None,
-    workspace_base: int = 0,
+    workspace_initialized: torch.Tensor | None = None,
+    working_state: torch.Tensor | None = None,
+    replay_workspace: torch.Tensor | None = None,
     workspace_num_tokens: int = 0,
     use_qk_l2norm_in_kernel: bool = True,
     A_log: torch.Tensor | None = None,
@@ -427,6 +443,11 @@ def fused_recurrent_kda_fwd(
     use_replay_workspace = workspace_slots is not None
     if use_replay_workspace:
         assert num_accepted_tokens is not None
+        assert workspace_initialized is not None
+        assert working_state is not None
+        assert replay_workspace is not None
+        assert working_state.shape[1:] == (H, V, K)
+        assert replay_workspace.shape[1] == workspace_num_tokens * H * (V + 2 * K)
 
     if scale is None:
         scale = K**-0.5
@@ -457,6 +478,9 @@ def fused_recurrent_kda_fwd(
         dt_bias=dt_bias,
         out=out,
         state=initial_state,
+        working_state=working_state,
+        replay_workspace=replay_workspace,
+        workspace_initialized=workspace_initialized,
         cu_seqlens=cu_seqlens,
         state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
@@ -475,8 +499,11 @@ def fused_recurrent_kda_fwd(
         stride_beta_token=beta.stride(1),
         stride_out_token=out.stride(1),
         stride_state_token=initial_state.stride(0),
+        stride_working_slot=(working_state.stride(0) if working_state is not None else 0),
+        stride_replay_slot=(
+            replay_workspace.stride(0) if replay_workspace is not None else 0
+        ),
         stride_indices_seq=ssm_state_indices.stride(0),
-        workspace_base=workspace_base,
         workspace_num_tokens=workspace_num_tokens,
         USE_REPLAY_WORKSPACE=use_replay_workspace,
         IS_SPEC_DECODING=num_accepted_tokens is not None,
@@ -504,7 +531,9 @@ def fused_recurrent_kda(
     ssm_state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor | None = None,
     workspace_slots: torch.Tensor | None = None,
-    workspace_base: int = 0,
+    workspace_initialized: torch.Tensor | None = None,
+    working_state: torch.Tensor | None = None,
+    replay_workspace: torch.Tensor | None = None,
     workspace_num_tokens: int = 0,
     out: torch.Tensor | None = None,
     fuse_gate: bool | None = None,
@@ -541,7 +570,9 @@ def fused_recurrent_kda(
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
         workspace_slots=workspace_slots,
-        workspace_base=workspace_base,
+        workspace_initialized=workspace_initialized,
+        working_state=working_state,
+        replay_workspace=replay_workspace,
         workspace_num_tokens=workspace_num_tokens,
         use_qk_l2norm_in_kernel=True,
         A_log=A_log if fuse_gate else None,
@@ -562,6 +593,9 @@ def fused_recurrent_kda_packed_decode_kernel(
     dt_bias,
     out,
     state,
+    working_state,
+    workspace_slots,
+    workspace_initialized,
     state_indices,
     lower_bound,
     scale: tl.constexpr,
@@ -569,6 +603,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     stride_g_token: tl.constexpr,
     stride_beta_token,
     stride_state_token: tl.constexpr,
+    stride_working_slot: tl.constexpr,
     stride_state_indices,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -577,6 +612,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    USE_REPLAY_WORKSPACE: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -598,8 +634,17 @@ def fused_recurrent_kda_packed_decode_kernel(
         tl.store(p_out, tl.zeros([BV], dtype=tl.float32), mask=mask_v)
         return
 
-    p_state = state + state_idx * stride_state_token
-    p_state += i_h * V * K + o_v[:, None] * K + o_k[None, :]
+    state_offset = i_h * V * K + o_v[:, None] * K + o_k[None, :]
+    p_canonical_state = state + state_idx * stride_state_token + state_offset
+    if USE_REPLAY_WORKSPACE:
+        workspace_slot = tl.load(workspace_slots + i_n).to(tl.int64)
+        initialized = tl.load(workspace_initialized + i_n) != 0
+        p_working_state = (
+            working_state + workspace_slot * stride_working_slot + state_offset
+        )
+        p_state = tl.where(initialized, p_working_state, p_canonical_state)
+    else:
+        p_state = p_canonical_state
     b_state = tl.load(p_state, mask=mask_state, other=0).to(tl.float32)
 
     # Q, K, and V occupy consecutive channel ranges, while the token stride
@@ -658,6 +703,9 @@ def fused_recurrent_kda_packed_decode(
     lower_bound: float | None,
     initial_state: torch.Tensor,
     state_indices: torch.Tensor,
+    workspace_slots: torch.Tensor | None = None,
+    workspace_initialized: torch.Tensor | None = None,
+    working_state: torch.Tensor | None = None,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one-token KDA decode directly from packed post-conv QKV."""
@@ -701,6 +749,14 @@ def fused_recurrent_kda_packed_decode(
         raise ValueError("`A_log` or `dt_bias` has an incompatible shape.")
     if state_indices.shape[0] != B:
         raise ValueError("`state_indices` must contain one entry per token.")
+    use_replay_workspace = workspace_slots is not None
+    if use_replay_workspace:
+        if workspace_initialized is None or working_state is None:
+            raise ValueError("Workspace metadata and working state are required.")
+        if workspace_slots.shape != (B,) or workspace_initialized.shape != (B,):
+            raise ValueError("Workspace metadata must contain one entry per token.")
+        if working_state.shape[1:] != (H, V, K):
+            raise ValueError("Working state has an incompatible shape.")
 
     BK = next_power_of_2(K)
     BV = min(next_power_of_2(V), 32)
@@ -717,6 +773,9 @@ def fused_recurrent_kda_packed_decode(
         dt_bias=dt_bias,
         out=out,
         state=initial_state,
+        working_state=working_state,
+        workspace_slots=workspace_slots,
+        workspace_initialized=workspace_initialized,
         state_indices=state_indices,
         lower_bound=lower_bound or 0.0,
         scale=scale,
@@ -724,6 +783,7 @@ def fused_recurrent_kda_packed_decode(
         stride_g_token=raw_g.stride(1),
         stride_beta_token=raw_beta.stride(1),
         stride_state_token=initial_state.stride(0),
+        stride_working_slot=(working_state.stride(0) if working_state is not None else 0),
         stride_state_indices=state_indices.stride(0),
         H=H,
         K=K,
@@ -732,6 +792,7 @@ def fused_recurrent_kda_packed_decode(
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
         USE_LOWER_BOUND=lower_bound is not None,
+        USE_REPLAY_WORKSPACE=use_replay_workspace,
         num_warps=4,
         num_stages=2,
         launch_pdl=current_platform.is_arch_support_pdl(),

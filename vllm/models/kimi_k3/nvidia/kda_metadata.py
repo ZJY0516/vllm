@@ -127,34 +127,6 @@ def _mamba_get_block_table_tensor(
     return state_indices
 
 
-@triton.jit(do_not_specialize=["num_requests"])
-def _select_workspace_state_indices_kernel(
-    state_indices_ptr,
-    workspace_slots_ptr,
-    workspace_initialized_ptr,
-    canonical_state_indices_ptr,
-    state_indices_stride_0: tl.constexpr,
-    num_requests,
-    working_base: tl.int64,
-    BLOCK_ROWS: tl.constexpr,
-):
-    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    mask = rows < num_requests
-    canonical = tl.load(
-        state_indices_ptr + rows * state_indices_stride_0,
-        mask=mask,
-    )
-    slots = tl.load(workspace_slots_ptr + rows, mask=mask)
-    initialized = tl.load(workspace_initialized_ptr + rows, mask=mask)
-    selected = tl.where(initialized, working_base + slots, canonical)
-    tl.store(canonical_state_indices_ptr + rows, canonical, mask=mask)
-    tl.store(
-        state_indices_ptr + rows * state_indices_stride_0,
-        selected,
-        mask=mask,
-    )
-
-
 @triton.jit(do_not_specialize=["num_spec_decodes", "batch_size"])
 def _stage_spec_decode_metadata_kernel(
     state_indices_ptr,
@@ -265,7 +237,9 @@ class KimiK3KDAMetadata(GDNAttentionMetadata):
     spec_conv_state_indices: torch.Tensor | None = None
     non_spec_conv_state_indices: torch.Tensor | None = None
     spec_workspace_slots: torch.Tensor | None = None
-    spec_workspace_base: int = 0
+    spec_workspace_initialized: torch.Tensor | None = None
+    non_spec_workspace_slots: torch.Tensor | None = None
+    non_spec_workspace_initialized: torch.Tensor | None = None
     spec_workspace_num_tokens: int = 0
 
 
@@ -279,11 +253,6 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         self.non_spec_conv_state_indices = torch.empty_like(
             self.non_spec_state_indices_tensor
-        )
-        self.canonical_state_indices = torch.empty(
-            self.decode_cudagraph_max_bs,
-            dtype=torch.int32,
-            device=self.spec_state_indices_tensor.device,
         )
         self.workspace_slots_cpu = torch.empty(
             self.decode_cudagraph_max_bs,
@@ -307,6 +276,11 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             dtype=torch.bool,
             device=self.spec_state_indices_tensor.device,
         )
+        self.spec_workspace_initialized = torch.empty_like(self.workspace_initialized)
+        self.non_spec_workspace_slots = torch.empty_like(self.workspace_slots)
+        self.non_spec_workspace_initialized = torch.empty_like(
+            self.workspace_initialized
+        )
 
     def build(  # type: ignore[override]
         self,
@@ -326,11 +300,6 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         #   indices = (start[:, None] + offsets).to(torch.int64)
         #   block_table_tensor = torch.gather(block_table, 1, indices)
         if self.kv_cache_spec.use_spec_workspace:
-            assert self.vllm_config.cache_config.num_gpu_blocks is not None
-            working_base = (
-                self.vllm_config.cache_config.num_gpu_blocks
-                + m.kda_spec_workspace_block_offset
-            )
             workspace_slots = m.kda_spec_workspace_slots
             workspace_initialized = m.kda_spec_workspace_initialized
             if workspace_slots is None or workspace_initialized is None:
@@ -353,12 +322,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 workspace_slots = self.workspace_slots[:num_workspace_reqs]
                 workspace_initialized = self.workspace_initialized[:num_workspace_reqs]
             assert workspace_initialized is not None
-            workspace_base = (
-                working_base + self.vllm_config.scheduler_config.max_num_seqs
-            )
         else:
             workspace_slots = None
-            workspace_base = 0
+            workspace_initialized = None
 
         block_table_tensor = _mamba_get_block_table_tensor(
             m.block_table_tensor,
@@ -366,35 +332,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
-        if workspace_slots is not None:
-            assert workspace_initialized is not None
-            num_requests = block_table_tensor.shape[0]
-            if block_table_tensor.is_cuda:
-                BLOCK_ROWS = 32
-                _select_workspace_state_indices_kernel[
-                    (triton.cdiv(num_requests, BLOCK_ROWS),)
-                ](
-                    block_table_tensor,
-                    workspace_slots,
-                    workspace_initialized,
-                    self.canonical_state_indices,
-                    block_table_tensor.stride(0),
-                    num_requests,
-                    working_base,
-                    BLOCK_ROWS=BLOCK_ROWS,
-                    num_warps=1,
-                )
-                canonical_state_indices = self.canonical_state_indices[:num_requests]
-            else:
-                canonical_state_indices = block_table_tensor[:, 0]
-                working_state_indices = working_base + workspace_slots
-                block_table_tensor = torch.where(
-                    workspace_initialized[:, None],
-                    working_state_indices[:, None],
-                    block_table_tensor[:, :1],
-                )
-        else:
-            canonical_state_indices = block_table_tensor[:, 0]
+        canonical_state_indices = block_table_tensor[:, 0]
 
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks_cpu = None
@@ -426,6 +364,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             num_accepted_tokens = None
             spec_conv_state_indices = None
             spec_workspace_slots = None
+            spec_workspace_initialized = None
+            non_spec_workspace_slots = workspace_slots
+            non_spec_workspace_initialized = workspace_initialized
         else:
             assert spec_sequence_masks_cpu is not None
             assert num_accepted_tokens is not None
@@ -465,8 +406,11 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 spec_token_indx = None
                 non_spec_token_indx = None
                 # Real requests precede trailing cudagraph padding.
+                num_spec_state_slots = (
+                    1 if workspace_slots is not None else self.num_spec + 1
+                )
                 spec_state_indices_tensor = block_table_tensor[
-                    :num_spec_decodes, : self.num_spec + 1
+                    :num_spec_decodes, :num_spec_state_slots
                 ]
                 non_spec_state_indices_tensor = None
                 # Padding trails real requests, so this prefix already contains
@@ -486,6 +430,13 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                     if workspace_slots is not None
                     else None
                 )
+                spec_workspace_initialized = (
+                    workspace_initialized[:num_spec_decodes]
+                    if workspace_initialized is not None
+                    else None
+                )
+                non_spec_workspace_slots = None
+                non_spec_workspace_initialized = None
             else:
                 query_lens = query_start_loc.diff()
                 spec_sequence_masks_gpu = async_tensor_h2d(
@@ -505,8 +456,11 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
 
                 # Spec requests carry one state slot per speculative step;
                 # non-spec requests use only their current state slot.
+                num_spec_state_slots = (
+                    1 if workspace_slots is not None else self.num_spec + 1
+                )
                 spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
+                    spec_sequence_masks_cpu, :num_spec_state_slots
                 ]
                 non_spec_state_indices_tensor = block_table_tensor[
                     active_non_spec_mask_cpu, 0
@@ -564,6 +518,21 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                     if workspace_slots is not None
                     else None
                 )
+                spec_workspace_initialized = (
+                    workspace_initialized[spec_sequence_masks_cpu]
+                    if workspace_initialized is not None
+                    else None
+                )
+                non_spec_workspace_slots = (
+                    workspace_slots[active_non_spec_mask_cpu]
+                    if workspace_slots is not None
+                    else None
+                )
+                non_spec_workspace_initialized = (
+                    workspace_initialized[active_non_spec_mask_cpu]
+                    if workspace_initialized is not None
+                    else None
+                )
 
         # Unlike the shared GDN layer, Kimi-K3's prefill KDA wrapper prepares
         # its own chunk indices. Only causal-convolution metadata is needed here.
@@ -609,10 +578,15 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             )
 
             if spec_workspace_slots is not None:
+                assert spec_workspace_initialized is not None
                 self.spec_token_indx[:num_spec_decodes].copy_(
                     spec_workspace_slots, non_blocking=True
                 )
                 self.spec_token_indx[num_spec_decodes:batch_size].zero_()
+                self.spec_workspace_initialized[:num_spec_decodes].copy_(
+                    spec_workspace_initialized, non_blocking=True
+                )
+                self.spec_workspace_initialized[num_spec_decodes:batch_size].zero_()
                 self.spec_conv_state_indices[:num_spec_decodes].copy_(
                     spec_conv_state_indices, non_blocking=True
                 )
@@ -625,6 +599,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             if spec_workspace_slots is not None:
                 spec_workspace_slots = self.spec_token_indx[:batch_size]
+                spec_workspace_initialized = self.spec_workspace_initialized[
+                    :batch_size
+                ]
                 spec_conv_state_indices = self.spec_conv_state_indices[:batch_size]
 
         if (
@@ -649,6 +626,20 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 NULL_BLOCK_ID
             )
             non_spec_conv_state_indices = self.non_spec_conv_state_indices[:batch_size]
+            if non_spec_workspace_slots is not None:
+                assert non_spec_workspace_initialized is not None
+                self.non_spec_workspace_slots[:num_decodes].copy_(
+                    non_spec_workspace_slots[:num_decodes], non_blocking=True
+                )
+                self.non_spec_workspace_slots[num_decodes:batch_size].zero_()
+                self.non_spec_workspace_initialized[:num_decodes].copy_(
+                    non_spec_workspace_initialized[:num_decodes], non_blocking=True
+                )
+                self.non_spec_workspace_initialized[num_decodes:batch_size].zero_()
+                non_spec_workspace_slots = self.non_spec_workspace_slots[:batch_size]
+                non_spec_workspace_initialized = self.non_spec_workspace_initialized[
+                    :batch_size
+                ]
 
         return KimiK3KDAMetadata(
             num_prefills=num_prefills,
@@ -673,7 +664,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             spec_conv_state_indices=spec_conv_state_indices,
             non_spec_conv_state_indices=non_spec_conv_state_indices,
             spec_workspace_slots=spec_workspace_slots,
-            spec_workspace_base=workspace_base,
+            spec_workspace_initialized=spec_workspace_initialized,
+            non_spec_workspace_slots=non_spec_workspace_slots,
+            non_spec_workspace_initialized=non_spec_workspace_initialized,
             spec_workspace_num_tokens=(
                 self.num_spec + 1 if self.kv_cache_spec.use_spec_workspace else 0
             ),

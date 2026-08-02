@@ -2574,11 +2574,6 @@ class GPUModelRunner(
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
-            cm.kda_spec_workspace_block_offset = (
-                self.kv_cache_config.kda_spec_workspace_block_offsets.get(
-                    kv_cache_gid, 0
-                )
-            )
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.

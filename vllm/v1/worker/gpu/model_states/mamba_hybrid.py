@@ -35,7 +35,6 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
     kda_spec_workspace_slots: torch.Tensor | None = None
     kda_spec_workspace_initialized: torch.Tensor | None = None
-    kda_spec_workspace_block_offsets: dict[int, int] | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -53,11 +52,6 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
                 None
                 if self.kda_spec_workspace_initialized is None
                 else self.kda_spec_workspace_initialized[:num_reqs]
-            ),
-            "kda_spec_workspace_block_offset": (
-                0
-                if self.kda_spec_workspace_block_offsets is None
-                else self.kda_spec_workspace_block_offsets.get(kv_cache_group_id, 0)
             ),
         }
 
@@ -347,9 +341,6 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
             kda_spec_workspace_slots=kda_spec_workspace_slots,
             kda_spec_workspace_initialized=kda_spec_workspace_initialized,
-            kda_spec_workspace_block_offsets=(
-                kv_cache_config.kda_spec_workspace_block_offsets
-            ),
         )
         return build_attn_metadata(
             attn_groups=attn_groups,

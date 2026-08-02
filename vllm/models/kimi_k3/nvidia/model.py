@@ -1003,6 +1003,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        self._init_kda_spec_workspace(vllm_config)
         self.num_attn_res_blocks = (
             cdiv(self.end_layer, self.attn_res_block_size)
             if self.attn_res_block_size is not None
@@ -1032,6 +1033,56 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
         )
+
+    def _init_kda_spec_workspace(self, vllm_config: VllmConfig) -> None:
+        kda_layers = [
+            layer.self_attn
+            for layer in self.layers
+            if isinstance(getattr(layer, "self_attn", None), KimiK3DeltaAttention)
+        ]
+        working_state = None
+        replay_workspace = None
+        if vllm_config.use_kda_spec_workspace() and kda_layers:
+            first_layer = kda_layers[0]
+            assert all(
+                layer.local_num_heads == first_layer.local_num_heads
+                and layer.head_dim == first_layer.head_dim
+                and layer.num_spec == first_layer.num_spec
+                for layer in kda_layers
+            )
+            _, state_dtype = MambaStateDtypeCalculator.kda_state_dtype(
+                vllm_config.model_config.dtype,
+                vllm_config.cache_config.mamba_cache_dtype,
+            )
+            num_layers = len(kda_layers)
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            num_heads = first_layer.local_num_heads
+            head_dim = first_layer.head_dim
+            working_state = torch.empty(
+                num_layers,
+                max_num_seqs,
+                num_heads,
+                head_dim,
+                head_dim,
+                dtype=state_dtype,
+                device=first_layer.A_log.device,
+            )
+            replay_workspace = torch.empty(
+                num_layers,
+                max_num_seqs,
+                (first_layer.num_spec + 1) * num_heads * 3 * head_dim,
+                dtype=state_dtype,
+                device=first_layer.A_log.device,
+            )
+        self.register_buffer("kda_spec_working_state", working_state, persistent=False)
+        self.register_buffer(
+            "kda_spec_replay_workspace", replay_workspace, persistent=False
+        )
+        if working_state is not None and replay_workspace is not None:
+            for layer_idx, layer in enumerate(kda_layers):
+                layer.bind_spec_workspace(
+                    working_state[layer_idx], replay_workspace[layer_idx]
+                )
 
     def make_empty_intermediate_tensors(
         self,

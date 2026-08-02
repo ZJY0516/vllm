@@ -486,19 +486,16 @@ class CommonAttentionMetadata:
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
 
     kda_spec_workspace_slots_cpu: torch.Tensor | None = None
-    """Stable per-request slots in the statically reserved KDA workspace."""
+    """Stable per-request slots in the dedicated KDA workspace tensors."""
 
     kda_spec_workspace_initialized_cpu: torch.Tensor | None = None
-    """Whether each request's fixed KDA working page contains its live state."""
+    """Whether each request's fixed KDA working slot contains its live state."""
 
     kda_spec_workspace_slots: torch.Tensor | None = None
     """GPU copy of the stable per-request KDA workspace slots."""
 
     kda_spec_workspace_initialized: torch.Tensor | None = None
     """GPU copy of the per-request KDA workspace initialization flags."""
-
-    kda_spec_workspace_block_offset: int = 0
-    """This KV cache group's block offset within the KDA workspace tail."""
 
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None

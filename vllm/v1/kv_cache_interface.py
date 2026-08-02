@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -717,14 +717,6 @@ class MambaSpec(KVCacheSpec):
     use_spec_workspace: bool = False
 
     @property
-    def spec_workspace_elements_per_slot(self) -> int:
-        if not self.use_spec_workspace:
-            return 0
-        num_tokens = self.num_speculative_blocks + 1
-        num_heads, value_dim, key_dim = self.shapes[-1]
-        return num_tokens * num_heads * (value_dim + 2 * key_dim)
-
-    @property
     def page_size_bytes(self) -> int:
         page_size = sum(
             prod(shape) * get_dtype_size(dtype)
@@ -1003,10 +995,6 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
-    num_kda_spec_workspace_blocks: int = 0
-    """Tail blocks reserved for compact KDA speculative replay inputs."""
-    kda_spec_workspace_block_offsets: dict[int, int] = field(default_factory=dict)
-    """KV cache group ID to its workspace offset within the reserved tail."""
 
     @property
     def has_mamba_layers(self) -> bool:
