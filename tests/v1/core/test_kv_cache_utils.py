@@ -27,6 +27,8 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    _get_kda_spec_workspace_blocks,
+    _get_kda_spec_workspace_layout,
     estimate_max_model_len,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
@@ -192,6 +194,50 @@ def new_mamba_spec(
         mamba_cache_mode=mamba_cache_mode,
         num_speculative_blocks=num_speculative_blocks,
     )
+
+
+def test_mamba_align_workspace_excludes_per_request_spec_blocks():
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        model_config=SimpleNamespace(max_model_len=64),
+    )
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((8,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=8,
+        use_spec_workspace=True,
+    )
+
+    assert spec.max_memory_usage_bytes(vllm_config) == 2 * 32
+    assert spec.max_num_blocks_per_req(vllm_config, 64) == 4
+
+
+def test_kda_spec_workspace_size_scales_with_window():
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((64, 4), (2, 32, 32)),
+        dtypes=(torch.bfloat16, torch.float32),
+        num_speculative_blocks=11,
+        use_spec_workspace=True,
+    )
+
+    assert spec.spec_workspace_elements_per_slot == 12 * 2 * 3 * 32
+
+    config = SimpleNamespace(
+        speculative_config=object(),
+        scheduler_config=SimpleNamespace(max_num_seqs=10),
+    )
+    groups = [KVCacheGroupSpec(layer_names=["kda"], kv_cache_spec=spec)]
+    assert _get_kda_spec_workspace_blocks(config, groups) == 22
+
+    groups = [
+        groups[0],
+        KVCacheGroupSpec(layer_names=["attention"], kv_cache_spec=new_kv_cache_spec()),
+        KVCacheGroupSpec(layer_names=["kda.1"], kv_cache_spec=spec),
+    ]
+    assert _get_kda_spec_workspace_layout(config, groups) == (44, {0: 0, 2: 22})
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -867,7 +913,6 @@ def test_get_kv_cache_configs_multiple_workers():
             ],
         ),
     ]
-
     # Different available memory. This is the case for TP.
     # Use the smallest memory available.
     kv_cache_configs = get_kv_cache_configs(
@@ -1162,6 +1207,22 @@ def test_get_kv_cache_configs_multiple_workers():
                 ref_kv_cache_spec.page_size_bytes * 2 * 10,
             ],
         )
+
+
+def test_resize_kv_cache_config_preserves_kda_workspace_blocks():
+    page_size = 1024
+    config = KVCacheConfig(
+        num_blocks=19,
+        num_kda_spec_workspace_blocks=1,
+        kv_cache_tensors=[KVCacheTensor(size=page_size * 20, shared_by=["layer"])],
+        kv_cache_groups=[],
+    )
+
+    kv_cache_utils._resize_kv_cache_config(config, num_blocks=9)
+
+    assert config.num_blocks == 9
+    assert config.num_kda_spec_workspace_blocks == 1
+    assert config.kv_cache_tensors[0].size == page_size * 10
 
 
 @pytest.mark.parametrize(

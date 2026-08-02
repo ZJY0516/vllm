@@ -2365,6 +2365,41 @@ class VllmConfig:
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_kda_spec_workspace(self) -> "VllmConfig":
+        if not self.cache_config.enable_kda_spec_workspace:
+            return self
+        if self.speculative_config is None:
+            raise ValueError(
+                "--enable-kda-spec-workspace requires speculative decoding"
+            )
+        if self.cache_config.mamba_cache_mode != "align":
+            raise ValueError(
+                "--enable-kda-spec-workspace requires --mamba-cache-mode align"
+            )
+        kimi_k3_architectures = {
+            "KimiK3ForConditionalGeneration",
+            "KimiLinearForCausalLM",
+        }
+        if self.model_config is None or not kimi_k3_architectures.intersection(
+            self.model_config.architectures
+        ):
+            raise ValueError(
+                "--enable-kda-spec-workspace is only supported for Kimi-K3"
+            )
+        return self
+
+    def use_kda_spec_workspace(self) -> bool:
+        return bool(
+            self.cache_config.enable_kda_spec_workspace
+            and self.speculative_config is not None
+            and self.model_config is not None
+            and {
+                "KimiK3ForConditionalGeneration",
+                "KimiLinearForCausalLM",
+            }.intersection(self.model_config.architectures)
+        )
+
 
 _current_vllm_config: VllmConfig | None = None
 _current_prefix: str | None = None

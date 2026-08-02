@@ -485,6 +485,21 @@ class CommonAttentionMetadata:
     at the current decode run's last full-state write. write_pos counts from
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
 
+    kda_spec_workspace_slots_cpu: torch.Tensor | None = None
+    """Stable per-request slots in the statically reserved KDA workspace."""
+
+    kda_spec_workspace_initialized_cpu: torch.Tensor | None = None
+    """Whether each request's fixed KDA working page contains its live state."""
+
+    kda_spec_workspace_slots: torch.Tensor | None = None
+    """GPU copy of the stable per-request KDA workspace slots."""
+
+    kda_spec_workspace_initialized: torch.Tensor | None = None
+    """GPU copy of the per-request KDA workspace initialization flags."""
+
+    kda_spec_workspace_block_offset: int = 0
+    """This KV cache group's block offset within the KDA workspace tail."""
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
@@ -597,6 +612,16 @@ class CommonAttentionMetadata:
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
+            kda_spec_workspace_slots_cpu=maybe_slice_reqs(
+                self.kda_spec_workspace_slots_cpu
+            ),
+            kda_spec_workspace_initialized_cpu=maybe_slice_reqs(
+                self.kda_spec_workspace_initialized_cpu
+            ),
+            kda_spec_workspace_slots=maybe_slice_reqs(self.kda_spec_workspace_slots),
+            kda_spec_workspace_initialized=maybe_slice_reqs(
+                self.kda_spec_workspace_initialized
+            ),
         )
 
 

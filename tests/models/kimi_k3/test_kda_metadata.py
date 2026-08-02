@@ -18,6 +18,7 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAMetadata,
     KimiK3KDAMetadataBuilder,
     _mamba_get_block_table_tensor,
+    _select_workspace_state_indices_kernel,
     stage_spec_decode_metadata,
 )
 from vllm.v1.attention.backend import AttentionMetadataBuilder
@@ -47,7 +48,15 @@ PRUNED_METADATA_FIELDS = {
 def _assert_matches_shared_gdn(reference, actual: KimiK3KDAMetadata):
     for field in fields(KimiK3KDAMetadata):
         actual_value = getattr(actual, field.name)
-        expected_value = getattr(reference, field.name)
+        if field.name.startswith("spec_workspace_") or field.name == (
+            "spec_conv_state_indices"
+        ):
+            assert actual_value in (None, 0)
+            continue
+        if field.name == "non_spec_conv_state_indices":
+            expected_value = reference.non_spec_state_indices_tensor
+        else:
+            expected_value = getattr(reference, field.name)
         if field.name in PRUNED_METADATA_FIELDS:
             assert actual_value is None
             continue
@@ -78,6 +87,7 @@ def _make_builder(
     full_cuda_graph: bool,
     device: torch.device = DEVICE,
     mamba_cache_mode: str = "none",
+    use_spec_workspace: bool = False,
 ) -> AttentionMetadataBuilder:
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
@@ -92,16 +102,124 @@ def _make_builder(
         CUDAGraphMode.FULL_AND_PIECEWISE if full_cuda_graph else CUDAGraphMode.NONE
     )
     vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
+    if use_spec_workspace:
+        vllm_config.cache_config.num_gpu_blocks = 100
     return builder_cls(
         kv_cache_spec=MambaSpec(
             block_size=BLOCK_SIZE,
-            shapes=((16, 64),),
-            dtypes=(torch.float16,),
+            shapes=((16, 64), (1, 64, 64)),
+            dtypes=(torch.float16, torch.float32),
             num_speculative_blocks=num_speculative_tokens,
+            use_spec_workspace=use_spec_workspace,
         ),
         layer_names=["layer.0"],
         vllm_config=vllm_config,
         device=device,
+    )
+
+
+def test_kda_replay_workspace_metadata_splits_conv_and_recurrent_state():
+    batch = BatchSpec(seq_lens=[50, 30], query_lens=[3, 3])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        is_prefilling=torch.tensor([False, False], dtype=torch.bool),
+        kda_spec_workspace_slots_cpu=torch.tensor([4, 1], dtype=torch.int32),
+        kda_spec_workspace_initialized_cpu=torch.tensor([False, True]),
+        kda_spec_workspace_block_offset=5,
+    )
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=2,
+        full_cuda_graph=False,
+        use_spec_workspace=True,
+    )
+    actual = builder.build(
+        0,
+        common,
+        num_decode_draft_tokens_cpu=torch.tensor([2, 2], dtype=torch.int32),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+    )
+
+    assert isinstance(actual, KimiK3KDAMetadata)
+    assert actual.spec_state_indices_tensor.shape == (2, 1)
+    torch.testing.assert_close(
+        actual.spec_workspace_slots, torch.tensor([4, 1], dtype=torch.int32)
+    )
+    assert actual.spec_workspace_base == (
+        105 + builder.vllm_config.scheduler_config.max_num_seqs
+    )
+    assert actual.spec_workspace_num_tokens == 3
+    assert actual.spec_conv_state_indices is not None
+
+    no_draft = builder.build(
+        0,
+        common,
+        num_decode_draft_tokens_cpu=torch.tensor([0, 0], dtype=torch.int32),
+        num_accepted_tokens=torch.tensor([1, 2], dtype=torch.int32),
+    )
+    assert no_draft.num_spec_decodes == 0
+    assert no_draft.non_spec_conv_state_indices is not None
+    assert no_draft.non_spec_state_indices_tensor is not None
+    assert (
+        no_draft.non_spec_conv_state_indices[1]
+        != no_draft.non_spec_state_indices_tensor[1]
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_kda_workspace_select_preserves_canonical_state_indices():
+    state_indices = torch.tensor([[11], [22], [33]], dtype=torch.int32, device="cuda")
+    workspace_slots = torch.tensor([2, 0, 1], dtype=torch.int32, device="cuda")
+    initialized = torch.tensor([False, True, True], device="cuda")
+    canonical = torch.empty(3, dtype=torch.int32, device="cuda")
+
+    _select_workspace_state_indices_kernel[(1,)](
+        state_indices,
+        workspace_slots,
+        initialized,
+        canonical,
+        state_indices.stride(0),
+        3,
+        100,
+        BLOCK_ROWS=4,
+        num_warps=1,
+    )
+
+    torch.testing.assert_close(
+        canonical.cpu(), torch.tensor([11, 22, 33], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        state_indices.cpu(),
+        torch.tensor([[11], [100], [101]], dtype=torch.int32),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_kda_replay_workspace_metadata_is_cudagraph_stable():
+    device = torch.device("cuda")
+    batch = BatchSpec(seq_lens=[50, 30], query_lens=[3, 3])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, device).replace(
+        is_prefilling=torch.tensor([False, False], dtype=torch.bool),
+        kda_spec_workspace_slots_cpu=torch.tensor([4, 1], dtype=torch.int32),
+        kda_spec_workspace_initialized_cpu=torch.tensor([False, True]),
+    )
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=2,
+        full_cuda_graph=True,
+        device=device,
+        use_spec_workspace=True,
+    )
+    actual = builder.build(
+        0,
+        common,
+        num_decode_draft_tokens_cpu=torch.tensor([2, 2], dtype=torch.int32),
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32, device=device),
+    )
+
+    assert isinstance(actual, KimiK3KDAMetadata)
+    torch.testing.assert_close(
+        actual.spec_workspace_slots,
+        torch.tensor([4, 1], dtype=torch.int32, device=device),
     )
 
 
@@ -186,6 +304,7 @@ def test_kimi_k3_kda_metadata_matches_shared_gdn(
 
     assert isinstance(actual, KimiK3KDAMetadata)
     _assert_matches_shared_gdn(reference, actual)
+    assert actual.spec_conv_state_indices is None
 
 
 def test_mixed_regular_and_spec_decode_uses_packed_decode_metadata():
@@ -409,3 +528,15 @@ def test_aligned_block_table_matches_shared_gdn():
     )
 
     torch.testing.assert_close(actual, expected)
+
+    replay_spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((16, 64), (1, 64, 64)),
+        dtypes=(torch.float16, torch.float32),
+        num_speculative_blocks=2,
+        use_spec_workspace=True,
+    )
+    replay_actual = _mamba_get_block_table_tensor(
+        block_table, seq_lens, replay_spec, "align"
+    )
+    torch.testing.assert_close(replay_actual, expected[:, :1])

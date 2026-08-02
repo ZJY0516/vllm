@@ -43,6 +43,8 @@ def _copy_mamba_state_block(
     state_dim_row_stride_ptr,
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
+    USE_TEMPORAL_TOKEN_BIAS: tl.constexpr,
+    SKIP_TEMPORAL_COPY: tl.constexpr,
 ):
     """Copy one (layer, state-type) mamba state block between block columns.
 
@@ -118,8 +120,16 @@ def _copy_mamba_state_block(
             tl.store(curr_dst, data, mask=mask)
         return
 
-    # Temporal state: copy state[bt[src_col + token_bias]] -> state[bt[dst_col]]
-    actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
+    if SKIP_TEMPORAL_COPY:
+        return
+
+    # Compact KDA workspaces keep their running state in a fixed page and do
+    # not use speculative block-table columns. Other Mamba implementations
+    # select one temporal snapshot with token_bias.
+    temporal_token_bias = token_bias if USE_TEMPORAL_TOKEN_BIAS else 0
+    actual_src_block_id = tl.load(block_table_base + src_col + temporal_token_bias).to(
+        tl.int64
+    )
     src_addr = state_base_addr + actual_src_block_id * state_block_stride
     # Use natural block data size (inner_size * elem_size), NOT
     # state_block_stride which is the page stride and can exceed the
@@ -188,6 +198,8 @@ def postprocess_mamba_fused_kernel(
     # COPY_BLOCK_SIZE: fixed tuning parameter for memory copy loop
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
+    USE_TEMPORAL_TOKEN_BIAS: tl.constexpr,
+    SKIP_TEMPORAL_COPY: tl.constexpr,
     # HAS_IDX_MAPPING: when True, program_id(0) is a batch index resolved to a
     # req-state slot via idx_mapping_ptr (V2). When False, it is the req index.
     HAS_IDX_MAPPING: tl.constexpr = False,
@@ -277,6 +289,8 @@ def postprocess_mamba_fused_kernel(
         state_dim_row_stride_ptr,
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
+        USE_TEMPORAL_TOKEN_BIAS,
+        SKIP_TEMPORAL_COPY,
     )
 
 
@@ -348,6 +362,8 @@ def precopy_mamba_align_fused_kernel(
     num_reqs,
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
+    USE_TEMPORAL_TOKEN_BIAS: tl.constexpr,
+    SKIP_TEMPORAL_COPY: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr = True,
 ):
     """Pre-copy mamba "align" state across block boundaries.
@@ -402,7 +418,198 @@ def precopy_mamba_align_fused_kernel(
         state_dim_row_stride_ptr,
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
+        USE_TEMPORAL_TOKEN_BIAS,
+        SKIP_TEMPORAL_COPY,
     )
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def commit_kda_spec_workspace_kernel(
+    num_accepted_tokens_ptr,
+    active_spec_decode_ptr,
+    workspace_initialized_ptr,
+    mamba_state_idx_ptr,
+    workspace_slots_ptr,
+    idx_mapping_ptr,
+    num_scheduled_tokens_ptr,
+    num_computed_tokens_ptr,
+    num_draft_tokens_ptr,
+    block_table_ptrs_ptr,
+    block_table_stride_req: tl.int64,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    working_block_bases_ptr,
+    replay_block_bases_ptr,
+    num_reqs,
+    NUM_STATE_TYPES: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    VALUE_DIM: tl.constexpr,
+    KEY_DIM: tl.constexpr,
+    WORKSPACE_NUM_TOKENS: tl.constexpr,
+    BLOCK_VALUE: tl.constexpr,
+    BLOCK_KEY: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr,
+    WORKSPACE_SLOT_IS_REQ_IDX: tl.constexpr,
+    PRECOMPUTED_NEW_COMPUTED: tl.constexpr,
+    MAMBA_BLOCK_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    layer_idx = tl.program_id(1)
+    state_idx = layer_idx * NUM_STATE_TYPES + NUM_STATE_TYPES - 1
+    value_tile = tl.program_id(2)
+    if batch_idx >= num_reqs:
+        return
+
+    req_idx = (
+        tl.load(idx_mapping_ptr + batch_idx).to(tl.int64)
+        if HAS_IDX_MAPPING
+        else batch_idx
+    )
+    if req_idx < 0:
+        return
+    is_active_spec = tl.load(active_spec_decode_ptr + req_idx) != 0
+    is_workspace_initialized = tl.load(workspace_initialized_ptr + req_idx) != 0
+    if not is_active_spec and not is_workspace_initialized:
+        return
+
+    if tl.load(state_conv_widths_ptr + state_idx) != 0:
+        return
+
+    num_accepted = tl.minimum(
+        tl.load(num_accepted_tokens_ptr + req_idx).to(tl.int64),
+        WORKSPACE_NUM_TOKENS,
+    )
+    if num_accepted <= 0:
+        return
+
+    group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
+    group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
+    block_table = group_base_addr.to(tl.pointer_type(tl.int32))
+    state_col = tl.load(mamba_state_idx_ptr + req_idx).to(tl.int64)
+    canonical_state_block_id = tl.load(
+        block_table + batch_idx * block_table_stride_req + state_col
+    ).to(tl.int64)
+
+    state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
+    state_block_stride_bytes = tl.load(state_block_strides_ptr + state_idx)
+    state_block_stride = state_block_stride_bytes // 4
+    state_base = state_base_addr.to(tl.pointer_type(tl.float32))
+
+    workspace_slot = (
+        req_idx
+        if WORKSPACE_SLOT_IS_REQ_IDX
+        else tl.load(workspace_slots_ptr + req_idx).to(tl.int64)
+    )
+    working_block_base = tl.load(working_block_bases_ptr + group_idx).to(tl.int64)
+    working_state_block_id = working_block_base + workspace_slot
+    state_block_id = tl.where(
+        is_workspace_initialized,
+        working_state_block_id,
+        canonical_state_block_id,
+    )
+
+    values_per_head_block: tl.constexpr = tl.cdiv(VALUE_DIM, BLOCK_VALUE)
+    head_idx = value_tile // values_per_head_block
+    value_block_idx = value_tile % values_per_head_block
+    value_offsets = value_block_idx * BLOCK_VALUE + tl.arange(0, BLOCK_VALUE)
+    key_offsets = tl.arange(0, BLOCK_KEY)
+    value_mask = value_offsets < VALUE_DIM
+    key_mask = key_offsets < KEY_DIM
+    state_mask = value_mask[:, None] & key_mask[None, :]
+
+    state_offset = (
+        head_idx * VALUE_DIM * KEY_DIM
+        + value_offsets[:, None] * KEY_DIM
+        + key_offsets[None, :]
+    )
+    state_ptr = state_base + state_block_id * state_block_stride + state_offset
+    state = tl.load(state_ptr, mask=state_mask, other=0.0).to(tl.float32)
+
+    slot_elements: tl.constexpr = (
+        WORKSPACE_NUM_TOKENS * NUM_HEADS * (VALUE_DIM + 2 * KEY_DIM)
+    )
+    slot_offset = workspace_slot * slot_elements
+    key_base: tl.constexpr = WORKSPACE_NUM_TOKENS * NUM_HEADS * VALUE_DIM
+    gate_base: tl.constexpr = key_base + WORKSPACE_NUM_TOKENS * NUM_HEADS * KEY_DIM
+    replay_block_base = tl.load(replay_block_bases_ptr + group_idx).to(tl.int64)
+    replay_base = state_base + replay_block_base * state_block_stride
+
+    if PRECOMPUTED_NEW_COMPUTED:
+        new_num_computed = tl.load(num_computed_tokens_ptr + req_idx).to(tl.int64)
+        num_tokens_running_state = new_num_computed - num_accepted + 1
+    else:
+        num_scheduled = tl.load(num_scheduled_tokens_ptr + req_idx).to(tl.int64)
+        num_computed = tl.load(num_computed_tokens_ptr + req_idx).to(tl.int64)
+        num_draft = tl.load(num_draft_tokens_ptr + req_idx).to(tl.int64)
+        num_tokens_running_state = num_computed + num_scheduled - num_draft
+        new_num_computed = num_tokens_running_state + num_accepted - 1
+    aligned_new_computed = (new_num_computed // MAMBA_BLOCK_SIZE) * MAMBA_BLOCK_SIZE
+    boundary_count = aligned_new_computed - num_tokens_running_state
+    has_new_boundary = (boundary_count > 0) & (boundary_count <= num_accepted)
+    boundary_col = tl.maximum(aligned_new_computed // MAMBA_BLOCK_SIZE - 1, 0)
+    boundary_block_id = tl.load(
+        block_table + batch_idx * block_table_stride_req + boundary_col,
+        mask=has_new_boundary,
+        other=0,
+    ).to(tl.int64)
+
+    if not is_active_spec:
+        is_exact_boundary = (new_num_computed > 0) & (
+            new_num_computed % MAMBA_BLOCK_SIZE == 0
+        )
+        completed_col = tl.maximum(new_num_computed // MAMBA_BLOCK_SIZE - 1, 0)
+        completed_block_id = tl.load(
+            block_table + batch_idx * block_table_stride_req + completed_col,
+            mask=is_exact_boundary,
+            other=0,
+        ).to(tl.int64)
+        completed_ptr = (
+            state_base + completed_block_id * state_block_stride + state_offset
+        )
+        tl.store(completed_ptr, state, mask=state_mask & is_exact_boundary)
+        return
+
+    for token_idx in tl.range(0, num_accepted):
+        update_offset = (
+            token_idx * NUM_HEADS * VALUE_DIM + head_idx * VALUE_DIM + value_offsets
+        )
+        key_offset = (
+            key_base
+            + token_idx * NUM_HEADS * KEY_DIM
+            + head_idx * KEY_DIM
+            + key_offsets
+        )
+        gate_offset = (
+            gate_base
+            + token_idx * NUM_HEADS * KEY_DIM
+            + head_idx * KEY_DIM
+            + key_offsets
+        )
+
+        update_linear = slot_offset + update_offset
+        key_linear = slot_offset + key_offset
+        gate_linear = slot_offset + gate_offset
+        update_ptr = replay_base + update_linear
+        key_ptr = replay_base + key_linear
+        gate_ptr = replay_base + gate_linear
+        update = tl.load(update_ptr, mask=value_mask, other=0.0).to(tl.float32)
+        key = tl.load(key_ptr, mask=key_mask, other=0.0).to(tl.float32)
+        decay = tl.load(gate_ptr, mask=key_mask, other=1.0).to(tl.float32)
+        state *= decay[None, :]
+        state += update[:, None] * key[None, :]
+
+        if has_new_boundary & (token_idx + 1 == boundary_count):
+            boundary_ptr = (
+                state_base + boundary_block_id * state_block_stride + state_offset
+            )
+            tl.store(boundary_ptr, state, mask=state_mask)
+
+    working_state_ptr = (
+        state_base + working_state_block_id * state_block_stride + state_offset
+    )
+    tl.store(working_state_ptr, state, mask=state_mask)
 
 
 @triton.jit
@@ -514,6 +721,13 @@ class MambaSpecDecodeGPUContext:
     num_state_types: int
     mamba_group_ids: list[int]
     num_groups: int
+    use_kda_spec_workspace: bool
+    kda_working_block_bases: torch.Tensor
+    kda_replay_block_bases: torch.Tensor
+    kda_num_heads: int
+    kda_value_dim: int
+    kda_key_dim: int
+    kda_workspace_num_tokens: int
 
     # Output buffer for num_accepted_tokens updates
     num_accepted_tokens_out: torch.Tensor
@@ -534,6 +748,8 @@ class MambaSpecDecodeGPUContext:
     num_draft_tokens_buf: CpuGpuBuffer | None = None
     precopy_src_col_buf: CpuGpuBuffer | None = None
     precopy_token_bias_buf: CpuGpuBuffer | None = None
+    kda_workspace_slots_buf: CpuGpuBuffer | None = None
+    kda_workspace_initialized_buf: CpuGpuBuffer | None = None
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -556,6 +772,18 @@ class MambaSpecDecodeGPUContext:
             for gid in mamba_group_ids
         )
         total_states = num_layers * num_state_types
+        use_kda_spec_workspace = mamba_spec.use_spec_workspace
+        if use_kda_spec_workspace:
+            kda_num_heads, kda_value_dim, kda_key_dim = mamba_spec.shapes[-1]
+            working_block_bases = [
+                kv_cache_config.num_blocks
+                + kv_cache_config.kda_spec_workspace_block_offsets[gid]
+                for gid in mamba_group_ids
+            ]
+            replay_block_bases = [base + max_num_reqs for base in working_block_bases]
+        else:
+            kda_num_heads = kda_value_dim = kda_key_dim = 0
+            working_block_bases = replay_block_bases = [0] * len(mamba_group_ids)
 
         return cls(
             state_base_addrs=torch.zeros(
@@ -587,6 +815,19 @@ class MambaSpecDecodeGPUContext:
             num_state_types=num_state_types,
             mamba_group_ids=mamba_group_ids,
             num_groups=len(mamba_group_ids),
+            use_kda_spec_workspace=use_kda_spec_workspace,
+            kda_working_block_bases=torch.tensor(
+                working_block_bases, dtype=torch.int64, device=device
+            ),
+            kda_replay_block_bases=torch.tensor(
+                replay_block_bases, dtype=torch.int64, device=device
+            ),
+            kda_num_heads=kda_num_heads,
+            kda_value_dim=kda_value_dim,
+            kda_key_dim=kda_key_dim,
+            kda_workspace_num_tokens=(
+                mamba_spec.num_speculative_blocks + 1 if use_kda_spec_workspace else 0
+            ),
             num_accepted_tokens_out=torch.zeros(
                 max_num_reqs, dtype=torch.int32, device=device
             ),
@@ -599,6 +840,16 @@ class MambaSpecDecodeGPUContext:
             num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             precopy_src_col_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             precopy_token_bias_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            kda_workspace_slots_buf=(
+                make_buffer(max_num_reqs, dtype=torch.int32)
+                if use_kda_spec_workspace
+                else None
+            ),
+            kda_workspace_initialized_buf=(
+                make_buffer(max_num_reqs, dtype=torch.bool)
+                if use_kda_spec_workspace
+                else None
+            ),
             is_initialized=False,
         )
 
@@ -721,6 +972,14 @@ class MambaSpecDecodeGPUContext:
                             f"_copy_mamba_state_block uint64 "
                             f"vectorization requires it"
                         )
+                        if self.use_kda_spec_workspace:
+                            expected_shape = (
+                                self.kda_num_heads,
+                                self.kda_value_dim,
+                                self.kda_key_dim,
+                            )
+                            assert state.dtype == torch.float32
+                            assert tuple(state.shape[1:]) == expected_shape
 
                     self.state_group_indices[idx] = group_local_idx
                     idx += 1
@@ -741,6 +1000,57 @@ class MambaSpecDecodeGPUContext:
             self.block_table_ptrs[i] = bt.data_ptr()
 
         self.is_initialized = True
+
+    def commit_kda_spec_workspace(
+        self,
+        num_reqs: int,
+        num_accepted_tokens: torch.Tensor,
+        active_spec_decode: torch.Tensor,
+        workspace_initialized: torch.Tensor,
+        mamba_state_idx: torch.Tensor,
+        workspace_slots: torch.Tensor,
+        idx_mapping: torch.Tensor | None,
+        workspace_slot_is_req_idx: bool,
+        num_scheduled_tokens: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        precomputed_new_computed: bool,
+    ) -> None:
+        if not self.use_kda_spec_workspace or num_reqs == 0:
+            return
+        assert self.is_initialized
+        value_tiles = self.kda_num_heads * cdiv(self.kda_value_dim, 32)
+        commit_kda_spec_workspace_kernel[(num_reqs, self.num_layers, value_tiles)](
+            num_accepted_tokens,
+            active_spec_decode,
+            workspace_initialized,
+            mamba_state_idx,
+            workspace_slots,
+            idx_mapping,
+            num_scheduled_tokens,
+            num_computed_tokens,
+            num_draft_tokens,
+            self.block_table_ptrs,
+            self.block_table_stride_req,
+            self.state_base_addrs,
+            self.state_block_strides,
+            self.state_conv_widths,
+            self.state_group_indices,
+            self.kda_working_block_bases,
+            self.kda_replay_block_bases,
+            num_reqs,
+            NUM_STATE_TYPES=self.num_state_types,
+            NUM_HEADS=self.kda_num_heads,
+            VALUE_DIM=self.kda_value_dim,
+            KEY_DIM=self.kda_key_dim,
+            WORKSPACE_NUM_TOKENS=self.kda_workspace_num_tokens,
+            BLOCK_VALUE=32,
+            BLOCK_KEY=triton.next_power_of_2(self.kda_key_dim),
+            HAS_IDX_MAPPING=idx_mapping is not None,
+            WORKSPACE_SLOT_IS_REQ_IDX=workspace_slot_is_req_idx,
+            PRECOMPUTED_NEW_COMPUTED=precomputed_new_computed,
+            MAMBA_BLOCK_SIZE=self.block_size,
+        )
 
     def run_fused_postprocess(
         self,
@@ -798,6 +1108,8 @@ class MambaSpecDecodeGPUContext:
             block_size=self.block_size,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            USE_TEMPORAL_TOKEN_BIAS=not self.use_kda_spec_workspace,
+            SKIP_TEMPORAL_COPY=self.use_kda_spec_workspace,
         )
 
     def run_fused_precopy(
@@ -841,6 +1153,8 @@ class MambaSpecDecodeGPUContext:
             num_reqs,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            USE_TEMPORAL_TOKEN_BIAS=not self.use_kda_spec_workspace,
+            SKIP_TEMPORAL_COPY=False,
             HAS_IDX_MAPPING=idx_mapping is not None,
         )
 
@@ -886,6 +1200,8 @@ class MambaSpecDecodeGPUContext:
             block_size=self.block_size,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            USE_TEMPORAL_TOKEN_BIAS=not self.use_kda_spec_workspace,
+            SKIP_TEMPORAL_COPY=self.use_kda_spec_workspace,
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
         )
@@ -959,8 +1275,14 @@ def collect_mamba_copy_meta(
             attention = forward_context[layer_name]
             kv_caches: list[torch.Tensor] = attention.kv_cache
             for state, state_copy_func in zip(kv_caches, mamba_state_copy_funcs):
+                num_accepted_tokens = accept_token_bias + 1
+                if (
+                    copy_bufs.mamba_spec.use_spec_workspace
+                    and state_copy_func is get_temporal_copy_spec
+                ):
+                    num_accepted_tokens = 1
                 copy_spec = state_copy_func(
-                    state, block_ids, src_block_idx, accept_token_bias + 1
+                    state, block_ids, src_block_idx, num_accepted_tokens
                 )
 
                 src_ptrs_np[offset] = copy_spec.start_addr
@@ -1229,6 +1551,26 @@ def postprocess_mamba_align_gpu(
         num_draft_tokens_gpu=ctx.num_draft_tokens_buf.gpu,
     )
 
+    if ctx.use_kda_spec_workspace:
+        assert ctx.kda_workspace_slots_buf is not None
+        assert ctx.kda_workspace_initialized_buf is not None
+        ctx.commit_kda_spec_workspace(
+            num_reqs=num_reqs,
+            num_accepted_tokens=num_accepted_tokens_gpu,
+            active_spec_decode=ctx.num_draft_tokens_buf.gpu,
+            workspace_initialized=ctx.kda_workspace_initialized_buf.gpu,
+            mamba_state_idx=ctx.mamba_state_idx_buf.gpu,
+            workspace_slots=ctx.kda_workspace_slots_buf.gpu,
+            idx_mapping=None,
+            workspace_slot_is_req_idx=False,
+            num_scheduled_tokens=ctx.num_scheduled_tokens_buf.gpu,
+            num_computed_tokens=ctx.num_computed_tokens_buf.gpu,
+            num_draft_tokens=ctx.num_draft_tokens_buf.gpu,
+            precomputed_new_computed=False,
+        )
+        active = ctx.num_draft_tokens_buf.np[:num_reqs] > 0
+        input_batch.kda_spec_workspace_initialized[:num_reqs][active] = True
+
     # ``num_accepted_tokens_out`` is pre-initialized from
     # ``num_accepted_tokens_gpu``; the kernel only overwrites entries to 1
     # when src_block_idx == dest_block_idx (copy within the same block), so
@@ -1305,6 +1647,8 @@ def stage_postprocess_inputs_to_gpu(
     num_reqs: int,
     requests: dict[str, CachedRequestState],
     mamba_state_idx: dict[str, int],
+    kda_workspace_slots: torch.Tensor | None = None,
+    kda_workspace_initialized: torch.Tensor | None = None,
 ) -> None:
     """Stage all per-request inputs the fused mamba postprocess kernel reads.
 
@@ -1332,3 +1676,14 @@ def stage_postprocess_inputs_to_gpu(
         ctx.num_computed_tokens_buf,
         ctx.num_draft_tokens_buf,
     )
+    if ctx.use_kda_spec_workspace:
+        assert ctx.kda_workspace_slots_buf is not None
+        assert ctx.kda_workspace_initialized_buf is not None
+        assert kda_workspace_slots is not None
+        assert kda_workspace_initialized is not None
+        ctx.kda_workspace_slots_buf.cpu[:num_reqs].copy_(kda_workspace_slots[:num_reqs])
+        ctx.kda_workspace_slots_buf.copy_to_gpu(num_reqs)
+        ctx.kda_workspace_initialized_buf.cpu[:num_reqs].copy_(
+            kda_workspace_initialized[:num_reqs]
+        )
+        ctx.kda_workspace_initialized_buf.copy_to_gpu(num_reqs)

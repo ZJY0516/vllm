@@ -15,7 +15,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionBackend,
@@ -95,7 +95,11 @@ def _mamba_get_block_table_tensor(
 
     assert block_table.is_cuda and seq_lens.is_cuda
     num_requests = block_table.shape[0]
-    num_state_slots = 1 + kv_cache_spec.num_speculative_blocks
+    num_state_slots = (
+        1
+        if kv_cache_spec.use_spec_workspace
+        else 1 + kv_cache_spec.num_speculative_blocks
+    )
     state_indices = torch.empty(
         (num_requests, num_state_slots),
         dtype=block_table.dtype,
@@ -121,6 +125,34 @@ def _mamba_get_block_table_tensor(
         launch_pdl=_metadata_launch_pdl(),
     )
     return state_indices
+
+
+@triton.jit(do_not_specialize=["num_requests"])
+def _select_workspace_state_indices_kernel(
+    state_indices_ptr,
+    workspace_slots_ptr,
+    workspace_initialized_ptr,
+    canonical_state_indices_ptr,
+    state_indices_stride_0: tl.constexpr,
+    num_requests,
+    working_base: tl.int64,
+    BLOCK_ROWS: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    mask = rows < num_requests
+    canonical = tl.load(
+        state_indices_ptr + rows * state_indices_stride_0,
+        mask=mask,
+    )
+    slots = tl.load(workspace_slots_ptr + rows, mask=mask)
+    initialized = tl.load(workspace_initialized_ptr + rows, mask=mask)
+    selected = tl.where(initialized, working_base + slots, canonical)
+    tl.store(canonical_state_indices_ptr + rows, canonical, mask=mask)
+    tl.store(
+        state_indices_ptr + rows * state_indices_stride_0,
+        selected,
+        mask=mask,
+    )
 
 
 @triton.jit(do_not_specialize=["num_spec_decodes", "batch_size"])
@@ -230,10 +262,52 @@ def stage_spec_decode_metadata(
 
 @dataclass
 class KimiK3KDAMetadata(GDNAttentionMetadata):
-    pass
+    spec_conv_state_indices: torch.Tensor | None = None
+    non_spec_conv_state_indices: torch.Tensor | None = None
+    spec_workspace_slots: torch.Tensor | None = None
+    spec_workspace_base: int = 0
+    spec_workspace_num_tokens: int = 0
 
 
 class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.spec_conv_state_indices = torch.empty(
+            self.decode_cudagraph_max_bs,
+            dtype=torch.int32,
+            device=self.spec_state_indices_tensor.device,
+        )
+        self.non_spec_conv_state_indices = torch.empty_like(
+            self.non_spec_state_indices_tensor
+        )
+        self.canonical_state_indices = torch.empty(
+            self.decode_cudagraph_max_bs,
+            dtype=torch.int32,
+            device=self.spec_state_indices_tensor.device,
+        )
+        self.workspace_slots_cpu = torch.empty(
+            self.decode_cudagraph_max_bs,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=PIN_MEMORY,
+        )
+        self.workspace_initialized_cpu = torch.empty(
+            self.decode_cudagraph_max_bs,
+            dtype=torch.bool,
+            device="cpu",
+            pin_memory=PIN_MEMORY,
+        )
+        self.workspace_slots = torch.empty(
+            self.decode_cudagraph_max_bs,
+            dtype=torch.int32,
+            device=self.spec_state_indices_tensor.device,
+        )
+        self.workspace_initialized = torch.empty(
+            self.decode_cudagraph_max_bs,
+            dtype=torch.bool,
+            device=self.spec_state_indices_tensor.device,
+        )
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -251,12 +325,76 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         #   offsets = torch.arange(1 + num_speculative_blocks, dtype=torch.int32)
         #   indices = (start[:, None] + offsets).to(torch.int64)
         #   block_table_tensor = torch.gather(block_table, 1, indices)
+        if self.kv_cache_spec.use_spec_workspace:
+            assert self.vllm_config.cache_config.num_gpu_blocks is not None
+            working_base = (
+                self.vllm_config.cache_config.num_gpu_blocks
+                + m.kda_spec_workspace_block_offset
+            )
+            workspace_slots = m.kda_spec_workspace_slots
+            workspace_initialized = m.kda_spec_workspace_initialized
+            if workspace_slots is None or workspace_initialized is None:
+                workspace_slots_cpu = m.kda_spec_workspace_slots_cpu
+                workspace_initialized_cpu = m.kda_spec_workspace_initialized_cpu
+                assert workspace_slots_cpu is not None
+                assert workspace_initialized_cpu is not None
+                num_workspace_reqs = workspace_slots_cpu.shape[0]
+                self.workspace_slots_cpu[:num_workspace_reqs].copy_(workspace_slots_cpu)
+                self.workspace_initialized_cpu[:num_workspace_reqs].copy_(
+                    workspace_initialized_cpu
+                )
+                self.workspace_slots[:num_workspace_reqs].copy_(
+                    self.workspace_slots_cpu[:num_workspace_reqs], non_blocking=True
+                )
+                self.workspace_initialized[:num_workspace_reqs].copy_(
+                    self.workspace_initialized_cpu[:num_workspace_reqs],
+                    non_blocking=True,
+                )
+                workspace_slots = self.workspace_slots[:num_workspace_reqs]
+                workspace_initialized = self.workspace_initialized[:num_workspace_reqs]
+            assert workspace_initialized is not None
+            workspace_base = (
+                working_base + self.vllm_config.scheduler_config.max_num_seqs
+            )
+        else:
+            workspace_slots = None
+            workspace_base = 0
+
         block_table_tensor = _mamba_get_block_table_tensor(
             m.block_table_tensor,
             m.seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
+        if workspace_slots is not None:
+            assert workspace_initialized is not None
+            num_requests = block_table_tensor.shape[0]
+            if block_table_tensor.is_cuda:
+                BLOCK_ROWS = 32
+                _select_workspace_state_indices_kernel[
+                    (triton.cdiv(num_requests, BLOCK_ROWS),)
+                ](
+                    block_table_tensor,
+                    workspace_slots,
+                    workspace_initialized,
+                    self.canonical_state_indices,
+                    block_table_tensor.stride(0),
+                    num_requests,
+                    working_base,
+                    BLOCK_ROWS=BLOCK_ROWS,
+                    num_warps=1,
+                )
+                canonical_state_indices = self.canonical_state_indices[:num_requests]
+            else:
+                canonical_state_indices = block_table_tensor[:, 0]
+                working_state_indices = working_base + workspace_slots
+                block_table_tensor = torch.where(
+                    workspace_initialized[:, None],
+                    working_state_indices[:, None],
+                    block_table_tensor[:, :1],
+                )
+        else:
+            canonical_state_indices = block_table_tensor[:, 0]
 
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks_cpu = None
@@ -281,10 +419,13 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_token_indx = None
             spec_state_indices_tensor = None
             non_spec_state_indices_tensor = block_table_tensor[:, 0]
+            non_spec_conv_state_indices = canonical_state_indices
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
             num_accepted_tokens = None
+            spec_conv_state_indices = None
+            spec_workspace_slots = None
         else:
             assert spec_sequence_masks_cpu is not None
             assert num_accepted_tokens is not None
@@ -334,6 +475,17 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
                 num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
+                spec_conv_state_indices = (
+                    canonical_state_indices[:num_spec_decodes]
+                    if workspace_slots is not None
+                    else None
+                )
+                non_spec_conv_state_indices = None
+                spec_workspace_slots = (
+                    workspace_slots[:num_spec_decodes]
+                    if workspace_slots is not None
+                    else None
+                )
             else:
                 query_lens = query_start_loc.diff()
                 spec_sequence_masks_gpu = async_tensor_h2d(
@@ -358,6 +510,9 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 ]
                 non_spec_state_indices_tensor = block_table_tensor[
                     active_non_spec_mask_cpu, 0
+                ]
+                non_spec_conv_state_indices = canonical_state_indices[
+                    active_non_spec_mask_cpu
                 ]
 
                 spec_query_lens = query_lens[spec_sequence_masks_cpu]
@@ -399,6 +554,16 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                     non_spec_query_start_loc_cpu = None
 
                 num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+                spec_conv_state_indices = (
+                    canonical_state_indices[spec_sequence_masks_cpu]
+                    if workspace_slots is not None
+                    else None
+                )
+                spec_workspace_slots = (
+                    workspace_slots[spec_sequence_masks_cpu]
+                    if workspace_slots is not None
+                    else None
+                )
 
         # Unlike the shared GDN layer, Kimi-K3's prefill KDA wrapper prepares
         # its own chunk indices. Only causal-convolution metadata is needed here.
@@ -443,9 +608,24 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 num_spec_decodes=num_spec_decodes,
             )
 
+            if spec_workspace_slots is not None:
+                self.spec_token_indx[:num_spec_decodes].copy_(
+                    spec_workspace_slots, non_blocking=True
+                )
+                self.spec_token_indx[num_spec_decodes:batch_size].zero_()
+                self.spec_conv_state_indices[:num_spec_decodes].copy_(
+                    spec_conv_state_indices, non_blocking=True
+                )
+                self.spec_conv_state_indices[num_spec_decodes:batch_size].fill_(
+                    NULL_BLOCK_ID
+                )
+
             spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
             spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
+            if spec_workspace_slots is not None:
+                spec_workspace_slots = self.spec_token_indx[:batch_size]
+                spec_conv_state_indices = self.spec_conv_state_indices[:batch_size]
 
         if (
             self.use_full_cuda_graph
@@ -462,6 +642,13 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
                 :batch_size
             ]
+            self.non_spec_conv_state_indices[:num_decodes].copy_(
+                non_spec_conv_state_indices, non_blocking=True
+            )
+            self.non_spec_conv_state_indices[num_decodes:batch_size].fill_(
+                NULL_BLOCK_ID
+            )
+            non_spec_conv_state_indices = self.non_spec_conv_state_indices[:batch_size]
 
         return KimiK3KDAMetadata(
             num_prefills=num_prefills,
@@ -483,6 +670,13 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            spec_conv_state_indices=spec_conv_state_indices,
+            non_spec_conv_state_indices=non_spec_conv_state_indices,
+            spec_workspace_slots=spec_workspace_slots,
+            spec_workspace_base=workspace_base,
+            spec_workspace_num_tokens=(
+                self.num_spec + 1 if self.kv_cache_spec.use_spec_workspace else 0
+            ),
         )
 
 

@@ -123,7 +123,17 @@ def _build_meta(convs, ssms, device, conv_state_dim_first):
     return base, blk_stride, elem, inner, width, group, drc, drs
 
 
-def _reference(convs, ssms, bt, src_col, dst_col, bias, num_reqs, conv_dim_first):
+def _reference(
+    convs,
+    ssms,
+    bt,
+    src_col,
+    dst_col,
+    bias,
+    num_reqs,
+    conv_dim_first,
+    use_temporal_token_bias,
+):
     """Apply the V1 copy semantics on clones, reading from the pre-copy state."""
     conv_pre = [c.clone() for c in convs]
     ssm_pre = [s.clone() for s in ssms]
@@ -134,7 +144,7 @@ def _reference(convs, ssms, bt, src_col, dst_col, bias, num_reqs, conv_dim_first
         if sc < 0 or sc == dc:
             continue
         sblk, dblk = int(bt[r, sc]), int(bt[r, dc])
-        tblk = int(bt[r, sc + tb])  # temporal src column shifted by bias
+        tblk = int(bt[r, sc + (tb if use_temporal_token_bias else 0)])
         for layer in range(NUM_LAYERS):
             if conv_dim_first:
                 conv_ref[layer][dblk, :, : CONV_WIDTH - tb] = conv_pre[layer][
@@ -150,9 +160,14 @@ def _reference(convs, ssms, bt, src_col, dst_col, bias, num_reqs, conv_dim_first
 @_parametrize("num_reqs", [1, 4, 16])
 @_parametrize("token_bias", [0, 1, 2])
 @_parametrize("has_idx_mapping", [True, False])
+@_parametrize("use_temporal_token_bias", [True, False])
 @_cuda_required
-def test_precopy_matches_v1_copy_specs(
-    num_reqs, token_bias, has_idx_mapping, conv_state_dim_first
+def test_precopy_matches_selected_copy_specs(
+    num_reqs,
+    token_bias,
+    has_idx_mapping,
+    conv_state_dim_first,
+    use_temporal_token_bias,
 ):
     device = torch.device("cuda")
     torch.manual_seed(0)
@@ -184,6 +199,7 @@ def test_precopy_matches_v1_copy_specs(
         bias.cpu(),
         num_reqs,
         conv_state_dim_first,
+        use_temporal_token_bias,
     )
 
     base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
@@ -210,6 +226,8 @@ def test_precopy_matches_v1_copy_specs(
         num_reqs,
         COPY_BLOCK_SIZE=1024,
         CONV_STATE_DIM_FIRST=conv_state_dim_first,
+        USE_TEMPORAL_TOKEN_BIAS=use_temporal_token_bias,
+        SKIP_TEMPORAL_COPY=False,
         HAS_IDX_MAPPING=has_idx_mapping,
     )
     torch.accelerator.synchronize()
@@ -417,8 +435,13 @@ if __name__ == "__main__":
         for tb in (0, 1, 2):
             for mapping in (True, False):
                 for dim_first in (False, True):
-                    test_precopy_matches_v1_copy_specs(nr, tb, mapping, dim_first)
-                    print(
-                        f"OK num_reqs={nr} token_bias={tb} "
-                        f"has_idx_mapping={mapping} conv_dim_first={dim_first}"
-                    )
+                    for temporal_bias in (True, False):
+                        test_precopy_matches_selected_copy_specs(
+                            nr, tb, mapping, dim_first, temporal_bias
+                        )
+                        print(
+                            f"OK num_reqs={nr} token_bias={tb} "
+                            f"has_idx_mapping={mapping} "
+                            f"conv_dim_first={dim_first} "
+                            f"temporal_bias={temporal_bias}"
+                        )

@@ -10,6 +10,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.core.sched.output import NewRequestData
@@ -32,13 +33,33 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    kda_spec_workspace_slots: torch.Tensor | None = None
+    kda_spec_workspace_initialized: torch.Tensor | None = None
+    kda_spec_workspace_block_offsets: dict[int, int] | None = None
 
     def get_extra_common_attn_kwargs(
         self,
         kv_cache_group_id: int,
         num_reqs: int,
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        return {
+            "is_prefilling": self.is_prefilling[:num_reqs],
+            "kda_spec_workspace_slots": (
+                None
+                if self.kda_spec_workspace_slots is None
+                else self.kda_spec_workspace_slots[:num_reqs]
+            ),
+            "kda_spec_workspace_initialized": (
+                None
+                if self.kda_spec_workspace_initialized is None
+                else self.kda_spec_workspace_initialized[:num_reqs]
+            ),
+            "kda_spec_workspace_block_offset": (
+                0
+                if self.kda_spec_workspace_block_offsets is None
+                else self.kda_spec_workspace_block_offsets.get(kv_cache_group_id, 0)
+            ),
+        }
 
     def get_extra_attn_kwargs(
         self,
@@ -75,6 +96,31 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        self._use_kda_spec_workspace = vllm_config.use_kda_spec_workspace()
+        self._kda_spec_workspace_initialized = torch.zeros(
+            self.max_num_reqs, dtype=torch.bool, device=self.device
+        )
+        self._kda_spec_workspace_active = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        self._kda_spec_workspace_was_initialized = torch.zeros(
+            self.max_num_reqs, dtype=torch.bool, device=self.device
+        )
+        self._kda_spec_workspace_slots_batch = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        self._kda_spec_workspace_initialized_batch = torch.zeros(
+            self.max_num_reqs, dtype=torch.bool, device=self.device
+        )
+        self._kda_spec_workspace_active_batch_cpu = torch.empty(
+            self.max_num_reqs,
+            dtype=torch.bool,
+            device="cpu",
+            pin_memory=PIN_MEMORY,
+        )
+        self._kda_spec_workspace_active_batch = torch.empty(
+            self.max_num_reqs, dtype=torch.bool, device=self.device
+        )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
         # kernel reusing the postprocess copy machinery, so the per-step src
@@ -98,6 +144,9 @@ class MambaHybridModelState(DefaultModelState):
         super().add_request(req_index, new_req_data)
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
+        if self._use_kda_spec_workspace:
+            self._kda_spec_workspace_active[req_index].zero_()
+            self._kda_spec_workspace_initialized[req_index].zero_()
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
             self._mamba_state_idx_gpu[req_index].fill_(
@@ -240,6 +289,7 @@ class MambaHybridModelState(DefaultModelState):
         # compute them during actual (non-capture) forward execution.
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
+        spec_decode_mask = None
         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
             num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
             num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
@@ -262,10 +312,44 @@ class MambaHybridModelState(DefaultModelState):
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
+        kda_spec_workspace_slots = None
+        kda_spec_workspace_initialized = None
+        if self._use_kda_spec_workspace:
+            active_batch_cpu = self._kda_spec_workspace_active_batch_cpu[:num_reqs]
+            active_batch_np = active_batch_cpu.numpy()
+            active_batch_np.fill(False)
+            if spec_decode_mask is not None:
+                active_batch_np[: input_batch.num_reqs] = spec_decode_mask
+            self._kda_spec_workspace_active_batch[:num_reqs].copy_(
+                active_batch_cpu, non_blocking=True
+            )
+            block = 256
+            _gather_kda_spec_workspace_metadata_kernel[(triton.cdiv(num_reqs, block),)](
+                input_batch.idx_mapping,
+                self._kda_spec_workspace_initialized,
+                self._kda_spec_workspace_active_batch,
+                self._kda_spec_workspace_active,
+                self._kda_spec_workspace_was_initialized,
+                self._kda_spec_workspace_slots_batch,
+                self._kda_spec_workspace_initialized_batch,
+                input_batch.num_reqs,
+                num_reqs,
+                BLOCK_SIZE=block,
+            )
+            kda_spec_workspace_slots = self._kda_spec_workspace_slots_batch[:num_reqs]
+            kda_spec_workspace_initialized = self._kda_spec_workspace_initialized_batch[
+                :num_reqs
+            ]
+
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            kda_spec_workspace_slots=kda_spec_workspace_slots,
+            kda_spec_workspace_initialized=kda_spec_workspace_initialized,
+            kda_spec_workspace_block_offsets=(
+                kv_cache_config.kda_spec_workspace_block_offsets
+            ),
         )
         return build_attn_metadata(
             attn_groups=attn_groups,
@@ -319,6 +403,23 @@ class MambaHybridModelState(DefaultModelState):
         ):
             num_reqs = idx_mapping.shape[0]
             if num_reqs:
+                if self._use_kda_spec_workspace:
+                    self._mamba_ctx.commit_kda_spec_workspace(
+                        num_reqs=num_reqs,
+                        num_accepted_tokens=self.num_accepted_tokens_gpu,
+                        active_spec_decode=self._kda_spec_workspace_active,
+                        workspace_initialized=(
+                            self._kda_spec_workspace_was_initialized
+                        ),
+                        mamba_state_idx=self._mamba_state_idx_gpu,
+                        workspace_slots=idx_mapping,
+                        idx_mapping=idx_mapping,
+                        workspace_slot_is_req_idx=True,
+                        num_scheduled_tokens=self._kda_spec_workspace_active,
+                        num_computed_tokens=num_computed_tokens,
+                        num_draft_tokens=self._kda_spec_workspace_active,
+                        precomputed_new_computed=True,
+                    )
                 self._mamba_ctx.run_fused_postprocess_align(
                     num_reqs,
                     self.num_accepted_tokens_gpu,
@@ -326,6 +427,32 @@ class MambaHybridModelState(DefaultModelState):
                     num_computed_tokens,
                     idx_mapping,
                 )
+
+
+@triton.jit(do_not_specialize=["num_actual_reqs", "num_reqs"])
+def _gather_kda_spec_workspace_metadata_kernel(
+    idx_mapping_ptr,
+    initialized_ptr,
+    active_batch_ptr,
+    active_ptr,
+    was_initialized_ptr,
+    slots_out_ptr,
+    initialized_out_ptr,
+    num_actual_reqs,
+    num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = rows < num_reqs
+    actual = rows < num_actual_reqs
+    slots = tl.load(idx_mapping_ptr + rows, mask=actual, other=0)
+    initialized = tl.load(initialized_ptr + slots, mask=actual, other=0)
+    active = tl.load(active_batch_ptr + rows, mask=actual, other=0)
+    tl.store(active_ptr + slots, active, mask=actual)
+    tl.store(was_initialized_ptr + slots, initialized, mask=actual)
+    tl.store(initialized_ptr + slots, initialized | active, mask=actual)
+    tl.store(slots_out_ptr + rows, slots, mask=valid)
+    tl.store(initialized_out_ptr + rows, initialized, mask=valid)
 
 
 @triton.jit

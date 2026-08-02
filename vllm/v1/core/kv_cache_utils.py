@@ -1436,11 +1436,57 @@ def get_kv_cache_config_from_groups(
                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
             )
 
+    (
+        num_kda_spec_workspace_blocks,
+        kda_spec_workspace_block_offsets,
+    ) = _get_kda_spec_workspace_layout(vllm_config, kv_cache_groups)
+    if num_kda_spec_workspace_blocks:
+        logger.info_once(
+            "Reserving %d KV cache block index(es) for the static KDA "
+            "speculative workspace",
+            num_kda_spec_workspace_blocks,
+        )
+    if num_kda_spec_workspace_blocks and num_blocks <= num_kda_spec_workspace_blocks:
+        raise ValueError(
+            "Insufficient KV cache blocks for the static KDA speculative "
+            f"workspace: have {num_blocks}, need more than "
+            f"{num_kda_spec_workspace_blocks}."
+        )
+
     return KVCacheConfig(
-        num_blocks=num_blocks,
+        num_blocks=num_blocks - num_kda_spec_workspace_blocks,
+        num_kda_spec_workspace_blocks=num_kda_spec_workspace_blocks,
+        kda_spec_workspace_block_offsets=kda_spec_workspace_block_offsets,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
     )
+
+
+def _get_kda_spec_workspace_blocks(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> int:
+    return _get_kda_spec_workspace_layout(vllm_config, kv_cache_groups)[0]
+
+
+def _get_kda_spec_workspace_layout(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> tuple[int, dict[int, int]]:
+    offsets: dict[int, int] = {}
+    num_blocks = 0
+    for group_id, group in enumerate(kv_cache_groups):
+        spec = group.kv_cache_spec
+        if not isinstance(spec, MambaSpec) or not spec.use_spec_workspace:
+            continue
+        # Hybrid groups can share the same backing KV tensor, so workspace
+        # block IDs must be disjoint across groups even though their block
+        # tables are independent.
+        offsets[group_id] = num_blocks
+        num_blocks += vllm_config.scheduler_config.max_num_seqs + cdiv(
+            vllm_config.scheduler_config.max_num_seqs
+            * spec.spec_workspace_elements_per_slot,
+            math.prod(spec.shapes[-1]),
+        )
+    return num_blocks, offsets
 
 
 def _promote_local_kv_cache_specs(
@@ -2214,13 +2260,7 @@ def get_kv_cache_configs(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )
     for kv_cache_config in kv_cache_configs:
-        num_blocks_old = kv_cache_config.num_blocks
-        kv_cache_config.num_blocks = min_num_blocks
-
-        # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+        _resize_kv_cache_config(kv_cache_config, min_num_blocks)
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             max_model_len = vllm_config.model_config.max_model_len
@@ -2240,6 +2280,19 @@ def get_kv_cache_configs(
             )
 
     return kv_cache_configs
+
+
+def _resize_kv_cache_config(kv_cache_config: KVCacheConfig, num_blocks: int) -> None:
+    num_blocks_old = kv_cache_config.num_blocks
+    kv_cache_config.num_blocks = num_blocks
+
+    # Workspace blocks are physically allocated but hidden from the scheduler.
+    num_workspace_blocks = kv_cache_config.num_kda_spec_workspace_blocks
+    num_physical_blocks_old = num_blocks_old + num_workspace_blocks
+    num_physical_blocks = num_blocks + num_workspace_blocks
+    for tensor in kv_cache_config.kv_cache_tensors:
+        assert tensor.size % num_physical_blocks_old == 0
+        tensor.size = tensor.size // num_physical_blocks_old * num_physical_blocks
 
 
 class BlockHashListWithBlockSize:

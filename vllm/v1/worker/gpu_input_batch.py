@@ -107,6 +107,7 @@ class InputBatch:
         cp_kv_cache_interleave_size: int = 1,
         reasoning_config: ReasoningConfig | None = None,
         use_replayssm: bool = False,
+        use_kda_spec_workspace: bool = False,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
     ):
         self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
@@ -181,6 +182,26 @@ class InputBatch:
             pin_memory=PIN_MEMORY,
         )
         self.replayssm_decode_base = self.replayssm_decode_base_cpu_tensor.numpy()
+
+        self.use_kda_spec_workspace = use_kda_spec_workspace
+        self.kda_spec_workspace_slots_cpu_tensor = torch.full(
+            (max_num_reqs,),
+            -1,
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=PIN_MEMORY,
+        )
+        self.kda_spec_workspace_slots = self.kda_spec_workspace_slots_cpu_tensor.numpy()
+        self.kda_spec_workspace_initialized_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.bool,
+            pin_memory=PIN_MEMORY,
+        )
+        self.kda_spec_workspace_initialized = (
+            self.kda_spec_workspace_initialized_cpu_tensor.numpy()
+        )
+        self._free_kda_spec_workspace_slots = list(range(max_num_reqs - 1, -1, -1))
 
         # Block table.
         self.block_table = MultiGroupBlockTable(
@@ -365,6 +386,13 @@ class InputBatch:
 
         self.req_id_to_index[req_id] = req_index
 
+        if self.use_kda_spec_workspace:
+            assert self._free_kda_spec_workspace_slots
+            self.kda_spec_workspace_slots[req_index] = (
+                self._free_kda_spec_workspace_slots.pop()
+            )
+            self.kda_spec_workspace_initialized[req_index] = False
+
         # Copy the prompt token ids and output token ids.
         num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             request.prompt_token_ids, request.prompt_embeds
@@ -546,6 +574,12 @@ class InputBatch:
         self.req_output_token_ids[req_index] = None
         self.spec_token_ids[req_index].clear()
         self.block_table.clear_row(req_index)
+        if self.use_kda_spec_workspace:
+            workspace_slot = int(self.kda_spec_workspace_slots[req_index])
+            assert workspace_slot >= 0
+            self._free_kda_spec_workspace_slots.append(workspace_slot)
+            self.kda_spec_workspace_slots[req_index] = -1
+            self.kda_spec_workspace_initialized[req_index] = False
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
@@ -618,6 +652,21 @@ class InputBatch:
             self.replayssm_decode_base[i1], self.replayssm_decode_base[i2] = (
                 self.replayssm_decode_base[i2],
                 self.replayssm_decode_base[i1],
+            )
+        if self.use_kda_spec_workspace:
+            (
+                self.kda_spec_workspace_slots[i1],
+                self.kda_spec_workspace_slots[i2],
+            ) = (
+                self.kda_spec_workspace_slots[i2],
+                self.kda_spec_workspace_slots[i1],
+            )
+            (
+                self.kda_spec_workspace_initialized[i1],
+                self.kda_spec_workspace_initialized[i2],
+            ) = (
+                self.kda_spec_workspace_initialized[i2],
+                self.kda_spec_workspace_initialized[i1],
             )
         self.num_computed_tokens_cpu[i1], self.num_computed_tokens_cpu[i2] = (
             self.num_computed_tokens_cpu[i2],
@@ -780,6 +829,15 @@ class InputBatch:
                 self.replayssm_decode_base[empty_index] = self.replayssm_decode_base[
                     last_req_index
                 ]
+            if self.use_kda_spec_workspace:
+                self.kda_spec_workspace_slots[empty_index] = (
+                    self.kda_spec_workspace_slots[last_req_index]
+                )
+                self.kda_spec_workspace_slots[last_req_index] = -1
+                self.kda_spec_workspace_initialized[empty_index] = (
+                    self.kda_spec_workspace_initialized[last_req_index]
+                )
+                self.kda_spec_workspace_initialized[last_req_index] = False
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
                 last_req_index
             ]

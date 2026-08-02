@@ -28,6 +28,7 @@ from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
     fused_recurrent_kda_packed_decode,
 )
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+from vllm.v1.worker.mamba_utils import commit_kda_spec_workspace_kernel
 
 DEVICE = "cuda"
 
@@ -515,6 +516,267 @@ def test_kda_spec_decode_correctness(
         err_atol=3e-3,
     )
     assert torch.isnan(output_storage[..., H * D :]).all()
+
+
+@torch.inference_mode()
+def test_kda_replay_workspace_commits_only_accepted_prefix():
+    num_seqs, query_len, H, D = 4, 12, 2, 32
+    total_tokens = num_seqs * query_len
+    torch.manual_seed(2026)
+    cu_seqlens = torch.arange(
+        0,
+        total_tokens + 1,
+        query_len,
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+    state_indices = torch.arange(1, num_seqs + 1, device=DEVICE).view(-1, 1).int()
+    working_base = num_seqs + 1
+    workspace_base = working_base + num_seqs
+    workspace_blocks = (num_seqs * 3 * query_len + D - 1) // D
+    workspace_slots = torch.tensor([3, 1, 0, 2], dtype=torch.int32, device=DEVICE)
+    working_state_indices = (working_base + workspace_slots).view(-1, 1)
+    state = 0.01 * torch.randn(
+        workspace_base + workspace_blocks,
+        H,
+        D,
+        D,
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    initial_states = state[state_indices[:, 0]].clone()
+    A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.1
+    dt_bias = torch.randn(H, D, dtype=torch.float32, device=DEVICE) * 0.1
+
+    def inputs():
+        return (
+            torch.randn(1, total_tokens, H, D, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(5)
+        )
+
+    q1, k1, v1, g1, beta1_full = inputs()
+    beta1 = beta1_full[..., 0].contiguous()
+    accepted = torch.tensor([1, 4, query_len, 8], dtype=torch.int32, device=DEVICE)
+    native_state_indices = torch.arange(
+        1,
+        num_seqs * query_len + 1,
+        dtype=torch.int32,
+        device=DEVICE,
+    ).view(num_seqs, query_len)
+    native_state = torch.zeros(
+        num_seqs * query_len + 1,
+        H,
+        D,
+        D,
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    native_state[native_state_indices[:, 0].long()] = initial_states
+    native_out1, _ = fused_recurrent_kda(
+        q1,
+        k1,
+        v1,
+        g1,
+        beta1,
+        A_log,
+        dt_bias,
+        None,
+        native_state,
+        cu_seqlens,
+        native_state_indices,
+        torch.ones(num_seqs, dtype=torch.int32, device=DEVICE),
+    )
+    out1, _ = fused_recurrent_kda(
+        q1,
+        k1,
+        v1,
+        g1,
+        beta1,
+        A_log,
+        dt_bias,
+        None,
+        state,
+        cu_seqlens,
+        state_indices,
+        accepted,
+        workspace_slots=workspace_slots,
+        workspace_base=workspace_base,
+        workspace_num_tokens=query_len,
+    )
+    torch.testing.assert_close(native_out1, out1, atol=0, rtol=0)
+    torch.testing.assert_close(state[state_indices[:, 0]], initial_states)
+
+    block_table = state_indices.clone()
+    commit_kda_spec_workspace_kernel[(num_seqs, 1, H * ((D + 31) // 32))](
+        accepted,
+        torch.ones(num_seqs, dtype=torch.int32, device=DEVICE),
+        torch.zeros(num_seqs, dtype=torch.bool, device=DEVICE),
+        torch.zeros(num_seqs, dtype=torch.int32, device=DEVICE),
+        workspace_slots,
+        workspace_slots,
+        torch.full((num_seqs,), query_len, dtype=torch.int32, device=DEVICE),
+        torch.full((num_seqs,), 9, dtype=torch.int32, device=DEVICE),
+        torch.full((num_seqs,), query_len - 1, dtype=torch.int32, device=DEVICE),
+        torch.tensor([block_table.data_ptr()], dtype=torch.int64, device=DEVICE),
+        block_table.stride(0),
+        torch.tensor([state.data_ptr()], dtype=torch.int64, device=DEVICE),
+        torch.tensor(
+            [state.stride(0) * state.element_size()],
+            dtype=torch.int64,
+            device=DEVICE,
+        ),
+        torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        torch.tensor([working_base], dtype=torch.int64, device=DEVICE),
+        torch.tensor([workspace_base], dtype=torch.int64, device=DEVICE),
+        num_seqs,
+        NUM_STATE_TYPES=1,
+        NUM_HEADS=H,
+        VALUE_DIM=D,
+        KEY_DIM=D,
+        WORKSPACE_NUM_TOKENS=query_len,
+        BLOCK_VALUE=32,
+        BLOCK_KEY=32,
+        HAS_IDX_MAPPING=False,
+        WORKSPACE_SLOT_IS_REQ_IDX=False,
+        PRECOMPUTED_NEW_COMPUTED=False,
+        MAMBA_BLOCK_SIZE=16,
+    )
+
+    q2, k2, v2, g2, beta2_full = inputs()
+    beta2 = beta2_full[..., 0].contiguous()
+    out2, _ = fused_recurrent_kda(
+        q2,
+        k2,
+        v2,
+        g2,
+        beta2,
+        A_log,
+        dt_bias,
+        None,
+        state,
+        cu_seqlens,
+        working_state_indices,
+        accepted,
+        workspace_slots=workspace_slots,
+        workspace_base=workspace_base,
+        workspace_num_tokens=query_len,
+    )
+
+    reference_state = initial_states.clone()
+    reference_out1 = []
+    reference_out2 = []
+    expected_checkpoints = initial_states.clone()
+    gate1 = fused_kda_gate(g1.view(total_tokens, H * D), A_log, D, g_bias=dt_bias)
+    gate2 = fused_kda_gate(g2.view(total_tokens, H * D), A_log, D, g_bias=dt_bias)
+    for seq in range(num_seqs):
+        start = seq * query_len
+        first_states = []
+        current = reference_state[seq].transpose(-1, -2)
+        for token in range(query_len):
+            sl = slice(start + token, start + token + 1)
+            token_out, current = naive_recurrent_kda(
+                l2norm_fwd(q1[:, sl].contiguous()),
+                l2norm_fwd(k1[:, sl].contiguous()),
+                v1[:, sl],
+                gate1[sl].unsqueeze(0),
+                beta1[:, sl].float().sigmoid(),
+                initial_state=current,
+                output_final_state=True,
+            )
+            assert current is not None
+            reference_out1.append(token_out)
+            first_states.append(current)
+        current = first_states[accepted[seq].item() - 1]
+        reference_state[seq] = current.transpose(-1, -2)
+        if accepted[seq].item() >= 6:
+            expected_checkpoints[seq] = first_states[5].transpose(-1, -2)
+        for token in range(query_len):
+            sl = slice(start + token, start + token + 1)
+            token_out, current = naive_recurrent_kda(
+                l2norm_fwd(q2[:, sl].contiguous()),
+                l2norm_fwd(k2[:, sl].contiguous()),
+                v2[:, sl],
+                gate2[sl].unsqueeze(0),
+                beta2[:, sl].float().sigmoid(),
+                initial_state=current,
+                output_final_state=True,
+            )
+            assert current is not None
+            reference_out2.append(token_out)
+
+    assert_close("replay_o1", torch.cat(reference_out1, 1), out1, 3e-3, 3e-3)
+    assert_close("replay_o2", torch.cat(reference_out2, 1), out2, 3e-3, 3e-3)
+    assert_close(
+        "replay_state",
+        reference_state,
+        state[working_state_indices[:, 0]],
+        3e-3,
+        3e-3,
+    )
+    native_accepted_state = native_state[
+        native_state_indices[
+            torch.arange(num_seqs, device=DEVICE), accepted.long() - 1
+        ].long()
+    ]
+    torch.testing.assert_close(
+        native_accepted_state,
+        state[working_state_indices[:, 0]],
+        atol=0,
+        rtol=0,
+    )
+    assert_close(
+        "replay_checkpoint",
+        expected_checkpoints,
+        state[state_indices[:, 0]],
+        3e-3,
+        3e-3,
+    )
+
+    plain_decode_boundary_states = torch.randn_like(reference_state)
+    state[working_state_indices[:, 0]] = plain_decode_boundary_states
+    commit_kda_spec_workspace_kernel[(num_seqs, 1, H * ((D + 31) // 32))](
+        torch.ones(num_seqs, dtype=torch.int32, device=DEVICE),
+        torch.zeros(num_seqs, dtype=torch.int32, device=DEVICE),
+        torch.ones(num_seqs, dtype=torch.bool, device=DEVICE),
+        torch.zeros(num_seqs, dtype=torch.int32, device=DEVICE),
+        workspace_slots,
+        workspace_slots,
+        torch.ones(num_seqs, dtype=torch.int32, device=DEVICE),
+        torch.full((num_seqs,), 16, dtype=torch.int32, device=DEVICE),
+        torch.zeros(num_seqs, dtype=torch.int32, device=DEVICE),
+        torch.tensor([block_table.data_ptr()], dtype=torch.int64, device=DEVICE),
+        block_table.stride(0),
+        torch.tensor([state.data_ptr()], dtype=torch.int64, device=DEVICE),
+        torch.tensor(
+            [state.stride(0) * state.element_size()],
+            dtype=torch.int64,
+            device=DEVICE,
+        ),
+        torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        torch.tensor([working_base], dtype=torch.int64, device=DEVICE),
+        torch.tensor([workspace_base], dtype=torch.int64, device=DEVICE),
+        num_seqs,
+        NUM_STATE_TYPES=1,
+        NUM_HEADS=H,
+        VALUE_DIM=D,
+        KEY_DIM=D,
+        WORKSPACE_NUM_TOKENS=query_len,
+        BLOCK_VALUE=32,
+        BLOCK_KEY=32,
+        HAS_IDX_MAPPING=False,
+        WORKSPACE_SLOT_IS_REQ_IDX=False,
+        PRECOMPUTED_NEW_COMPUTED=True,
+        MAMBA_BLOCK_SIZE=16,
+    )
+    assert_close(
+        "plain_decode_boundary_checkpoint",
+        plain_decode_boundary_states,
+        state[state_indices[:, 0]],
+        0,
+        0,
+    )
 
 
 @pytest.mark.parametrize(

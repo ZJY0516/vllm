@@ -1255,6 +1255,53 @@ def test_validate_mamba_align_subblock_prefill():
     VllmConfig.validate_block_size(config)
 
 
+def test_validate_kda_spec_workspace_is_explicit_and_kimi_only():
+    disabled = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_kda_spec_workspace=False),
+        speculative_config=None,
+        model_config=None,
+    )
+    assert VllmConfig.validate_kda_spec_workspace(disabled) is disabled
+    assert not VllmConfig.use_kda_spec_workspace(disabled)
+
+    enabled = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            enable_kda_spec_workspace=True, mamba_cache_mode="align"
+        ),
+        speculative_config=object(),
+        model_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
+    )
+    assert VllmConfig.validate_kda_spec_workspace(enabled) is enabled
+
+    for target_architecture in (
+        "KimiK3ForConditionalGeneration",
+        "KimiLinearForCausalLM",
+    ):
+        enabled.model_config.architectures = [target_architecture]
+        assert VllmConfig.validate_kda_spec_workspace(enabled) is enabled
+
+    enabled.model_config.architectures = ["KimiLinearForCausalLM"]
+    assert VllmConfig.use_kda_spec_workspace(enabled)
+    enabled.model_config.architectures = ["K3DSparkModel"]
+    assert not VllmConfig.use_kda_spec_workspace(enabled)
+    with pytest.raises(ValueError, match="only supported for Kimi-K3"):
+        VllmConfig.validate_kda_spec_workspace(enabled)
+
+    enabled.cache_config.mamba_cache_mode = "all"
+    with pytest.raises(ValueError, match="requires.*align"):
+        VllmConfig.validate_kda_spec_workspace(enabled)
+    enabled.cache_config.mamba_cache_mode = "align"
+
+    enabled.speculative_config = None
+    with pytest.raises(ValueError, match="requires speculative decoding"):
+        VllmConfig.validate_kda_spec_workspace(enabled)
+
+    enabled.speculative_config = object()
+    enabled.model_config.architectures = ["OtherArchitecture"]
+    with pytest.raises(ValueError, match="only supported for Kimi-K3"):
+        VllmConfig.validate_kda_spec_workspace(enabled)
+
+
 @pytest.mark.parametrize(
     ("model_id", "compilation_config", "optimization_level"),
     [

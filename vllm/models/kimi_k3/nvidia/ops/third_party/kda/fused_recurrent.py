@@ -150,6 +150,7 @@ def fused_recurrent_kda_fwd_kernel(
     cu_seqlens,
     state_indices,
     num_accepted_tokens,
+    workspace_slots,
     lower_bound,
     scale: tl.constexpr,
     N: tl.int64,
@@ -165,6 +166,9 @@ def fused_recurrent_kda_fwd_kernel(
     stride_out_token: tl.constexpr,
     stride_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
+    workspace_base: tl.constexpr,
+    workspace_num_tokens: tl.constexpr,
+    USE_REPLAY_WORKSPACE: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     USE_GATE_IN_KERNEL: tl.constexpr,
@@ -193,7 +197,7 @@ def fused_recurrent_kda_fwd_kernel(
     m_v = o_v < V
     m_state = m_v[:, None] & m_k[None, :]
 
-    if IS_SPEC_DECODING:
+    if IS_SPEC_DECODING and not USE_REPLAY_WORKSPACE:
         initial_token = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
     else:
         initial_token = 0
@@ -214,6 +218,17 @@ def fused_recurrent_kda_fwd_kernel(
     )
     b_state = tl.load(p_state, mask=m_state, other=0.0).to(tl.float32)
 
+    if USE_REPLAY_WORKSPACE:
+        workspace_slot = tl.load(workspace_slots + i_n).to(tl.int64)
+        workspace_slot_elements: tl.constexpr = workspace_num_tokens * H * (V + 2 * K)
+        workspace_slot_offset = workspace_slot * workspace_slot_elements
+        workspace_linear_base = (
+            workspace_base * stride_state_token + workspace_slot_offset
+        )
+        workspace_k_offset: tl.constexpr = workspace_num_tokens * H * V
+        workspace_g_offset: tl.constexpr = (
+            workspace_k_offset + workspace_num_tokens * H * K
+        )
     p_q = q + bos * stride_qkv_token + i_h * K + o_k
     p_k = k + bos * stride_qkv_token + i_h * K + o_k
     p_v = v + bos * stride_qkv_token + i_h * V + o_v
@@ -259,7 +274,8 @@ def fused_recurrent_kda_fwd_kernel(
                 )
                 b_gate = -b_a * b_softplus
 
-        b_state *= exp(b_gate[None, :])
+        b_decay = exp(b_gate)
+        b_state *= b_decay[None, :]
         b_v -= tl.sum(b_state * b_k[None, :], axis=1)
         b_beta = tl.load(p_beta, eviction_policy="evict_last").to(tl.float32)
         if APPLY_BETA_SIGMOID:
@@ -273,23 +289,61 @@ def fused_recurrent_kda_fwd_kernel(
             mask=m_v,
             eviction_policy="evict_first",
         )
-
-        final_state_index = tl.load(state_indices + i_n * stride_indices_seq + i_t).to(
-            tl.int64
-        )
-        if final_state_index > 0:
-            p_final_state = (
+        if USE_REPLAY_WORKSPACE:
+            u_offset = i_t * H * V + i_h * V
+            p_workspace_u = (
                 state
-                + final_state_index * stride_state_token
-                + i_h * V * K
-                + o_v[:, None] * K
-                + o_k[None, :]
+                + workspace_linear_base
+                + u_offset
+                + o_v
             )
             tl.store(
-                p_final_state,
-                b_state.to(p_final_state.dtype.element_ty),
-                mask=m_state,
+                p_workspace_u,
+                b_v.to(p_workspace_u.dtype.element_ty),
+                mask=m_v,
             )
+            if i_v == 0:
+                k_offset = workspace_k_offset + i_t * H * K + i_h * K
+                g_offset = workspace_g_offset + i_t * H * K + i_h * K
+                p_workspace_k = (
+                    state
+                    + workspace_linear_base
+                    + k_offset
+                    + o_k
+                )
+                p_workspace_g = (
+                    state
+                    + workspace_linear_base
+                    + g_offset
+                    + o_k
+                )
+                tl.store(
+                    p_workspace_k,
+                    b_k.to(p_workspace_k.dtype.element_ty),
+                    mask=m_k,
+                )
+                tl.store(
+                    p_workspace_g,
+                    b_decay.to(p_workspace_g.dtype.element_ty),
+                    mask=m_k,
+                )
+        else:
+            final_state_index = tl.load(
+                state_indices + i_n * stride_indices_seq + i_t
+            ).to(tl.int64)
+            if final_state_index > 0:
+                p_final_state = (
+                    state
+                    + final_state_index * stride_state_token
+                    + i_h * V * K
+                    + o_v[:, None] * K
+                    + o_k[None, :]
+                )
+                tl.store(
+                    p_final_state,
+                    b_state.to(p_final_state.dtype.element_ty),
+                    mask=m_state,
+                )
 
         p_q += stride_qkv_token
         p_k += stride_qkv_token
@@ -327,6 +381,9 @@ def fused_recurrent_kda_fwd(
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
+    workspace_slots: torch.Tensor | None = None,
+    workspace_base: int = 0,
+    workspace_num_tokens: int = 0,
     use_qk_l2norm_in_kernel: bool = True,
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
@@ -367,6 +424,9 @@ def fused_recurrent_kda_fwd(
     if use_gate_in_kernel:
         assert A_log is not None and A_log.is_contiguous()
         assert dt_bias is None or dt_bias.is_contiguous()
+    use_replay_workspace = workspace_slots is not None
+    if use_replay_workspace:
+        assert num_accepted_tokens is not None
 
     if scale is None:
         scale = K**-0.5
@@ -400,6 +460,7 @@ def fused_recurrent_kda_fwd(
         cu_seqlens=cu_seqlens,
         state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        workspace_slots=workspace_slots,
         lower_bound=lower_bound,
         scale=scale,
         N=N,
@@ -415,6 +476,9 @@ def fused_recurrent_kda_fwd(
         stride_out_token=out.stride(1),
         stride_state_token=initial_state.stride(0),
         stride_indices_seq=ssm_state_indices.stride(0),
+        workspace_base=workspace_base,
+        workspace_num_tokens=workspace_num_tokens,
+        USE_REPLAY_WORKSPACE=use_replay_workspace,
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         USE_GATE_IN_KERNEL=use_gate_in_kernel,
@@ -439,6 +503,9 @@ def fused_recurrent_kda(
     cu_seqlens: torch.Tensor,
     ssm_state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor | None = None,
+    workspace_slots: torch.Tensor | None = None,
+    workspace_base: int = 0,
+    workspace_num_tokens: int = 0,
     out: torch.Tensor | None = None,
     fuse_gate: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -473,6 +540,9 @@ def fused_recurrent_kda(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        workspace_slots=workspace_slots,
+        workspace_base=workspace_base,
+        workspace_num_tokens=workspace_num_tokens,
         use_qk_l2norm_in_kernel=True,
         A_log=A_log if fuse_gate else None,
         dt_bias=dt_bias if fuse_gate else None,
@@ -483,9 +553,7 @@ def fused_recurrent_kda(
     )
 
 
-@triton.jit(
-    do_not_specialize=["stride_beta_token", "stride_state_indices"]
-)
+@triton.jit(do_not_specialize=["stride_beta_token", "stride_state_indices"])
 def fused_recurrent_kda_packed_decode_kernel(
     mixed_qkv,
     raw_g,

@@ -728,6 +728,7 @@ class GPUModelRunner(
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
             use_replayssm=self.cache_config.use_replayssm,
+            use_kda_spec_workspace=self.vllm_config.use_kda_spec_workspace(),
         )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -2426,6 +2427,17 @@ class GPUModelRunner(
             replayssm_decode_base_cpu = (
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded]
             )
+        kda_spec_workspace_slots_cpu = None
+        kda_spec_workspace_initialized_cpu = None
+        if self.input_batch.use_kda_spec_workspace:
+            kda_spec_workspace_slots_cpu = (
+                self.input_batch.kda_spec_workspace_slots_cpu_tensor[:num_reqs_padded]
+            )
+            kda_spec_workspace_initialized_cpu = (
+                self.input_batch.kda_spec_workspace_initialized_cpu_tensor[
+                    :num_reqs_padded
+                ]
+            )
 
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
@@ -2435,6 +2447,8 @@ class GPUModelRunner(
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             replayssm_decode_base_cpu=replayssm_decode_base_cpu,
+            kda_spec_workspace_slots_cpu=kda_spec_workspace_slots_cpu,
+            kda_spec_workspace_initialized_cpu=kda_spec_workspace_initialized_cpu,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens_padded,
             max_query_len=max_query_len,
@@ -2560,6 +2574,11 @@ class GPUModelRunner(
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
+            cm.kda_spec_workspace_block_offset = (
+                self.kv_cache_config.kda_spec_workspace_block_offsets.get(
+                    kv_cache_gid, 0
+                )
+            )
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -4359,6 +4378,8 @@ class GPUModelRunner(
                         num_reqs,
                         self.requests,
                         self.mamba_state_idx,
+                        self.input_batch.kda_spec_workspace_slots_cpu_tensor,
+                        self.input_batch.kda_spec_workspace_initialized_cpu_tensor,
                     )
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
@@ -7289,6 +7310,7 @@ class GPUModelRunner(
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config=self.vllm_config.reasoning_config,
                 use_replayssm=self.cache_config.use_replayssm,
+                use_kda_spec_workspace=(self.vllm_config.use_kda_spec_workspace()),
                 slot_mapping_modes=slot_mapping_modes,
             )
 

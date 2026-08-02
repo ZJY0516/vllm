@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the V2 model runner's InputBatch (vllm.v1.worker.gpu.input_batch)."""
+"""Tests for Model Runner V2 request batching."""
 
 import pytest
 import torch
 
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+    _gather_kda_spec_workspace_metadata_kernel,
+)
 
 DEVICE = current_platform.device_type
 
@@ -51,3 +54,35 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     assert torch.equal(
         batch.query_start_loc.cpu(), torch.from_numpy(batch.query_start_loc_np)
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_kda_spec_workspace_gpu_state_transition():
+    idx_mapping = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
+    initialized = torch.tensor(
+        [False, True, False, False], dtype=torch.bool, device="cuda"
+    )
+    active_batch = torch.tensor([True, False, False, False], device="cuda")
+    active = torch.zeros(4, dtype=torch.int32, device="cuda")
+    was_initialized = torch.zeros(4, dtype=torch.bool, device="cuda")
+    slots_out = torch.empty(4, dtype=torch.int32, device="cuda")
+    initialized_out = torch.empty(4, dtype=torch.bool, device="cuda")
+
+    _gather_kda_spec_workspace_metadata_kernel[(1,)](
+        idx_mapping,
+        initialized,
+        active_batch,
+        active,
+        was_initialized,
+        slots_out,
+        initialized_out,
+        2,
+        4,
+        BLOCK_SIZE=8,
+    )
+
+    assert slots_out.cpu().tolist() == [3, 1, 0, 0]
+    assert initialized_out.cpu().tolist() == [False, True, False, False]
+    assert initialized.cpu().tolist() == [False, True, False, True]
+    assert active.cpu().tolist() == [0, 0, 0, 1]
+    assert was_initialized.cpu().tolist() == [False, True, False, False]

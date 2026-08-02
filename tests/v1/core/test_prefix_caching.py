@@ -1099,6 +1099,61 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
     manager.free(req_2)
 
 
+def test_hybrid_cache_mamba_align_workspace_survives_chunked_prefill():
+    block_size = 16
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((8, 4), (2, 8, 8)),
+        dtypes=(torch.float32, torch.float32),
+        mamba_cache_mode="align",
+        num_speculative_blocks=7,
+        use_spec_workspace=True,
+    )
+    config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attention"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            *[KVCacheGroupSpec([f"kda.{index}"], mamba_spec) for index in range(3)],
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=1024,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    token_ids = [index // block_size for index in range(4 * block_size + 7)]
+    first = make_request("first", token_ids, block_size, sha256)
+
+    while first.num_computed_tokens < len(token_ids):
+        chunk = min(8, len(token_ids) - first.num_computed_tokens)
+        assert manager.allocate_slots(first, chunk, num_lookahead_tokens=7) is not None
+        first.num_computed_tokens += chunk
+        manager.new_step_starts()
+
+    for output_token in range(20):
+        first.append_output_token_ids([1000 + output_token])
+        assert manager.allocate_slots(first, 1, num_lookahead_tokens=7) is not None
+        first.num_computed_tokens += 1
+        manager.new_step_starts()
+    manager.free(first)
+
+    second = make_request("second", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(second)
+
+    assert num_computed_tokens == 4 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [4, 4, 4, 4]
+
+
 def test_hybrid_model_mamba_align_with_dynamic_draft_tokens():
     """Regression test for https://github.com/vllm-project/vllm/issues/39271.
 

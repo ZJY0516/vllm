@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -714,6 +714,15 @@ class MambaSpec(KVCacheSpec):
     mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
     mamba_cache_mode: str = "none"
     num_speculative_blocks: int = 0
+    use_spec_workspace: bool = False
+
+    @property
+    def spec_workspace_elements_per_slot(self) -> int:
+        if not self.use_spec_workspace:
+            return 0
+        num_tokens = self.num_speculative_blocks + 1
+        num_heads, value_dim, key_dim = self.shapes[-1]
+        return num_tokens * num_heads * (value_dim + 2 * key_dim)
 
     @property
     def page_size_bytes(self) -> int:
@@ -727,15 +736,18 @@ class MambaSpec(KVCacheSpec):
         return page_size
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        num_speculative_blocks = (
+            0 if self.use_spec_workspace else self.num_speculative_blocks
+        )
         if vllm_config.cache_config.mamba_cache_mode == "all":
             max_model_len = vllm_config.model_config.max_model_len
             return (
-                cdiv(max_model_len, self.block_size) + self.num_speculative_blocks
+                cdiv(max_model_len, self.block_size) + num_speculative_blocks
             ) * self.page_size_bytes
         elif vllm_config.cache_config.mamba_cache_mode == "align":
-            return self.page_size_bytes * (2 + self.num_speculative_blocks)
+            return self.page_size_bytes * (2 + num_speculative_blocks)
         else:
-            return self.page_size_bytes * (1 + self.num_speculative_blocks)
+            return self.page_size_bytes * (1 + num_speculative_blocks)
 
     def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
         # Mamba state is replicated across DCP/PCP ranks, never sharded, so
@@ -746,7 +758,10 @@ class MambaSpec(KVCacheSpec):
             # resident at a time (earlier states are nulled out by
             # remove_skipped_blocks), so the row length must cover max_len
             # rather than max_memory_usage_bytes.
-            return cdiv(max_len, self.block_size) + self.num_speculative_blocks
+            num_speculative_blocks = (
+                0 if self.use_spec_workspace else self.num_speculative_blocks
+            )
+            return cdiv(max_len, self.block_size) + num_speculative_blocks
         return cdiv(self.max_memory_usage_bytes(vllm_config), self.page_size_bytes)
 
     def is_uniform_with_collection(
@@ -755,6 +770,7 @@ class MambaSpec(KVCacheSpec):
         return all(
             isinstance(spec, MambaSpec)
             and spec.num_speculative_blocks == self.num_speculative_blocks
+            and spec.use_spec_workspace == self.use_spec_workspace
             for spec in kv_cache_specs.values()
         )
 
@@ -987,6 +1003,10 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    num_kda_spec_workspace_blocks: int = 0
+    """Tail blocks reserved for compact KDA speculative replay inputs."""
+    kda_spec_workspace_block_offsets: dict[int, int] = field(default_factory=dict)
+    """KV cache group ID to its workspace offset within the reserved tail."""
 
     @property
     def has_mamba_layers(self) -> bool:

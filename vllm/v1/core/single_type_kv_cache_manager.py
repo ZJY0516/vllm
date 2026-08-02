@@ -1262,7 +1262,10 @@ class MambaManager(SingleTypeKVCacheManager):
         # class applies for attention groups whose KV cache is partitioned.
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
-        self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        self.use_spec_workspace = kv_cache_spec.use_spec_workspace
+        self.num_speculative_blocks = (
+            0 if self.use_spec_workspace else kv_cache_spec.num_speculative_blocks
+        )
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
@@ -1469,6 +1472,8 @@ class MambaManager(SingleTypeKVCacheManager):
             # that kv_cache_manager will think there is no enough blocks to allocate now
             # and don't schedule it in the current step.
             return self.block_pool.num_gpu_blocks + 1
+        if self.use_spec_workspace:
+            num_tokens = num_tokens_main_model
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.
@@ -1533,6 +1538,8 @@ class MambaManager(SingleTypeKVCacheManager):
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        if self.use_spec_workspace:
+            num_tokens = num_tokens_main_model
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
             # speculative decoding (MTP/EAGLE) with linear attention.

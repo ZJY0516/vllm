@@ -459,9 +459,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
             if isinstance(spec, MambaSpec):
+                num_speculative_blocks = (
+                    0 if spec.use_spec_workspace else spec.num_speculative_blocks
+                )
                 max_num_blocks = (
                     max_num_blocks if self.cache_config.enable_prefix_caching else 1
-                ) + spec.num_speculative_blocks
+                ) + num_speculative_blocks
                 max_num_blocks = get_block_table_width(
                     max_num_blocks, spec.block_size, token_alignment=None
                 )

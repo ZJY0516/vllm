@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from dataclasses import replace
 
 import torch
 from einops import rearrange
@@ -46,6 +47,7 @@ from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 logger = init_logger(__name__)
 
@@ -284,6 +286,16 @@ def _make_decode_norm_weight_loader(
 
 
 class KimiK3DeltaAttention(GatedDeltaNetAttention):
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if spec is None:
+            return None
+        assert isinstance(spec, MambaSpec)
+        return replace(
+            spec,
+            use_spec_workspace=vllm_config.use_kda_spec_workspace(),
+        )
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return KimiK3KDAAttentionBackend
 
@@ -532,6 +544,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         has_initial_state = m.has_initial_state
         non_spec_query_start_loc = m.non_spec_query_start_loc
         non_spec_state_indices_tensor = m.non_spec_state_indices_tensor
+        non_spec_conv_state_indices = m.non_spec_conv_state_indices
         spec_token_indx = m.spec_token_indx
         non_spec_token_indx = m.non_spec_token_indx
         spec_state_indices_tensor = m.spec_state_indices_tensor
@@ -554,6 +567,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             and not has_spec_decode
             and m.num_prefills == 0
             and m.num_decodes > 0
+            and m.spec_workspace_num_tokens == 0
         ):
             assert non_spec_state_indices_tensor is not None
             ops.fused_kda_decode(
@@ -609,8 +623,16 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if has_spec_decode:
             assert spec_state_indices_tensor is not None
             assert spec_query_start_loc is not None
-            spec_conv_indices = spec_state_indices_tensor[:, 0][: m.num_spec_decodes]
-            spec_max_query_len = spec_state_indices_tensor.size(-1)
+            spec_conv_indices = (
+                m.spec_conv_state_indices
+                if m.spec_conv_state_indices is not None
+                else spec_state_indices_tensor[:, 0]
+            )[: m.num_spec_decodes]
+            spec_max_query_len = (
+                m.spec_workspace_num_tokens
+                if m.spec_workspace_slots is not None
+                else spec_state_indices_tensor.size(-1)
+            )
             spec_conv_out = torch.empty_like(mixed_qkv_spec)
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
@@ -646,8 +668,15 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 lower_bound=self.gate_lower_bound,
                 initial_state=recurrent_state,
                 cu_seqlens=spec_cu_seqlens,
-                ssm_state_indices=spec_state_indices_tensor,
+                ssm_state_indices=(
+                    spec_state_indices_tensor[:, :1]
+                    if m.spec_workspace_slots is not None
+                    else spec_state_indices_tensor
+                ),
                 num_accepted_tokens=num_accepted_tokens,
+                workspace_slots=m.spec_workspace_slots,
+                workspace_base=m.spec_workspace_base,
+                workspace_num_tokens=m.spec_workspace_num_tokens,
                 out=spec_out,
             )
 
@@ -655,6 +684,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         core_attn_out_non_spec = None
         if mixed_qkv_ns is not None:
             assert g1_ns is not None and beta_ns is not None
+            assert non_spec_conv_state_indices is not None
             if m.num_prefills > 0:
                 q_ns, k_ns, v_ns = mixed_qkv_ns.split(
                     self.local_projection_size, dim=-1
@@ -674,7 +704,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         activation="silu",
                         conv_states=state,
                         has_initial_state=has_initial_state,
-                        cache_indices=non_spec_state_indices_tensor,
+                        cache_indices=non_spec_conv_state_indices,
                         query_start_loc=non_spec_query_start_loc,
                         metadata=m,
                     ).transpose(0, 1)
@@ -733,7 +763,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             else:
                 # Pure non-speculative decode.
                 assert non_spec_state_indices_tensor is not None
-                decode_conv_indices = non_spec_state_indices_tensor[
+                decode_conv_indices = non_spec_conv_state_indices[
                     : mixed_qkv_ns.size(0)
                 ]
                 packed_conv_out = torch.empty_like(mixed_qkv_ns)
@@ -758,7 +788,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     dt_bias=self.dt_bias,
                     lower_bound=self.gate_lower_bound,
                     initial_state=recurrent_state,
-                    state_indices=decode_conv_indices,
+                    state_indices=non_spec_state_indices_tensor[: mixed_qkv_ns.size(0)],
                 )
 
         # Restore the scheduler's original token order for mixed batches.

@@ -201,7 +201,11 @@ def warmup_kernels(
         if isinstance(spec, CrossAttentionSpec):
             num_tokens = max_encoder_len
         num_blocks = cdiv(num_tokens, spec.block_size)
-        if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+        if (
+            isinstance(spec, MambaSpec)
+            and spec.mamba_cache_mode == "align"
+            and not spec.use_spec_workspace
+        ):
             # Align mode reserves extra blocks beyond the token range for the
             # speculative-decode running-state snapshots.
             num_blocks += spec.num_speculative_blocks

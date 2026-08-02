@@ -156,6 +156,10 @@ class CacheConfig:
     mamba backend; standard (non-speculative) decode only. In align mode flushes
     are most efficient when mamba_block_size is a multiple of replayssm_buffer_len,
     but this is not required."""
+    enable_kda_spec_workspace: bool = False
+    """Use compact KDA speculative replay workspace pages for Kimi-K3.
+    Requires mamba_cache_mode 'align'. When disabled, speculative KDA state
+    allocation follows the native path."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)

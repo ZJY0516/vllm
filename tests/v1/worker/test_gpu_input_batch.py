@@ -439,6 +439,61 @@ def test_pooling_prompt_lens_not_aliased(device: str):
     )
 
 
+def test_kda_spec_workspace_slots_follow_requests():
+    input_batch = InputBatch(
+        max_num_reqs=3,
+        max_model_len=MAX_PROMPT_SIZE + NUM_OUTPUT_TOKENS,
+        max_num_batched_tokens=3 * (MAX_PROMPT_SIZE + NUM_OUTPUT_TOKENS),
+        device=torch.device("cpu"),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+        max_num_blocks_per_req=[2],
+        use_kda_spec_workspace=True,
+    )
+    requests = [_construct_cached_request_state(i) for i in range(3)]
+    for request in requests:
+        input_batch.add_request(request)
+
+    slots = {
+        request.req_id: int(
+            input_batch.kda_spec_workspace_slots[
+                input_batch.req_id_to_index[request.req_id]
+            ]
+        )
+        for request in requests
+    }
+    input_batch.kda_spec_workspace_initialized[:] = [True, False, True]
+    initialized = {
+        request.req_id: bool(
+            input_batch.kda_spec_workspace_initialized[
+                input_batch.req_id_to_index[request.req_id]
+            ]
+        )
+        for request in requests
+    }
+    input_batch.swap_states(0, 2)
+    input_batch.remove_request(requests[1].req_id)
+    input_batch.condense()
+
+    for request in (requests[0], requests[2]):
+        index = input_batch.req_id_to_index[request.req_id]
+        assert input_batch.kda_spec_workspace_slots[index] == slots[request.req_id]
+        assert (
+            input_batch.kda_spec_workspace_initialized[index]
+            == initialized[request.req_id]
+        )
+
+    replacement = _construct_cached_request_state(3)
+    input_batch.add_request(replacement)
+    replacement_index = input_batch.req_id_to_index[replacement.req_id]
+    assert (
+        input_batch.kda_spec_workspace_slots[replacement_index]
+        == slots[requests[1].req_id]
+    )
+    assert not input_batch.kda_spec_workspace_initialized[replacement_index]
+
+
 def test_placeholder_spec_token_ids_written_verbatim():
     input_batch = InputBatch(
         max_num_reqs=1,
