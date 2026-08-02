@@ -157,9 +157,11 @@ class CacheConfig:
     are most efficient when mamba_block_size is a multiple of replayssm_buffer_len,
     but this is not required."""
     enable_kda_spec_workspace: bool = False
-    """Use compact KDA speculative replay workspace pages for Kimi-K3.
-    Requires mamba_cache_mode 'align'. When disabled, speculative KDA state
-    allocation follows the native path."""
+    """Use model-owned KDA working-state and replay workspace tensors for
+    Kimi-K3. The fixed allocation scales with max_num_seqs and the speculative
+    token count, and is kept outside the KV cache manager. Requires
+    mamba_cache_mode 'align'. When disabled, speculative KDA state allocation
+    follows the native path."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
