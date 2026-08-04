@@ -572,8 +572,11 @@ def test_kda_spec_decode_correctness(
     assert torch.isnan(output_storage[..., H * D :]).all()
 
 
+@pytest.mark.parametrize("precomputed_new_computed", [False, True])
 @torch.inference_mode()
-def test_kda_replay_workspace_commits_only_accepted_prefix():
+def test_kda_replay_workspace_commits_only_accepted_prefix(
+    precomputed_new_computed: bool,
+):
     num_seqs, query_len, H, D = 4, 12, 2, 32
     total_tokens = num_seqs * query_len
     torch.manual_seed(2026)
@@ -612,6 +615,11 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
     q1, k1, v1, g1, beta1_full = inputs()
     beta1 = beta1_full[..., 0].contiguous()
     accepted = torch.tensor([1, 4, query_len, 8], dtype=torch.int32, device=DEVICE)
+    # Requests 2 and 3 reach the boundary after one and seven replays.
+    num_computed = torch.tensor([9, 9, 15, 9], dtype=torch.int32, device=DEVICE)
+    commit_num_computed = (
+        num_computed + accepted if precomputed_new_computed else num_computed
+    )
     native_state_indices = torch.arange(
         1,
         num_seqs * query_len + 1,
@@ -672,7 +680,7 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
         workspace_slots,
         workspace_slots,
         torch.full((num_seqs,), query_len, dtype=torch.int32, device=DEVICE),
-        torch.full((num_seqs,), 9, dtype=torch.int32, device=DEVICE),
+        commit_num_computed,
         torch.full((num_seqs,), query_len - 1, dtype=torch.int32, device=DEVICE),
         torch.tensor([block_table.data_ptr()], dtype=torch.int64, device=DEVICE),
         block_table.stride(0),
@@ -696,7 +704,7 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
         BLOCK_KEY=32,
         HAS_IDX_MAPPING=False,
         WORKSPACE_SLOT_IS_REQ_IDX=False,
-        PRECOMPUTED_NEW_COMPUTED=False,
+        PRECOMPUTED_NEW_COMPUTED=precomputed_new_computed,
         MAMBA_BLOCK_SIZE=16,
     )
 
@@ -748,8 +756,10 @@ def test_kda_replay_workspace_commits_only_accepted_prefix():
             first_states.append(current)
         current = first_states[accepted[seq].item() - 1]
         reference_state[seq] = current.transpose(-1, -2)
-        if accepted[seq].item() >= 6:
-            expected_checkpoints[seq] = first_states[5].transpose(-1, -2)
+        if seq == 2:
+            expected_checkpoints[seq] = first_states[0].transpose(-1, -2)
+        elif seq == 3:
+            expected_checkpoints[seq] = first_states[6].transpose(-1, -2)
         for token in range(query_len):
             sl = slice(start + token, start + token + 1)
             token_out, current = naive_recurrent_kda(

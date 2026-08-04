@@ -552,8 +552,12 @@ def commit_kda_spec_workspace_kernel(
         num_tokens_running_state = num_computed + num_scheduled - num_draft
         new_num_computed = num_tokens_running_state + num_accepted - 1
     aligned_new_computed = (new_num_computed // MAMBA_BLOCK_SIZE) * MAMBA_BLOCK_SIZE
-    boundary_count = aligned_new_computed - num_tokens_running_state
-    has_new_boundary = (boundary_count > 0) & (boundary_count <= num_accepted)
+    boundary_replay_count = aligned_new_computed - num_tokens_running_state + 1
+    has_new_boundary = (
+        (aligned_new_computed > 0)
+        & (boundary_replay_count > 0)
+        & (boundary_replay_count <= num_accepted)
+    )
     boundary_col = tl.maximum(aligned_new_computed // MAMBA_BLOCK_SIZE - 1, 0)
     boundary_block_id = tl.load(
         block_table + batch_idx * block_table_stride_req + boundary_col,
@@ -606,7 +610,7 @@ def commit_kda_spec_workspace_kernel(
         state *= decay[None, :]
         state += update[:, None] * key[None, :]
 
-        if has_new_boundary & (token_idx + 1 == boundary_count):
+        if has_new_boundary & (token_idx + 1 == boundary_replay_count):
             boundary_ptr = (
                 state_base + boundary_block_id * state_block_stride + state_offset
             )
