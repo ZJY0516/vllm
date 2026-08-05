@@ -15,6 +15,7 @@ import vllm.config.vllm as vllm_config_module
 import vllm.envs as envs
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
+    CacheConfig,
     CompilationConfig,
     KernelConfig,
     ModelConfig,
@@ -380,6 +381,23 @@ def test_async_scheduling_with_pipeline_parallelism_is_allowed():
         ),
     )
     assert cfg.scheduler_config.async_scheduling is True
+
+
+def test_replayssm_spec_rejects_pipeline_parallelism():
+    with pytest.raises(ValidationError, match="does not support pipeline parallelism"):
+        VllmConfig(
+            cache_config=CacheConfig(use_replayssm_spec=True),
+            parallel_config=ParallelConfig(
+                pipeline_parallel_size=2,
+                distributed_executor_backend="mp",
+                nnodes=2,
+            ),
+            speculative_config=SpeculativeConfig(
+                method="ngram",
+                num_speculative_tokens=3,
+                prompt_lookup_max=3,
+            ),
+        )
 
 
 @dataclass

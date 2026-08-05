@@ -11,6 +11,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     get_conv_copy_spec,
+    get_replayssm_spec_temporal_copy_spec,
     get_temporal_copy_spec,
     is_conv_state_dim_first,
 )
@@ -43,6 +44,7 @@ def _copy_mamba_state_block(
     state_dim_row_stride_ptr,
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
+    USE_TEMPORAL_TOKEN_BIAS: tl.constexpr = True,
 ):
     """Copy one (layer, state-type) mamba state block between block columns.
 
@@ -119,7 +121,10 @@ def _copy_mamba_state_block(
         return
 
     # Temporal state: copy state[bt[src_col + token_bias]] -> state[bt[dst_col]]
-    actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
+    temporal_token_bias = token_bias if USE_TEMPORAL_TOKEN_BIAS else 0
+    actual_src_block_id = tl.load(block_table_base + src_col + temporal_token_bias).to(
+        tl.int64
+    )
     src_addr = state_base_addr + actual_src_block_id * state_block_stride
     # Use natural block data size (inner_size * elem_size), NOT
     # state_block_stride which is the page stride and can exceed the
@@ -188,6 +193,7 @@ def postprocess_mamba_fused_kernel(
     # COPY_BLOCK_SIZE: fixed tuning parameter for memory copy loop
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
+    COPY_TEMPORAL_STATE: tl.constexpr = True,
     # HAS_IDX_MAPPING: when True, program_id(0) is a batch index resolved to a
     # req-state slot via idx_mapping_ptr (V2). When False, it is the req index.
     HAS_IDX_MAPPING: tl.constexpr = False,
@@ -258,6 +264,11 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
+    if not COPY_TEMPORAL_STATE:
+        conv_width = tl.load(state_conv_widths_ptr + state_idx)
+        if conv_width == 0:
+            return
+
     bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
     _copy_mamba_state_block(
         state_idx,
@@ -277,6 +288,7 @@ def postprocess_mamba_fused_kernel(
         state_dim_row_stride_ptr,
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
+        True,
     )
 
 
@@ -348,6 +360,7 @@ def precopy_mamba_align_fused_kernel(
     num_reqs,
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
+    USE_TEMPORAL_TOKEN_BIAS: tl.constexpr = True,
 ):
     """Pre-copy mamba "align" state across block boundaries on the V2 runner.
 
@@ -397,6 +410,7 @@ def precopy_mamba_align_fused_kernel(
         state_dim_row_stride_ptr,
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
+        USE_TEMPORAL_TOKEN_BIAS,
     )
 
 
@@ -509,6 +523,7 @@ class MambaSpecDecodeGPUContext:
     num_state_types: int
     mamba_group_ids: list[int]
     num_groups: int
+    copy_temporal_postprocess: bool
 
     # Output buffer for num_accepted_tokens updates
     num_accepted_tokens_out: torch.Tensor
@@ -539,6 +554,7 @@ class MambaSpecDecodeGPUContext:
         num_state_types: int,
         device: torch.device,
         make_buffer: Callable[..., CpuGpuBuffer],
+        copy_temporal_postprocess: bool = True,
     ) -> "MambaSpecDecodeGPUContext":
         """Create context with allocated buffers (metadata populated later)."""
         mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
@@ -580,6 +596,7 @@ class MambaSpecDecodeGPUContext:
             num_state_types=num_state_types,
             mamba_group_ids=mamba_group_ids,
             num_groups=len(mamba_group_ids),
+            copy_temporal_postprocess=copy_temporal_postprocess,
             num_accepted_tokens_out=torch.zeros(
                 max_num_reqs, dtype=torch.int32, device=device
             ),
@@ -644,7 +661,12 @@ class MambaSpecDecodeGPUContext:
                 attention = forward_context[layer_name]
                 kv_caches: list[torch.Tensor] = attention.kv_cache
 
-                for state_type_idx, state in enumerate(kv_caches):
+                if len(kv_caches) < len(mamba_state_copy_funcs):
+                    raise ValueError(
+                        f"layer {layer_name} has {len(kv_caches)} cache tensors "
+                        f"but {len(mamba_state_copy_funcs)} copy functions"
+                    )
+                for state, copy_func in zip(kv_caches, mamba_state_copy_funcs):
                     # Base address
                     self.state_base_addrs[idx] = state.data_ptr()
 
@@ -661,10 +683,10 @@ class MambaSpecDecodeGPUContext:
                     # Element size
                     self.state_elem_sizes[idx] = state.element_size()
 
-                    copy_func = mamba_state_copy_funcs[state_type_idx]
                     assert (
                         copy_func is get_conv_copy_spec
                         or copy_func is get_temporal_copy_spec
+                        or copy_func is get_replayssm_spec_temporal_copy_spec
                     ), f"unexpected copy func: {copy_func}"
                     if copy_func is get_conv_copy_spec:
                         if state.dim() != 3:
@@ -789,6 +811,7 @@ class MambaSpecDecodeGPUContext:
             block_size=self.block_size,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            COPY_TEMPORAL_STATE=self.copy_temporal_postprocess,
         )
 
     def run_fused_precopy(
@@ -831,6 +854,7 @@ class MambaSpecDecodeGPUContext:
             num_reqs,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            USE_TEMPORAL_TOKEN_BIAS=self.copy_temporal_postprocess,
         )
 
     def run_fused_postprocess_align(
@@ -875,6 +899,7 @@ class MambaSpecDecodeGPUContext:
             block_size=self.block_size,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            COPY_TEMPORAL_STATE=self.copy_temporal_postprocess,
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
         )
@@ -914,6 +939,9 @@ class MambaBuffers:
                     num_state_types=len(copy_funcs),
                     device=device,
                     make_buffer=make_buffer,
+                    copy_temporal_postprocess=(
+                        get_replayssm_spec_temporal_copy_spec not in copy_funcs
+                    ),
                 )
                 if with_postprocess_align
                 else None
@@ -1146,6 +1174,27 @@ def postprocess_mamba_align_gpu(
         num_computed_tokens_gpu=ctx.num_computed_tokens_buf.gpu,
         num_draft_tokens_gpu=ctx.num_draft_tokens_buf.gpu,
     )
+
+    if not ctx.copy_temporal_postprocess:
+        for mamba_group_id in ctx.mamba_group_ids:
+            block_table = input_batch.block_table[mamba_group_id].get_device_tensor(
+                num_reqs
+            )
+            layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
+            for layer_name in layer_names:
+                layer = forward_context[layer_name]
+                if getattr(layer, "use_replayssm_spec", False):
+                    layer.materialize_replayssm_spec_state(
+                        block_table=block_table,
+                        state_cols=ctx.mamba_state_idx_buf.gpu[:num_reqs],
+                        num_accepted_tokens=num_accepted_tokens_gpu[:num_reqs],
+                        num_scheduled_tokens=ctx.num_scheduled_tokens_buf.gpu[
+                            :num_reqs
+                        ],
+                        num_computed_tokens=ctx.num_computed_tokens_buf.gpu[:num_reqs],
+                        num_draft_tokens=ctx.num_draft_tokens_buf.gpu[:num_reqs],
+                        mamba_block_size=ctx.block_size,
+                    )
 
     # ``num_accepted_tokens_out`` is pre-initialized from
     # ``num_accepted_tokens_gpu``; the kernel only overwrites entries to 1

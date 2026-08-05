@@ -2353,16 +2353,21 @@ class VllmConfig:
                 "--use-replayssm-spec is only supported for Nemotron-H models "
                 f"(got architecture {self.model_config.architecture!r})"
             )
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "--use-replayssm-spec does not support pipeline parallelism; "
+                "set --pipeline-parallel-size 1"
+            )
         # Inverted against --use-replayssm, which forbids speculative decoding.
         if self.num_speculative_tokens <= 0:
             raise ValueError(
                 "--use-replayssm-spec requires speculative decoding "
                 "(num_speculative_tokens > 0)"
             )
-        if self.cache_config.mamba_cache_mode != "none":
+        if self.cache_config.mamba_cache_mode == "all":
             raise ValueError(
-                "--use-replayssm-spec does not support prefix caching; "
-                "pass --mamba-cache-mode none"
+                "--use-replayssm-spec supports --mamba-cache-mode none or "
+                "align, but not all"
             )
         if self.mamba_config.backend != MambaBackendEnum.TRITON:
             raise ValueError("--use-replayssm-spec requires --mamba-backend triton")

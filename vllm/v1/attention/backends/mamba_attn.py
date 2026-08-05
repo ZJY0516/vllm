@@ -228,6 +228,14 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     "the cached-spec kernel requires the 4-tensor Mamba2 page "
                     "(conv, ssm, post_conv_cache, dt_cache)"
                 )
+            if (
+                self.vllm_config.cache_config.mamba_cache_mode == "align"
+                and self.max_spec_len > kv_cache_spec.block_size
+            ):
+                raise ValueError(
+                    "--use-replayssm-spec with --mamba-cache-mode align "
+                    "requires 1 + num_speculative_tokens <= mamba_block_size"
+                )
             local_nheads, head_dim, dstate = kv_cache_spec.shapes[1]
             conv_dim_local = kv_cache_spec.shapes[2][1]
             # post_conv_cache holds x|B only, so the width past d_inner is
@@ -761,11 +769,11 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         num_accepted_tokens: torch.Tensor,
         num_decodes: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Advance the block-keyed spec ring cursors for this step.
+        """Prepare the block-keyed spec ring cursors for this step.
 
-        Commits the previous step's accepted tokens and decides this step's
-        is_flush on-device, then resets rows that are entering decode. Both run
-        as fixed launches so the captured graph is identical every step.
+        Align mode reconstructs the accepted state immediately after verify, so
+        every step starts from an empty ring. None mode commits the previous
+        acceptance here and only resets rows that are entering decode.
         """
         from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_spec import (  # noqa: E501
             commit_replayssm_spec,
@@ -792,6 +800,21 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         assert self.spec_post_origin is not None and self.spec_is_flush is not None
 
         block_ids = state_indices_tensor_d[:, 0]
+        if self.vllm_config.cache_config.mamba_cache_mode == "align":
+            reset_mask = torch.ones(
+                num_decodes, dtype=torch.int8, device=block_ids.device
+            )
+            reset_replayssm_spec_cursors(
+                self.spec_write_pos,
+                self.spec_post_origin,
+                self.spec_is_flush,
+                reset_mask,
+                block_ids,
+                max_cache_len=self.spec_flush_threshold,
+                max_spec_len=self.max_spec_len,
+            )
+            return self.spec_write_pos, self.spec_post_origin, self.spec_is_flush
+
         # Commit first: acceptance is only known after the previous step's
         # sampling, so folding it into this build keeps every cursor update
         # on-device and avoids a device-to-host sync on num_accepted_tokens.

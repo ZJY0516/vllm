@@ -415,6 +415,20 @@ def get_temporal_copy_spec(
     )
 
 
+def get_replayssm_spec_temporal_copy_spec(
+    state: torch.Tensor,
+    block_ids: list[int],
+    cur_block_idx: int,
+    num_accepted_tokens: int,
+) -> MambaCopySpec:
+    """Copy the materialized ReplaySSM checkpoint without a draft offset."""
+    del num_accepted_tokens
+    src_state = state[block_ids[cur_block_idx]]
+    return MambaCopySpec(
+        start_addr=src_state.data_ptr(), num_elements=src_state.numel()
+    )
+
+
 class MambaStateCopyFuncCalculator:
     @classmethod
     def linear_attention_state_copy_func(cls):

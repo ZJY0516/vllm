@@ -11,6 +11,7 @@ import torch
 
 from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
+    get_replayssm_spec_temporal_copy_spec,
     get_temporal_copy_spec,
 )
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -30,6 +31,18 @@ _COPY_FUNCS: tuple[MambaStateCopyFunc, ...] = (
     get_conv_copy_spec,
     get_temporal_copy_spec,
 )
+
+
+def test_replayssm_temporal_copy_uses_materialized_checkpoint():
+    state = torch.empty(4, 8)
+    block_ids = [1, 2, 3]
+
+    copy_spec = get_replayssm_spec_temporal_copy_spec(
+        state, block_ids, cur_block_idx=0, num_accepted_tokens=3
+    )
+
+    assert copy_spec.start_addr == state[1].data_ptr()
+    assert copy_spec.num_elements == state[1].numel()
 
 
 def postprocess_mamba(

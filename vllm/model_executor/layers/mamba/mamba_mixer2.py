@@ -36,6 +36,9 @@ from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_outpu
     selective_state_update_replayssm_output_only,
 )
 from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_spec import (
+    materialize_replayssm_spec_state as materialize_replayssm_spec_state_op,
+)
+from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_spec import (
     selective_state_update_replayssm_spec,
 )
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
@@ -1159,6 +1162,41 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
+
+    def materialize_replayssm_spec_state(
+        self,
+        block_table: torch.Tensor,
+        state_cols: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_scheduled_tokens: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        mamba_block_size: int,
+        idx_mapping: torch.Tensor | None = None,
+        precomputed_new_num_computed: bool = False,
+    ) -> None:
+        """Materialize accepted ReplaySSM states after verification."""
+        assert self.use_replayssm_spec
+        state_checkpoint = self.kv_cache[1]
+        post_conv_cache = self.kv_cache[2]
+        dt_cache = self.kv_cache[3]
+        materialize_replayssm_spec_state_op(
+            state_checkpoint,
+            post_conv_cache,
+            dt_cache,
+            self.A,
+            self.dt_bias,
+            block_table,
+            state_cols,
+            num_accepted_tokens,
+            num_scheduled_tokens,
+            num_computed_tokens,
+            num_draft_tokens,
+            mamba_block_size=mamba_block_size,
+            max_spec_len=self.max_spec_len,
+            idx_mapping=idx_mapping,
+            precomputed_new_num_computed=precomputed_new_num_computed,
+        )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None

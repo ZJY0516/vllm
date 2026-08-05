@@ -72,14 +72,31 @@ PREFIX_CACHING_PROMPTS = [
     _PC_PREFIX + "Surprisingly, the experiments showed that",
     _PC_PREFIX + "The most important conclusion was that",
 ]
+CROSS_BOUNDARY_BLOCK_SIZE = 2048
+CROSS_BOUNDARY_PROMPT_LEN = 2 * CROSS_BOUNDARY_BLOCK_SIZE - 2
 
 
-def _prefix_cache_hits(llm) -> int:
+def _cross_boundary_prompt(llm) -> list[list[int]]:
+    tokenizer = llm.llm.get_tokenizer()
+    cycle = tokenizer.encode(_PC_SENTENCE, add_special_tokens=False)
+    repeats = (CROSS_BOUNDARY_PROMPT_LEN + len(cycle) - 1) // len(cycle)
+    prompt_token_ids = (cycle * repeats)[:CROSS_BOUNDARY_PROMPT_LEN]
+    assert len(prompt_token_ids) % CROSS_BOUNDARY_BLOCK_SIZE == (
+        CROSS_BOUNDARY_BLOCK_SIZE - 2
+    )
+    return [prompt_token_ids]
+
+
+def _counter_value(llm, name: str) -> int:
     return sum(
         m.value
         for m in llm.llm.get_metrics()
-        if isinstance(m, Counter) and m.name == "vllm:prefix_cache_hits"
+        if isinstance(m, Counter) and m.name == name
     )
+
+
+def _prefix_cache_hits(llm) -> int:
+    return _counter_value(llm, "vllm:prefix_cache_hits")
 
 
 def _check_replayssm_prefix_caching_parity(
@@ -172,3 +189,73 @@ def _check_replayssm_spec_parity(vllm_runner, model_name, *, num_spec_tokens=3):
 @pytest.mark.parametrize("model_name", MODELS)
 def test_replayssm_spec_decode_matches_baseline(vllm_runner, model_name):
     _check_replayssm_spec_parity(vllm_runner, model_name)
+
+
+@pytest.mark.parametrize("model_name", MODELS)
+def test_replayssm_spec_prefix_caching_matches_baseline(vllm_runner, model_name):
+    """A cache-hit accepted window crossing a block matches the baseline."""
+    common = dict(
+        max_model_len=8192,
+        block_size=CROSS_BOUNDARY_BLOCK_SIZE,
+        trust_remote_code=True,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        mamba_cache_mode="align",
+        disable_log_stats=False,
+        speculative_config={
+            "method": "ngram",
+            "num_speculative_tokens": 3,
+            "prompt_lookup_max": 3,
+        },
+    )
+    with vllm_runner(model_name, **common) as llm:
+        assert (
+            llm.llm.llm_engine.vllm_config.cache_config.mamba_block_size
+            == CROSS_BOUNDARY_BLOCK_SIZE
+        )
+        prompts = _cross_boundary_prompt(llm)
+        llm.generate_greedy_logprobs(prompts, max_tokens=3, num_logprobs=5)
+        baseline_hits_before = _prefix_cache_hits(llm)
+        baseline_accepted_before = _counter_value(
+            llm, "vllm:spec_decode_num_accepted_tokens"
+        )
+        baseline = llm.generate_greedy_logprobs(prompts, max_tokens=3, num_logprobs=5)
+        baseline_hit_delta = _prefix_cache_hits(llm) - baseline_hits_before
+        baseline_accepted_delta = (
+            _counter_value(llm, "vllm:spec_decode_num_accepted_tokens")
+            - baseline_accepted_before
+        )
+    with vllm_runner(
+        model_name, use_replayssm_spec=True, replayssm_buffer_len=16, **common
+    ) as llm:
+        assert (
+            llm.llm.llm_engine.vllm_config.cache_config.mamba_block_size
+            == CROSS_BOUNDARY_BLOCK_SIZE
+        )
+        llm.generate_greedy_logprobs(prompts, max_tokens=3, num_logprobs=5)
+        replay_hits_before = _prefix_cache_hits(llm)
+        replay_accepted_before = _counter_value(
+            llm, "vllm:spec_decode_num_accepted_tokens"
+        )
+        replay = llm.generate_greedy_logprobs(prompts, max_tokens=3, num_logprobs=5)
+        replay_hit_delta = _prefix_cache_hits(llm) - replay_hits_before
+        replay_accepted_delta = (
+            _counter_value(llm, "vllm:spec_decode_num_accepted_tokens")
+            - replay_accepted_before
+        )
+
+    assert baseline_hit_delta > 0
+    assert replay_hit_delta > 0
+    # The prompt ends two tokens before the boundary. With max_tokens=3,
+    # accepting a draft proves the first verify crossed it.
+    assert baseline_accepted_delta > 0
+    assert replay_accepted_delta > 0
+    assert [output[0] for output in baseline] == [output[0] for output in replay]
+    assert [output[1] for output in baseline] == [output[1] for output in replay]
+    check_logprobs_close(
+        outputs_0_lst=baseline,
+        outputs_1_lst=replay,
+        name_0="baseline_spec_align_pc",
+        name_1="replayssm_spec_align_pc",
+        always_check_logprobs=True,
+    )

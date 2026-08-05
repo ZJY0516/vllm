@@ -11,7 +11,8 @@ byte-identical semantics to the V1 copy specs (``get_conv_copy_spec`` /
   ``state[bt[dst_col], :conv_width - token_bias]``.
 * temporal state (conv_width == 0): ``token_bias`` selects the accepted
   speculative column -- ``state[bt[src_col + token_bias]]`` ->
-  ``state[bt[dst_col]]``.
+  ``state[bt[dst_col]]``. ReplaySSM materializes the accepted checkpoint in
+  ``src_col`` itself, so its temporal copy ignores ``token_bias``.
 
 The kernel must also no-op when ``src_col < 0`` (fresh request) or
 ``src_col == dst_col`` (no boundary crossed).
@@ -95,7 +96,16 @@ def _build_meta(convs, ssms, device):
     return base, blk_stride, elem, inner, width, group, drc, drs
 
 
-def _reference(convs, ssms, bt, src_col, dst_col, bias, num_reqs):
+def _reference(
+    convs,
+    ssms,
+    bt,
+    src_col,
+    dst_col,
+    bias,
+    num_reqs,
+    use_temporal_token_bias,
+):
     """Apply the V1 copy semantics on clones, reading from the pre-copy state."""
     conv_pre = [c.clone() for c in convs]
     ssm_pre = [s.clone() for s in ssms]
@@ -106,7 +116,7 @@ def _reference(convs, ssms, bt, src_col, dst_col, bias, num_reqs):
         if sc < 0 or sc == dc:
             continue
         sblk, dblk = int(bt[r, sc]), int(bt[r, dc])
-        tblk = int(bt[r, sc + tb])  # temporal src column shifted by bias
+        tblk = int(bt[r, sc + (tb if use_temporal_token_bias else 0)])
         for layer in range(NUM_LAYERS):
             conv_ref[layer][dblk, : CONV_WIDTH - tb] = conv_pre[layer][sblk, tb:]
             ssm_ref[layer][dblk] = ssm_pre[layer][tblk]
@@ -115,7 +125,8 @@ def _reference(convs, ssms, bt, src_col, dst_col, bias, num_reqs):
 
 @_parametrize("num_reqs", [1, 4, 16])
 @_parametrize("token_bias", [0, 1, 2])
-def test_precopy_matches_v1_copy_specs(num_reqs, token_bias):
+@_parametrize("use_temporal_token_bias", [True, False])
+def test_precopy_matches_v1_copy_specs(num_reqs, token_bias, use_temporal_token_bias):
     device = torch.device("cuda")
     torch.manual_seed(0)
     # Distinct physical block per (req, col) so copies never alias.
@@ -138,7 +149,14 @@ def test_precopy_matches_v1_copy_specs(num_reqs, token_bias):
 
     convs, ssms = _build_state(num_blocks, device)
     conv_ref, ssm_ref = _reference(
-        convs, ssms, bt.cpu(), src_col.cpu(), dst_col.cpu(), bias.cpu(), num_reqs
+        convs,
+        ssms,
+        bt.cpu(),
+        src_col.cpu(),
+        dst_col.cpu(),
+        bias.cpu(),
+        num_reqs,
+        use_temporal_token_bias,
     )
 
     base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
@@ -165,6 +183,7 @@ def test_precopy_matches_v1_copy_specs(num_reqs, token_bias):
         num_reqs,
         COPY_BLOCK_SIZE=1024,
         CONV_STATE_DIM_FIRST=False,
+        USE_TEMPORAL_TOKEN_BIAS=use_temporal_token_bias,
     )
     torch.accelerator.synchronize()
 
@@ -176,5 +195,6 @@ def test_precopy_matches_v1_copy_specs(num_reqs, token_bias):
 if __name__ == "__main__":
     for nr in (1, 4, 16):
         for tb in (0, 1, 2):
-            test_precopy_matches_v1_copy_specs(nr, tb)
-            print(f"OK num_reqs={nr} token_bias={tb}")
+            for use_bias in (True, False):
+                test_precopy_matches_v1_copy_specs(nr, tb, use_bias)
+                print(f"OK num_reqs={nr} token_bias={tb} use_bias={use_bias}")

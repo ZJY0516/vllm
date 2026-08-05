@@ -162,9 +162,9 @@ class CacheConfig:
     """Use the ReplaySSM Mamba2 speculative-decode kernel: verify a whole draft
     window against one checkpoint plus a circular input ring, so rollback is a
     cursor move instead of a per-draft state snapshot. Requires speculative
-    decoding, mamba_cache_mode 'none' and the Triton mamba backend; mutually
-    exclusive with use_replayssm. replayssm_buffer_len must be at least
-    1 + num_speculative_tokens."""
+    decoding, mamba_cache_mode 'none' or 'align' and the Triton mamba backend;
+    mutually exclusive with use_replayssm and pipeline parallelism.
+    replayssm_buffer_len must be at least 1 + num_speculative_tokens."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)

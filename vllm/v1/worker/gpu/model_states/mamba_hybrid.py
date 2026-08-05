@@ -11,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
+    get_replayssm_spec_temporal_copy_spec,
     is_conv_state_dim_first,
 )
 from vllm.triton_utils import tl, triton
@@ -97,6 +98,15 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
+            self._mamba_kv_cache_config: KVCacheConfig | None = None
+            self._mamba_block_tables: tuple[torch.Tensor, ...] | None = None
+
+    def _get_mamba_state_copy_funcs(self):
+        copy_funcs = self.model.get_mamba_state_copy_func()
+        if not self.cache_config.use_replayssm_spec:
+            return copy_funcs
+        assert len(copy_funcs) == 2
+        return copy_funcs[0], get_replayssm_spec_temporal_copy_spec
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -132,7 +142,7 @@ class MambaHybridModelState(DefaultModelState):
         block_tables: tuple[torch.Tensor, ...],
     ) -> MambaSpecDecodeGPUContext:
         if self._mamba_ctx is None:
-            copy_funcs = self.model.get_mamba_state_copy_func()
+            copy_funcs = self._get_mamba_state_copy_funcs()
             # The fused copy kernels shift conv windows assuming the SD layout;
             # the DS layout cannot express a >0 spec-decode shift as a single
             # contiguous copy (mirrors get_conv_copy_spec's NotImplementedError).
@@ -149,6 +159,9 @@ class MambaHybridModelState(DefaultModelState):
                 make_buffer=lambda n, dtype: CpuGpuBuffer(
                     n, dtype=dtype, device=self.device
                 ),
+                copy_temporal_postprocess=(
+                    get_replayssm_spec_temporal_copy_spec not in copy_funcs
+                ),
             )
         ctx = self._mamba_ctx
         if not ctx.is_initialized:
@@ -159,7 +172,7 @@ class MambaHybridModelState(DefaultModelState):
             ctx.initialize_from_forward_context(
                 kv_cache_config,
                 forward_context,
-                self.model.get_mamba_state_copy_func(),
+                self._get_mamba_state_copy_funcs(),
                 [block_tables[gid] for gid in mamba_group_ids],
             )
         return ctx
@@ -184,6 +197,8 @@ class MambaHybridModelState(DefaultModelState):
             return
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
+        self._mamba_kv_cache_config = kv_cache_config
+        self._mamba_block_tables = block_tables
 
         # The state-advance + pre-copy kernels run every step; they fast-exit per
         # request when src_col < 0 or src_col == dst_col, so no copy happens on
@@ -326,6 +341,12 @@ class MambaHybridModelState(DefaultModelState):
         ):
             num_reqs = idx_mapping.shape[0]
             if num_reqs:
+                if not self._mamba_ctx.copy_temporal_postprocess and (
+                    not isinstance(num_sampled, int) or num_sampled > 0
+                ):
+                    self._materialize_replayssm_spec_state(
+                        idx_mapping, num_computed_tokens
+                    )
                 self._mamba_ctx.run_fused_postprocess_align(
                     num_reqs,
                     self.num_accepted_tokens_gpu,
@@ -333,6 +354,33 @@ class MambaHybridModelState(DefaultModelState):
                     num_computed_tokens,
                     idx_mapping,
                 )
+
+    def _materialize_replayssm_spec_state(
+        self,
+        idx_mapping: torch.Tensor,
+        new_num_computed_tokens: torch.Tensor,
+    ) -> None:
+        kv_cache_config = self._mamba_kv_cache_config
+        block_tables = self._mamba_block_tables
+        assert kv_cache_config is not None and block_tables is not None
+        assert self._mamba_ctx is not None
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        for mamba_group_id in self._mamba_ctx.mamba_group_ids:
+            layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
+            for layer_name in layer_names:
+                layer = forward_context[layer_name]
+                if getattr(layer, "use_replayssm_spec", False):
+                    layer.materialize_replayssm_spec_state(
+                        block_table=block_tables[mamba_group_id],
+                        state_cols=self._mamba_state_idx_gpu,
+                        num_accepted_tokens=self.num_accepted_tokens_gpu,
+                        num_scheduled_tokens=self.num_accepted_tokens_gpu,
+                        num_computed_tokens=new_num_computed_tokens,
+                        num_draft_tokens=self.num_accepted_tokens_gpu,
+                        mamba_block_size=self._mamba_ctx.block_size,
+                        idx_mapping=idx_mapping,
+                        precomputed_new_num_computed=True,
+                    )
 
 
 @triton.jit

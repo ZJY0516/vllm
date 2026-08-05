@@ -1138,7 +1138,7 @@ class VllmRunner:
 
     def generate_w_logprobs(
         self,
-        prompts: list[str],
+        prompts: list[str] | list[torch.Tensor] | list[list[int]],
         sampling_params: SamplingParams,
         images: PromptImageInput | None = None,
         audios: PromptAudioInput | None = None,
@@ -1184,7 +1184,7 @@ class VllmRunner:
 
     def generate_greedy_logprobs(
         self,
-        prompts: list[str],
+        prompts: list[str] | list[torch.Tensor] | list[list[int]],
         max_tokens: int,
         num_logprobs: int | None,
         num_prompt_logprobs: int | None = None,

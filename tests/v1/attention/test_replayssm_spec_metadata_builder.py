@@ -6,6 +6,9 @@ The cursors are block-keyed and advanced on-device by commit_replayssm_spec, so
 these tests drive builder.build() and read the resulting buffers back. Each case
 builds one CommonAttentionMetadata and reuses it, because
 create_common_attn_metadata draws fresh block ids on every call.
+
+In align mode the post-verify path materializes the accepted checkpoint, so the
+builder resets the ring on every step instead of committing it on the next one.
 """
 
 import pytest
@@ -56,6 +59,7 @@ def _make_spec_mamba_spec() -> MambaSpec:
 def _create_spec_builder(
     buffer_len: int = BUFFER_LEN,
     full_cuda_graph: bool = False,
+    cache_mode: str = "none",
 ) -> MockMambaBuilder:
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
@@ -71,6 +75,7 @@ def _create_spec_builder(
     # does not run against the mock model.
     vllm_config.cache_config.use_replayssm_spec = True
     vllm_config.cache_config.replayssm_buffer_len = buffer_len
+    vllm_config.cache_config.mamba_cache_mode = cache_mode
     return MockMambaBuilder(_make_spec_mamba_spec(), ["layer0"], vllm_config, DEVICE)
 
 
@@ -132,6 +137,17 @@ def test_commit_advances_write_pos_by_accepted():
     write_pos, post_origin, _ = _cursors(builder, blocks)
     assert write_pos == [5]
     assert post_origin == [0]
+
+
+def test_align_resets_ring_instead_of_committing_acceptance():
+    builder = _create_spec_builder(cache_mode="align")
+    common = _make_common([120], [100])
+    blocks = _prime(builder, common)
+    _seed(builder, blocks, write_pos=5, is_flush=1)
+
+    _build(builder, common, [3])
+
+    assert _cursors(builder, blocks) == ([0], [0], [0])
 
 
 def test_rejected_drafts_are_not_committed():

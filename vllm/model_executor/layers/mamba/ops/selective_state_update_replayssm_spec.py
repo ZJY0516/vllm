@@ -733,6 +733,249 @@ def _replayssm_spec_fl_kernel(
 
 
 @triton.jit
+def _materialize_replayssm_spec_state_kernel(
+    state_ptr,
+    post_conv_cache_ptr,
+    dt_cache_ptr,
+    A_ptr,
+    dt_bias_ptr,
+    block_table_ptr,
+    state_col_ptr,
+    num_accepted_ptr,
+    num_scheduled_ptr,
+    num_computed_ptr,
+    num_draft_ptr,
+    idx_mapping_ptr,
+    null_block_id,
+    batch,
+    nheads,
+    dim,
+    dstate,
+    d_inner,
+    nheads_ngroups_ratio,
+    stride_state_batch,
+    stride_state_head,
+    stride_state_dim,
+    stride_state_dstate,
+    stride_post_batch,
+    stride_post_pos,
+    stride_post_channel,
+    stride_dt_batch,
+    stride_dt_head,
+    stride_dt_pos,
+    stride_A_head,
+    stride_dt_bias_head,
+    stride_bt_batch,
+    stride_bt_col,
+    BLOCK_SIZE_MN: tl.constexpr,
+    MAX_SPEC_LEN: tl.constexpr,
+    MAMBA_BLOCK_SIZE: tl.constexpr,
+    DT_SOFTPLUS: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr,
+    PRECOMPUTED_NEW_COMPUTED: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_mn = tl.program_id(2)
+    if pid_b >= batch:
+        return
+
+    req_idx = pid_b
+    if HAS_IDX_MAPPING:
+        req_idx = tl.load(idx_mapping_ptr + pid_b).to(tl.int32)
+        if req_idx < 0:
+            return
+
+    num_accepted = tl.load(num_accepted_ptr + req_idx).to(tl.int32)
+    if num_accepted <= 0:
+        return
+
+    if PRECOMPUTED_NEW_COMPUTED:
+        new_num_computed = tl.load(num_computed_ptr + req_idx).to(tl.int32)
+        num_tokens_running_state = new_num_computed - num_accepted + 1
+    else:
+        num_scheduled = tl.load(num_scheduled_ptr + req_idx).to(tl.int32)
+        num_computed = tl.load(num_computed_ptr + req_idx).to(tl.int32)
+        num_draft = tl.load(num_draft_ptr + req_idx).to(tl.int32)
+        is_decode = (num_draft > 0) | ((num_scheduled == 1) & (num_computed > 0))
+        if not is_decode:
+            return
+        num_tokens_running_state = num_computed + num_scheduled - num_draft
+        new_num_computed = num_tokens_running_state + num_accepted - 1
+
+    src_col = tl.load(state_col_ptr + req_idx).to(tl.int64)
+    if src_col < 0:
+        return
+    block_table_row = block_table_ptr + pid_b * stride_bt_batch
+    src_block = tl.load(block_table_row + src_col * stride_bt_col).to(tl.int64)
+    if src_block == null_block_id:
+        return
+
+    aligned_new_computed = (new_num_computed // MAMBA_BLOCK_SIZE) * MAMBA_BLOCK_SIZE
+    has_boundary = aligned_new_computed >= num_tokens_running_state
+    boundary_len = aligned_new_computed - num_tokens_running_state + 1
+    dest_col = aligned_new_computed // MAMBA_BLOCK_SIZE - 1
+    dest_block = tl.load(
+        block_table_row + dest_col * stride_bt_col,
+        mask=has_boundary,
+        other=null_block_id,
+    ).to(tl.int64)
+    store_boundary = (
+        has_boundary & (dest_block != null_block_id) & (dest_block != src_block)
+    )
+
+    offs_mn = pid_mn * BLOCK_SIZE_MN + tl.arange(0, BLOCK_SIZE_MN)
+    state_mask = offs_mn < dim * dstate
+    offs_m = offs_mn // dstate
+    offs_n = offs_mn - offs_m * dstate
+    state_offsets = (
+        pid_h * stride_state_head
+        + offs_m * stride_state_dim
+        + offs_n * stride_state_dstate
+    )
+    state = tl.load(
+        state_ptr + src_block * stride_state_batch + state_offsets,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    A = tl.load(A_ptr + pid_h * stride_A_head).to(tl.float32)
+    dt_bias = tl.load(dt_bias_ptr + pid_h * stride_dt_bias_head).to(tl.float32)
+    group = pid_h // nheads_ngroups_ratio
+
+    for token_idx in tl.static_range(MAX_SPEC_LEN):
+        token_valid = token_idx < num_accepted
+        dt = tl.load(
+            dt_cache_ptr
+            + src_block * stride_dt_batch
+            + pid_h * stride_dt_head
+            + token_idx * stride_dt_pos,
+            mask=token_valid,
+            other=0.0,
+        ).to(tl.float32)
+        dt += dt_bias
+        if DT_SOFTPLUS:
+            dt = tl.where(dt <= 20.0, softplus(dt), dt)
+        x = tl.load(
+            post_conv_cache_ptr
+            + src_block * stride_post_batch
+            + token_idx * stride_post_pos
+            + (pid_h * dim + offs_m) * stride_post_channel,
+            mask=token_valid & state_mask,
+            other=0.0,
+        ).to(tl.float32)
+        B = tl.load(
+            post_conv_cache_ptr
+            + src_block * stride_post_batch
+            + token_idx * stride_post_pos
+            + (d_inner + group * dstate + offs_n) * stride_post_channel,
+            mask=token_valid & state_mask,
+            other=0.0,
+        ).to(tl.float32)
+        updated = state * tl.exp(tl.minimum(A * dt, 0.0)) + x * (dt * B)
+        state = tl.where(token_valid, updated, state)
+        tl.store(
+            state_ptr + dest_block * stride_state_batch + state_offsets,
+            state,
+            mask=(state_mask & store_boundary & (boundary_len == token_idx + 1)),
+        )
+
+    tl.store(
+        state_ptr + src_block * stride_state_batch + state_offsets,
+        state,
+        mask=state_mask,
+    )
+
+
+def materialize_replayssm_spec_state(
+    state_checkpoint: torch.Tensor,
+    post_conv_cache: torch.Tensor,
+    dt_cache: torch.Tensor,
+    A: torch.Tensor,
+    dt_bias: torch.Tensor,
+    block_table: torch.Tensor,
+    state_cols: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    num_scheduled_tokens: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    *,
+    mamba_block_size: int,
+    max_spec_len: int,
+    dt_softplus: bool = True,
+    null_block_id: int = NULL_BLOCK_ID,
+    idx_mapping: torch.Tensor | None = None,
+    precomputed_new_num_computed: bool = False,
+) -> None:
+    """Materialize accepted and block-aligned states after verification."""
+    num_blocks, nheads, dim, dstate = state_checkpoint.shape
+    cache_blocks, cache_buf_len, cache_conv_dim = post_conv_cache.shape
+    assert cache_blocks == num_blocks
+    assert dt_cache.shape == (num_blocks, nheads, cache_buf_len)
+    assert A.shape == (nheads,)
+    assert dt_bias.shape == (nheads,)
+    assert max_spec_len <= cache_buf_len
+    assert max_spec_len <= mamba_block_size
+    d_inner = nheads * dim
+    assert cache_conv_dim > d_inner
+    assert (cache_conv_dim - d_inner) % dstate == 0
+    ngroups = (cache_conv_dim - d_inner) // dstate
+    assert nheads % ngroups == 0
+    num_req_slots = num_accepted_tokens.shape[0]
+    assert state_cols.shape[0] >= num_req_slots
+    assert num_scheduled_tokens.shape[0] >= num_req_slots
+    assert num_computed_tokens.shape[0] >= num_req_slots
+    assert num_draft_tokens.shape[0] >= num_req_slots
+    batch = num_req_slots if idx_mapping is None else idx_mapping.shape[0]
+    assert block_table.shape[0] >= batch
+
+    block_mn = 256
+    grid = (batch, nheads, triton.cdiv(dim * dstate, block_mn))
+    with torch.accelerator.device_index(state_checkpoint.device.index):
+        _materialize_replayssm_spec_state_kernel[grid](
+            state_checkpoint,
+            post_conv_cache,
+            dt_cache,
+            A,
+            dt_bias,
+            block_table,
+            state_cols,
+            num_accepted_tokens,
+            num_scheduled_tokens,
+            num_computed_tokens,
+            num_draft_tokens,
+            idx_mapping,
+            null_block_id,
+            batch,
+            nheads,
+            dim,
+            dstate,
+            d_inner,
+            nheads // ngroups,
+            state_checkpoint.stride(0),
+            state_checkpoint.stride(1),
+            state_checkpoint.stride(2),
+            state_checkpoint.stride(3),
+            post_conv_cache.stride(0),
+            post_conv_cache.stride(1),
+            post_conv_cache.stride(2),
+            dt_cache.stride(0),
+            dt_cache.stride(1),
+            dt_cache.stride(2),
+            A.stride(0),
+            dt_bias.stride(0),
+            block_table.stride(0),
+            block_table.stride(1),
+            BLOCK_SIZE_MN=block_mn,
+            MAX_SPEC_LEN=max_spec_len,
+            MAMBA_BLOCK_SIZE=mamba_block_size,
+            DT_SOFTPLUS=dt_softplus,
+            HAS_IDX_MAPPING=idx_mapping is not None,
+            PRECOMPUTED_NEW_COMPUTED=precomputed_new_num_computed,
+            num_warps=4,
+        )
+
+
+@triton.jit
 def _advance_write_pos_origin_kernel(
     write_pos_ptr,
     post_origin_ptr,
@@ -1156,6 +1399,7 @@ def reset_replayssm_spec_cursors(
 
 
 __all__ = [
+    "materialize_replayssm_spec_state",
     "selective_state_update_replayssm_spec",
     "commit_replayssm_spec",
     "reset_replayssm_spec_cursors",

@@ -1056,7 +1056,7 @@ class GPUModelRunner(
             self._mamba_bufs = mamba_utils.MambaBuffers.create(
                 max_num_reqs=self.max_num_reqs,
                 kv_cache_config=self.kv_cache_config,
-                copy_funcs=self.model.get_mamba_state_copy_func(),
+                copy_funcs=self._get_mamba_state_copy_funcs(),
                 make_buffer=self._make_buffer,
                 device=self.device,
                 with_postprocess_align=(
@@ -1064,6 +1064,16 @@ class GPUModelRunner(
                 ),
             )
         return self._mamba_bufs
+
+    def _get_mamba_state_copy_funcs(self):
+        copy_funcs = self.model.get_mamba_state_copy_func()
+        if not self.cache_config.use_replayssm_spec:
+            return copy_funcs
+        assert len(copy_funcs) == 2
+        return (
+            copy_funcs[0],
+            mamba_utils.get_replayssm_spec_temporal_copy_spec,
+        )
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -1594,7 +1604,7 @@ class GPUModelRunner(
                 input_batch=self.input_batch,
                 kv_cache_config=self.kv_cache_config,
                 forward_context=self.compilation_config.static_forward_context,
-                mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
+                mamba_state_copy_funcs=self._get_mamba_state_copy_funcs(),
             )
 
             assert self.num_accepted_tokens_event is not None
@@ -4336,7 +4346,7 @@ class GPUModelRunner(
                     self.input_batch,
                     self.requests,
                     self.compilation_config.static_forward_context,
-                    self.model.get_mamba_state_copy_func(),
+                    self._get_mamba_state_copy_funcs(),
                     mamba_bufs.preprocess,
                 )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1

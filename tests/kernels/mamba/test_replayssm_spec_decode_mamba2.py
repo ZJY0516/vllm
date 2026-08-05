@@ -40,6 +40,7 @@ EXPECTED gap that is bounded per step and non-accumulating across the decode.
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import selective_state_update
 from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_output_only import (  # noqa: E501
@@ -47,6 +48,7 @@ from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_outpu
 )
 from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_spec import (  # noqa: E501
     commit_replayssm_spec,
+    materialize_replayssm_spec_state,
     reset_replayssm_spec_cursors,
     selective_state_update_replayssm_spec,
 )
@@ -121,6 +123,161 @@ def _pack_window_conv_out(
     conv_out[:, d_inner : d_inner + G * N] = B_w.reshape(S, G * N)
     conv_out[:, d_inner + G * N :] = C_w.reshape(S, G * N)
     return conv_out
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
+@pytest.mark.parametrize(
+    ("num_computed", "num_accepted", "boundary_len"),
+    [(8, 3, None), (6, 3, 2), (5, 3, 3)],
+)
+@pytest.mark.parametrize("precomputed_with_idx_mapping", [False, True])
+def test_materialize_accepted_and_boundary_states(
+    num_computed: int,
+    num_accepted: int,
+    boundary_len: int | None,
+    precomputed_with_idx_mapping: bool,
+):
+    """Materialization writes the final and optional block-boundary states."""
+    set_random_seed(0)
+    H, P, N, G = 2, 4, 16, 1
+    d_inner = H * P
+    max_spec_len = 4
+    mamba_block_size = 8
+    _, cache_buf_len = _lbt(max_spec_len, max_spec_len)
+
+    A_scalar = -torch.rand(H, device=DEV) - 1.0
+    A = A_scalar[:, None, None].expand(H, P, N)
+    dt_bias = torch.rand(H, device=DEV) - 2.0
+    x = torch.randn(max_spec_len, H, P, device=DEV)
+    dt = torch.randn(max_spec_len, H, device=DEV)
+    B = torch.randn(max_spec_len, G, N, device=DEV)
+    C = torch.randn(max_spec_len, G, N, device=DEV)
+
+    num_blocks = 5
+    block_table = torch.tensor([[1, 2, 3]], dtype=torch.int32, device=DEV)
+    src_col = 1
+    src_block = int(block_table[0, src_col].item())
+    dest_block = int(block_table[0, 0].item())
+    state = torch.randn(num_blocks, H, P, N, device=DEV) * 0.1
+    state_before = state.clone()
+    post_conv_cache = torch.zeros(
+        num_blocks,
+        cache_buf_len,
+        d_inner + G * N,
+        device=DEV,
+    )
+    dt_cache = torch.zeros(
+        num_blocks, H, cache_buf_len, device=DEV, dtype=torch.float32
+    )
+
+    conv_out = _pack_window_conv_out(x, B, C, d_inner, G, N, torch.float32)
+    selective_state_update_replayssm_spec(
+        state,
+        post_conv_cache,
+        dt_cache,
+        conv_out,
+        dt,
+        A,
+        write_pos=torch.zeros(num_blocks, dtype=torch.int32, device=DEV),
+        post_conv_state_pos=torch.zeros(num_blocks, dtype=torch.int32, device=DEV),
+        is_flush=torch.zeros(num_blocks, dtype=torch.int8, device=DEV),
+        query_start_loc=torch.tensor([0, max_spec_len], dtype=torch.int32, device=DEV),
+        state_batch_indices=torch.tensor([src_block], dtype=torch.int32, device=DEV),
+        max_cache_len=2 * max_spec_len,
+        max_spec_len=max_spec_len,
+        d_inner=d_inner,
+        ngroups=G,
+        dstate=N,
+        dt_bias=dt_bias,
+        out=torch.empty(max_spec_len, H, P, device=DEV),
+    )
+    torch.testing.assert_close(state, state_before, rtol=0, atol=0)
+
+    expected_states = []
+    expected = state_before[src_block].float()
+    heads_per_group = H // G
+    for token_idx in range(num_accepted):
+        dt_token = F.softplus(dt[token_idx].float() + dt_bias)
+        B_token = B[token_idx].repeat_interleave(heads_per_group, dim=0)
+        expected = expected * torch.exp(
+            A_scalar[:, None, None] * dt_token[:, None, None]
+        ) + x[token_idx, :, :, None] * (dt_token[:, None, None] * B_token[:, None, :])
+        expected_states.append(expected.clone())
+
+    num_req_slots = 3 if precomputed_with_idx_mapping else 1
+    req_slot = 2 if precomputed_with_idx_mapping else 0
+    state_cols = torch.zeros(num_req_slots, dtype=torch.int32, device=DEV)
+    accepted = torch.ones(num_req_slots, dtype=torch.int32, device=DEV)
+    scheduled = torch.ones(num_req_slots, dtype=torch.int32, device=DEV)
+    computed = torch.zeros(num_req_slots, dtype=torch.int32, device=DEV)
+    draft = torch.zeros(num_req_slots, dtype=torch.int32, device=DEV)
+    state_cols[req_slot] = src_col
+    accepted[req_slot] = num_accepted
+    if precomputed_with_idx_mapping:
+        computed[req_slot] = num_computed + num_accepted
+        idx_mapping = torch.tensor([req_slot], dtype=torch.int32, device=DEV)
+    else:
+        scheduled[req_slot] = max_spec_len
+        computed[req_slot] = num_computed
+        draft[req_slot] = max_spec_len - 1
+        idx_mapping = None
+
+    materialize_replayssm_spec_state(
+        state,
+        post_conv_cache,
+        dt_cache,
+        A_scalar,
+        dt_bias,
+        block_table,
+        state_cols,
+        accepted,
+        scheduled,
+        computed,
+        draft,
+        mamba_block_size=mamba_block_size,
+        max_spec_len=max_spec_len,
+        idx_mapping=idx_mapping,
+        precomputed_new_num_computed=precomputed_with_idx_mapping,
+    )
+
+    torch.testing.assert_close(
+        state[src_block], expected_states[-1], rtol=1e-5, atol=1e-5
+    )
+    if boundary_len is None:
+        torch.testing.assert_close(
+            state[dest_block], state_before[dest_block], rtol=0, atol=0
+        )
+    else:
+        torch.testing.assert_close(
+            state[dest_block],
+            expected_states[boundary_len - 1],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
+def test_materialize_skips_prefill_rows():
+    H, P, N, G = 2, 4, 16, 1
+    max_spec_len = 4
+    state = torch.randn(3, H, P, N, device=DEV)
+    state_before = state.clone()
+    materialize_replayssm_spec_state(
+        state,
+        torch.randn(3, 8, H * P + G * N, device=DEV),
+        torch.randn(3, H, 8, device=DEV),
+        -torch.ones(H, device=DEV),
+        torch.zeros(H, device=DEV),
+        torch.tensor([[0, 1]], dtype=torch.int32, device=DEV),
+        torch.tensor([1], dtype=torch.int32, device=DEV),
+        torch.ones(1, dtype=torch.int32, device=DEV),
+        torch.full((1,), max_spec_len, dtype=torch.int32, device=DEV),
+        torch.zeros(1, dtype=torch.int32, device=DEV),
+        torch.zeros(1, dtype=torch.int32, device=DEV),
+        mamba_block_size=8,
+        max_spec_len=max_spec_len,
+    )
+    torch.testing.assert_close(state, state_before, rtol=0, atol=0)
 
 
 def _standard_window_oracle(
