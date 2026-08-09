@@ -27,6 +27,9 @@ from vllm.lora.layers import LoRAMappingType
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_spec import (  # noqa: E501
+    commit_replayssm_spec,
+)
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
@@ -653,11 +656,17 @@ def test_update_states_request_unscheduled(model_runner, dist_init):
     assert not _is_req_scheduled(model_runner, req_ids[1])
 
 
-def test_replayssm_request_unscheduled_preserves_deferred_state(
+def test_replayssm_unscheduled_request_commits_pending_acceptance_on_resume(
     model_runner, dist_init
 ):
-    """A cache-resident request must keep its ring anchor and pending
-    acceptance while it is temporarily outside the persistent batch."""
+    """Keep pending acceptance across temporary persistent-batch removal.
+
+    ReplaySSM defers cursor advancement until the next model step. The physical
+    cache block survives temporary unscheduling, but the accepted-token count is
+    tied to the persistent-batch row. When the request returns in a different
+    row, its block cursor must still advance by the acceptance from its previous
+    verify step.
+    """
     req_ids = ("req_0", "req_1")
     model_runner.use_async_scheduling = True
     model_runner.cache_config.use_replayssm_spec = True
@@ -669,10 +678,13 @@ def test_replayssm_request_unscheduled_preserves_deferred_state(
     model_runner.requests[req_id].output_token_ids.append(99)
     model_runner.input_batch.num_computed_tokens_cpu[req_index] = 4
     model_runner.input_batch.replayssm_decode_base[req_index] = 3
+    # The previous verify step accepted three tokens for req_1 in row 1.
     model_runner.num_accepted_tokens.gpu[req_index] = 3
     accepted_tokens_event = Mock()
     model_runner.num_accepted_tokens_event = accepted_tokens_event
 
+    # Temporarily omit req_1 without preempting it, so its physical cache block
+    # remains allocated while its persistent-batch row is removed.
     model_runner._update_states(
         SchedulerOutput(
             scheduled_new_reqs=[],
@@ -687,9 +699,6 @@ def test_replayssm_request_unscheduled_preserves_deferred_state(
         )
     )
 
-    decode_base, deferred = model_runner._replayssm_spec_deferred_state[req_id]
-    assert decode_base == 3
-    assert deferred.item() == 3
     accepted_tokens_event.synchronize.assert_not_called()
 
     resume_output = _schedule_cached_requests(
@@ -703,11 +712,28 @@ def test_replayssm_request_unscheduled_preserves_deferred_state(
     model_runner._update_states(resume_output)
 
     req_index = model_runner.input_batch.req_id_to_index[req_id]
+    assert req_index == 0  # The request moved from persistent-batch row 1.
+    # Re-adding a request initializes its new row to the default acceptance of
+    # one. Restore must replace it with the pending value from the old row.
     model_runner.num_accepted_tokens.gpu[req_index] = 1
     model_runner._restore_replayssm_spec_deferred_state()
-    assert model_runner.input_batch.replayssm_decode_base[req_index] == 3
-    assert model_runner.num_accepted_tokens.gpu[req_index].item() == 3
-    assert req_id not in model_runner._replayssm_spec_deferred_state
+
+    # Exercise the actual ReplaySSM cursor kernel. Merely skipping req_1 while
+    # it was non-live would leave this cursor at one if acceptance were lost.
+    write_pos = torch.zeros(2, dtype=torch.int32, device=model_runner.device)
+    post_origin = torch.zeros_like(write_pos)
+    is_flush = torch.zeros(2, dtype=torch.int8, device=model_runner.device)
+    commit_replayssm_spec(
+        write_pos,
+        post_origin,
+        is_flush,
+        model_runner.num_accepted_tokens.gpu[req_index : req_index + 1],
+        torch.tensor([1], dtype=torch.int32, device=model_runner.device),
+        max_cache_len=20,
+        spec_query_len=4,
+    )
+
+    assert write_pos.tolist() == [0, 3]
 
 
 def test_replayssm_preemption_discards_deferred_state(model_runner, dist_init):
