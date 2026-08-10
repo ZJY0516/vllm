@@ -379,6 +379,7 @@ hyperframe==6.1.0
     # via h2
 hypothesis==6.131.0
     # via
+    #   -r requirements/test/cuda.in
     #   hypothesis-graphql
     #   hypothesis-jsonschema
     #   schemathesis

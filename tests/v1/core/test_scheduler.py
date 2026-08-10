@@ -28,6 +28,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
@@ -2444,6 +2445,7 @@ def create_scheduler_with_priority(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
+    async_scheduling: bool = False,
 ) -> Scheduler:
     """Create scheduler with priority policy enabled.
 
@@ -2475,6 +2477,7 @@ def create_scheduler_with_priority(
         enable_chunked_prefill=True,
         is_encoder_decoder=model_config.is_encoder_decoder,
         policy="priority",  # Enable priority scheduling
+        async_scheduling=async_scheduling,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
     )
@@ -2535,7 +2538,8 @@ def create_scheduler_with_priority(
         ],
     )
     cache_config.num_gpu_blocks = num_blocks
-    scheduler = Scheduler(
+    scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
+    scheduler = scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         log_stats=True,
