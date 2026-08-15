@@ -4,6 +4,7 @@ members = [
     "src/chat",
     "src/cmd",
     "src/engine-core-client",
+    "src/kv-cache/python",
     "src/llm",
     "src/managed-engine",
     "src/metrics",

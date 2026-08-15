@@ -349,6 +349,78 @@ def test_prefill(hash_fn):
     )
 
 
+def test_rust_full_attention_manager_matches_public_prefix_cache_contract():
+    pytest.importorskip("vllm._rust_kv_cache")
+    from vllm.v1.core.rust_kv_cache_manager import (
+        RustFullAttentionKVCacheManager,
+    )
+
+    block_size = 16
+    manager = RustFullAttentionKVCacheManager(
+        make_kv_cache_config(block_size, 256),
+        max_model_len=4096,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    )
+    producer = make_request("producer", list(range(1600)), block_size, sha256)
+    assert manager.allocate_slots(producer, producer.num_tokens) is not None
+    manager.free(producer)
+
+    consumer = make_request("consumer", list(range(2048)), block_size, sha256)
+    computed, num_computed_tokens, shared_prefix_boundary = manager.get_computed_blocks(
+        consumer
+    )
+    assert num_computed_tokens == 1600
+    assert shared_prefix_boundary == 0
+    assert len(computed.get_block_ids()[0]) == 100
+
+    new_blocks = manager.allocate_slots(
+        consumer,
+        consumer.num_tokens - num_computed_tokens,
+        num_new_computed_tokens=num_computed_tokens,
+        new_computed_blocks=computed,
+    )
+    assert new_blocks is not None
+    assert len(new_blocks.get_block_ids()[0]) == 28
+    assert len(manager.get_block_ids("consumer")[0]) == 128
+    assert manager.estimate_cached_tokens(consumer) == 2048
+
+    manager.free(consumer)
+    assert manager.usage == 0
+    assert manager.reset_prefix_cache()
+
+
+def test_rust_manager_long_context_operations_are_faster_than_python():
+    pytest.importorskip("vllm._rust_kv_cache")
+    from benchmarks.benchmark_kv_cache_manager import run_scenario
+
+    scenario = dict(
+        cache_type="full",
+        prompt_tokens=100_000,
+        hit_rate=1.0,
+        block_size=16,
+        sliding_window=4096,
+        warmups=5,
+        iterations=31,
+    )
+    python_results = {
+        result.operation: result
+        for result in run_scenario(manager_backend="python", **scenario)
+    }
+    rust_results = {
+        result.operation: result
+        for result in run_scenario(manager_backend="rust", **scenario)
+    }
+
+    assert rust_results.keys() == python_results.keys()
+    for operation, python_result in python_results.items():
+        rust_result = rust_results[operation]
+        assert rust_result.median_us < python_result.median_us, (
+            f"{operation}: Rust median {rust_result.median_us:.3f} us is not "
+            f"faster than Python median {python_result.median_us:.3f} us"
+        )
+
+
 def test_prefill_hybrid_model():
     block_size = 16
     manager = make_kv_cache_manager(

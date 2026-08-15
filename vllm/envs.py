@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     V_SCALE_CONSTANT: int = 100
     VLLM_USE_RUST_FRONTEND: bool = False
     VLLM_USE_RUST_BENCH: bool = False
+    VLLM_USE_RUST_KV_CACHE_MANAGER: bool = False
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
@@ -1412,6 +1413,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, use the packaged Rust client for `vllm bench serve`.
     "VLLM_USE_RUST_BENCH": lambda: bool(int(os.getenv("VLLM_USE_RUST_BENCH", "0"))),
+    # Use the self-contained Rust KV cache manager for supported models.
+    "VLLM_USE_RUST_KV_CACHE_MANAGER": lambda: bool(
+        int(os.getenv("VLLM_USE_RUST_KV_CACHE_MANAGER", "0"))
+    ),
     # Path to the vllm-rs binary. Defaults to "auto" which discovers the
     # binary installed with the vllm package. Used when VLLM_USE_RUST_FRONTEND=1
     # or VLLM_USE_RUST_BENCH=1.

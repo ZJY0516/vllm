@@ -1,0 +1,16 @@
+[package]
+name = "vllm-kv-cache-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "_rust_kv_cache"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3.workspace = true
+rustc-hash.workspace = true
+
+[lints]
+workspace = true

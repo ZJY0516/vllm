@@ -33,6 +33,14 @@ def rust_extensions(*, optional: bool = False) -> list[RustExtension]:
             optional=optional,
             py_limited_api=True,
         ),
+        RustExtension(
+            target="vllm._rust_kv_cache",
+            path="rust/src/kv-cache/python/Cargo.toml",
+            # The limited ABI adds a checked C-API call per block iteration,
+            # which dominates long-prefix metadata operations.
+            binding=Binding.PyO3,
+            optional=optional,
+        ),
     ]
 
 
