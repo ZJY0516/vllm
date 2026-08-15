@@ -10,46 +10,38 @@ use crate::block_pool::{BlockPool, CacheKey};
 
 #[derive(Default)]
 struct RequestState {
-    full_blocks: Vec<u32>,
-    mamba_blocks: Vec<u32>,
-    full_cached_blocks: usize,
-    mamba_cached_blocks: usize,
-    mamba_allocated: bool,
-    last_state_block_idx: Option<usize>,
+    blocks: Vec<Vec<u32>>,
+    cached_blocks: Vec<usize>,
+    mamba_allocated: Vec<bool>,
+    last_state_block_idx: Vec<Option<usize>>,
 }
 
-/// Owns a shared block pool and request tables for one FullAttention/Mamba pair.
+/// Owns a shared block pool and request tables for FullAttention/Mamba groups.
 #[pyclass(module = "vllm._rust_kv_cache")]
 pub(crate) struct HybridMambaKVCacheManager {
     block_size: usize,
     enable_caching: bool,
-    full_group_id: usize,
-    mamba_group_id: usize,
+    group_is_mamba: Vec<bool>,
     pool: BlockPool,
     requests: FxHashMap<String, RequestState>,
     mamba_cached_this_step: FxHashSet<CacheKey>,
-    new_full_block_ids: Vec<u32>,
+    new_attention_block_ids: Vec<u32>,
 }
 
 impl HybridMambaKVCacheManager {
-    fn split_groups<'a, T>(&self, groups: &'a [Vec<T>]) -> PyResult<(&'a [T], &'a [T])> {
-        if groups.len() != 2 {
+    fn validate_groups<T>(&self, groups: &[Vec<T>]) -> PyResult<()> {
+        if groups.len() != self.group_is_mamba.len() {
             return Err(PyValueError::new_err(format!(
-                "the hybrid manager requires two block groups, got {}",
-                groups.len()
+                "the hybrid manager requires {} block groups, got {}",
+                self.group_is_mamba.len(),
+                groups.len(),
             )));
         }
-        Ok((
-            groups[self.full_group_id].as_slice(),
-            groups[self.mamba_group_id].as_slice(),
-        ))
+        Ok(())
     }
 
-    fn order_groups<T>(&self, full: Vec<T>, mamba: Vec<T>) -> Vec<Vec<T>> {
-        let mut groups = vec![Vec::new(), Vec::new()];
-        groups[self.full_group_id] = full;
-        groups[self.mamba_group_id] = mamba;
-        groups
+    fn empty_groups<T>(&self) -> Vec<Vec<T>> {
+        (0..self.group_is_mamba.len()).map(|_| Vec::new()).collect()
     }
 
     fn check_hash_count(&self, num_hashes: usize, num_tokens: usize) -> PyResult<()> {
@@ -70,7 +62,7 @@ impl HybridMambaKVCacheManager {
         num_tokens_main_model: usize,
         computed_groups: &[Vec<u32>],
     ) -> PyResult<usize> {
-        let (computed_full, computed_mamba) = self.split_groups(computed_groups)?;
+        self.validate_groups(computed_groups)?;
         let full_required = num_tokens.div_ceil(self.block_size);
         let mamba_required = num_tokens_main_model.div_ceil(self.block_size);
         if let Some(state) = self.requests.get(request_id) {
@@ -79,41 +71,66 @@ impl HybridMambaKVCacheManager {
                     "a running request cannot add prefix-cache hits",
                 ));
             }
-            let full_new = full_required.saturating_sub(state.full_blocks.len());
-            let mamba_new = usize::from(mamba_required > state.mamba_blocks.len());
-            return Ok(full_new + mamba_new);
+            return Ok(state
+                .blocks
+                .iter()
+                .zip(&self.group_is_mamba)
+                .map(|(blocks, &is_mamba)| {
+                    if is_mamba {
+                        usize::from(mamba_required > blocks.len())
+                    } else {
+                        full_required.saturating_sub(blocks.len())
+                    }
+                })
+                .sum());
         }
 
-        if let Some(&block_id) = computed_mamba.iter().rfind(|&&block_id| block_id != 0)
-            && let Some(cache_key) = self.pool.cache_key(block_id)
-            && self.mamba_cached_this_step.contains(cache_key)
-        {
-            return Ok(self.pool.num_blocks() + 1);
+        for (group_id, blocks) in computed_groups.iter().enumerate() {
+            if self.group_is_mamba[group_id]
+                && let Some(&block_id) = blocks.iter().rfind(|&&block_id| block_id != 0)
+                && let Some(cache_key) = self.pool.cache_key(block_id)
+                && self.mamba_cached_this_step.contains(cache_key)
+            {
+                return Ok(self.pool.num_blocks() + 1);
+            }
         }
 
-        let full_new = full_required.saturating_sub(computed_full.len());
-        let mamba_new = usize::from(mamba_required > computed_mamba.len());
-        Ok(full_new
-            + mamba_new
-            + self.pool.count_evictable(computed_full)?
-            + self.pool.count_evictable(computed_mamba)?)
+        let mut blocks_to_allocate = 0;
+        for (group_id, blocks) in computed_groups.iter().enumerate() {
+            blocks_to_allocate += if self.group_is_mamba[group_id] {
+                usize::from(mamba_required > blocks.len())
+            } else {
+                full_required.saturating_sub(blocks.len())
+            };
+            blocks_to_allocate += self.pool.count_evictable(blocks)?;
+        }
+        Ok(blocks_to_allocate)
     }
 
     fn remove_skipped(&mut self, request_id: &str, processed_tokens: usize) -> PyResult<()> {
         let Some(state) = self.requests.get_mut(request_id) else {
             return Ok(());
         };
-        let Some(block_idx) = state.last_state_block_idx else {
-            return Ok(());
-        };
         let first_required_block = processed_tokens.div_ceil(self.block_size).saturating_sub(1);
-        if block_idx >= first_required_block || block_idx >= state.mamba_blocks.len() {
-            return Ok(());
+        let mut released = Vec::new();
+        for group_id in 0..self.group_is_mamba.len() {
+            if !self.group_is_mamba[group_id] {
+                continue;
+            }
+            let Some(block_idx) = state.last_state_block_idx[group_id] else {
+                continue;
+            };
+            if block_idx >= first_required_block || block_idx >= state.blocks[group_id].len() {
+                continue;
+            }
+            let block_id = state.blocks[group_id][block_idx];
+            if block_id != 0 {
+                state.blocks[group_id][block_idx] = 0;
+                released.push(block_id);
+            }
         }
-        let block_id = state.mamba_blocks[block_idx];
-        if block_id != 0 {
-            state.mamba_blocks[block_idx] = 0;
-            self.pool.release(std::iter::once(block_id))?;
+        if !released.is_empty() {
+            self.pool.release(released.into_iter())?;
         }
         Ok(())
     }
@@ -127,37 +144,42 @@ impl HybridMambaKVCacheManager {
         let full_required = num_tokens.div_ceil(self.block_size);
         let mamba_required = num_tokens_main_model.div_ceil(self.block_size);
 
-        let full_current = self.requests[request_id].full_blocks.len();
-        let mut new_full = Vec::with_capacity(full_required.saturating_sub(full_current));
-        for _ in full_current..full_required {
-            new_full.push(self.pool.allocate()?);
-        }
-        self.new_full_block_ids.extend_from_slice(&new_full);
-        self.requests
-            .get_mut(request_id)
-            .expect("request state exists")
-            .full_blocks
-            .extend_from_slice(&new_full);
-
-        let state = self.requests.get_mut(request_id).expect("request state exists");
-        if mamba_required <= state.mamba_blocks.len() {
-            state.mamba_allocated = true;
-            return Ok(self.order_groups(new_full, Vec::new()));
+        let mut new_groups = self.empty_groups();
+        for group_id in 0..self.group_is_mamba.len() {
+            if self.group_is_mamba[group_id] {
+                continue;
+            }
+            let current = self.requests[request_id].blocks[group_id].len();
+            let new_blocks = &mut new_groups[group_id];
+            new_blocks.reserve(full_required.saturating_sub(current));
+            for _ in current..full_required {
+                new_blocks.push(self.pool.allocate()?);
+            }
+            self.new_attention_block_ids.extend_from_slice(new_blocks);
+            self.requests.get_mut(request_id).expect("request state exists").blocks[group_id]
+                .extend_from_slice(new_blocks);
         }
 
-        let previous_len = state.mamba_blocks.len();
-        if state.mamba_allocated {
-            state.last_state_block_idx = previous_len.checked_sub(1);
-        } else if previous_len > 0 {
-            state.last_state_block_idx = Some(previous_len - 1);
+        for group_id in 0..self.group_is_mamba.len() {
+            if !self.group_is_mamba[group_id] {
+                continue;
+            }
+            let state = self.requests.get_mut(request_id).expect("request state exists");
+            if mamba_required <= state.blocks[group_id].len() {
+                state.mamba_allocated[group_id] = true;
+                continue;
+            }
+            let previous_len = state.blocks[group_id].len();
+            if state.mamba_allocated[group_id] || previous_len > 0 {
+                state.last_state_block_idx[group_id] = previous_len.checked_sub(1);
+            }
+            state.blocks[group_id].resize(mamba_required.saturating_sub(1), 0);
+            let new_mamba_block = self.pool.allocate()?;
+            state.blocks[group_id].push(new_mamba_block);
+            state.mamba_allocated[group_id] = true;
+            new_groups[group_id] = state.blocks[group_id][previous_len..].to_vec();
         }
-        let num_skipped_blocks = mamba_required.saturating_sub(1);
-        state.mamba_blocks.resize(num_skipped_blocks, 0);
-        let new_mamba_block = self.pool.allocate()?;
-        state.mamba_blocks.push(new_mamba_block);
-        state.mamba_allocated = true;
-        let returned_mamba = state.mamba_blocks[previous_len..].to_vec();
-        Ok(self.order_groups(new_full, returned_mamba))
+        Ok(new_groups)
     }
 
     fn cache_request_blocks(
@@ -171,50 +193,42 @@ impl HybridMambaKVCacheManager {
         }
         self.check_hash_count(block_hashes.len(), num_tokens)?;
         let num_full_blocks = num_tokens / self.block_size;
-        let state = self.requests.get(request_id).ok_or_else(|| {
-            PyKeyError::new_err(format!("request {request_id:?} has no allocated blocks"))
-        })?;
-        let full_start = state.full_cached_blocks;
-        let mamba_start = state.mamba_cached_blocks;
-        if full_start >= num_full_blocks && mamba_start >= num_full_blocks {
-            return Ok(());
-        }
-        if state.full_blocks.len() < num_full_blocks || state.mamba_blocks.len() < num_full_blocks {
-            return Err(PyAssertionError::new_err(format!(
-                "request {request_id:?} does not have {num_full_blocks} cacheable blocks"
-            )));
-        }
-        let full_blocks = if full_start < num_full_blocks {
-            state.full_blocks[full_start..num_full_blocks].to_vec()
-        } else {
-            Vec::new()
-        };
-        let mamba_blocks = if mamba_start < num_full_blocks {
-            state.mamba_blocks[mamba_start..num_full_blocks].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        for (index, block_id) in (full_start..).zip(full_blocks) {
-            let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
-            self.pool.cache(
-                block_id,
-                CacheKey::new(block_hash, self.full_group_id),
-                (index + 1) * self.block_size,
-            )?;
-        }
-        for (index, block_id) in (mamba_start..).zip(mamba_blocks) {
-            if block_id == 0 {
-                continue;
+        for group_id in 0..self.group_is_mamba.len() {
+            let (start, blocks) = {
+                let state = self.requests.get(request_id).ok_or_else(|| {
+                    PyKeyError::new_err(format!("request {request_id:?} has no allocated blocks"))
+                })?;
+                if state.blocks[group_id].len() < num_full_blocks {
+                    return Err(PyAssertionError::new_err(format!(
+                        "request {request_id:?} group {group_id} does not have \
+                         {num_full_blocks} cacheable blocks"
+                    )));
+                }
+                let start = state.cached_blocks[group_id];
+                if start >= num_full_blocks {
+                    continue;
+                }
+                (
+                    start,
+                    state.blocks[group_id][start..num_full_blocks].to_vec(),
+                )
+            };
+            for (index, block_id) in (start..).zip(blocks) {
+                if block_id == 0 {
+                    continue;
+                }
+                let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
+                let cache_key = CacheKey::new(block_hash, group_id);
+                self.pool.cache(block_id, cache_key.clone(), (index + 1) * self.block_size)?;
+                if self.group_is_mamba[group_id] {
+                    self.mamba_cached_this_step.insert(cache_key);
+                }
             }
-            let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
-            let cache_key = CacheKey::new(block_hash, self.mamba_group_id);
-            self.pool.cache(block_id, cache_key.clone(), (index + 1) * self.block_size)?;
-            self.mamba_cached_this_step.insert(cache_key);
+            let cached_blocks =
+                &mut self.requests.get_mut(request_id).expect("request state exists").cached_blocks
+                    [group_id];
+            *cached_blocks = (*cached_blocks).max(num_full_blocks);
         }
-        let state = self.requests.get_mut(request_id).expect("request state exists");
-        state.full_cached_blocks = state.full_cached_blocks.max(num_full_blocks);
-        state.mamba_cached_blocks = state.mamba_cached_blocks.max(num_full_blocks);
         Ok(())
     }
 
@@ -230,26 +244,27 @@ impl HybridMambaKVCacheManager {
         num_blocks: usize,
         block_size: usize,
         enable_caching: bool,
-        full_group_id: usize,
-        mamba_group_id: usize,
+        group_is_mamba: Vec<bool>,
     ) -> PyResult<Self> {
         if block_size == 0 {
             return Err(PyValueError::new_err("block_size must be positive"));
         }
-        if full_group_id > 1 || mamba_group_id > 1 || full_group_id == mamba_group_id {
+        if group_is_mamba.len() < 2
+            || !group_is_mamba.iter().any(|&is_mamba| is_mamba)
+            || !group_is_mamba.iter().any(|&is_mamba| !is_mamba)
+        {
             return Err(PyValueError::new_err(
-                "full_group_id and mamba_group_id must identify two distinct groups",
+                "group_is_mamba must identify at least one FullAttention and one Mamba group",
             ));
         }
         Ok(Self {
             block_size,
             enable_caching,
-            full_group_id,
-            mamba_group_id,
+            group_is_mamba,
             pool: BlockPool::new(num_blocks, enable_caching)?,
             requests: FxHashMap::default(),
             mamba_cached_this_step: FxHashSet::default(),
-            new_full_block_ids: Vec::new(),
+            new_attention_block_ids: Vec::new(),
         })
     }
 
@@ -259,37 +274,69 @@ impl HybridMambaKVCacheManager {
         max_cache_hit_length: usize,
     ) -> PyResult<(Vec<Vec<u32>>, usize, usize)> {
         if !self.enable_caching {
-            return Ok((self.order_groups(Vec::new(), Vec::new()), 0, 0));
+            return Ok((self.empty_groups(), 0, 0));
         }
         let max_blocks = (max_cache_hit_length / self.block_size).min(block_hashes.len()?);
-        let mut full_blocks = Vec::with_capacity(max_blocks);
+        let mut hit_groups = self.empty_groups();
         for index in 0..max_blocks {
             let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
-            let Some(block_id) = self.pool.find_cached(block_hash.clone(), self.full_group_id)
-            else {
+            let mut block_ids = Vec::new();
+            for (group_id, &is_mamba) in self.group_is_mamba.iter().enumerate() {
+                if is_mamba {
+                    continue;
+                }
+                let Some(block_id) = self.pool.find_cached(block_hash.clone(), group_id) else {
+                    block_ids.clear();
+                    break;
+                };
+                block_ids.push((group_id, block_id));
+            }
+            if block_ids.is_empty() {
                 break;
-            };
-            full_blocks.push(block_id);
-        }
-        let full_hit_tokens = full_blocks.len() * self.block_size;
-        for index in (0..full_blocks.len()).rev() {
-            let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
-            if let Some(block_id) = self.pool.find_cached(block_hash, self.mamba_group_id) {
-                full_blocks.truncate(index + 1);
-                let mut mamba_blocks = vec![0; index];
-                mamba_blocks.push(block_id);
-                return Ok((
-                    self.order_groups(full_blocks, mamba_blocks),
-                    (index + 1) * self.block_size,
-                    full_hit_tokens - (index + 1) * self.block_size,
-                ));
+            }
+            for (group_id, block_id) in block_ids {
+                hit_groups[group_id].push(block_id);
             }
         }
-        Ok((
-            self.order_groups(Vec::new(), Vec::new()),
-            0,
-            full_hit_tokens,
-        ))
+        let full_hit_blocks = self
+            .group_is_mamba
+            .iter()
+            .position(|&is_mamba| !is_mamba)
+            .map(|group_id| hit_groups[group_id].len())
+            .unwrap_or(0);
+        let full_hit_tokens = full_hit_blocks * self.block_size;
+        for index in (0..full_hit_blocks).rev() {
+            let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
+            let mut mamba_block_ids = Vec::new();
+            for (group_id, &is_mamba) in self.group_is_mamba.iter().enumerate() {
+                if !is_mamba {
+                    continue;
+                }
+                let Some(block_id) = self.pool.find_cached(block_hash.clone(), group_id) else {
+                    mamba_block_ids.clear();
+                    break;
+                };
+                mamba_block_ids.push((group_id, block_id));
+            }
+            if mamba_block_ids.is_empty() {
+                continue;
+            }
+            for (group_id, blocks) in hit_groups.iter_mut().enumerate() {
+                if !self.group_is_mamba[group_id] {
+                    blocks.truncate(index + 1);
+                }
+            }
+            for (group_id, block_id) in mamba_block_ids {
+                hit_groups[group_id] = vec![0; index];
+                hit_groups[group_id].push(block_id);
+            }
+            return Ok((
+                hit_groups,
+                (index + 1) * self.block_size,
+                full_hit_tokens - (index + 1) * self.block_size,
+            ));
+        }
+        Ok((self.empty_groups(), 0, full_hit_tokens))
     }
 
     #[pyo3(signature = (
@@ -343,15 +390,16 @@ impl HybridMambaKVCacheManager {
         }
 
         if !self.requests.contains_key(request_id) {
-            let (computed_full, computed_mamba) = self.split_groups(&computed_groups)?;
-            self.pool.touch(computed_full)?;
-            self.pool.touch(computed_mamba)?;
+            self.validate_groups(&computed_groups)?;
+            for blocks in &computed_groups {
+                self.pool.touch(blocks)?;
+            }
+            let group_count = self.group_is_mamba.len();
             let state = RequestState {
-                full_blocks: computed_full.to_vec(),
-                mamba_blocks: computed_mamba.to_vec(),
-                full_cached_blocks: computed_full.len(),
-                mamba_cached_blocks: computed_mamba.len(),
-                ..RequestState::default()
+                cached_blocks: computed_groups.iter().map(Vec::len).collect(),
+                blocks: computed_groups,
+                mamba_allocated: vec![false; group_count],
+                last_state_block_idx: vec![None; group_count],
             };
             self.requests.insert(request_id.to_owned(), state);
         }
@@ -383,20 +431,17 @@ impl HybridMambaKVCacheManager {
         let Some(state) = self.requests.remove(request_id) else {
             return Ok(());
         };
-        if self.full_group_id < self.mamba_group_id {
-            self.pool.release(state.full_blocks.into_iter().rev())?;
-            self.pool.release(state.mamba_blocks.into_iter().rev())
-        } else {
-            self.pool.release(state.mamba_blocks.into_iter().rev())?;
-            self.pool.release(state.full_blocks.into_iter().rev())
+        for blocks in state.blocks {
+            self.pool.release(blocks.into_iter().rev())?;
         }
+        Ok(())
     }
 
     fn get_block_ids(&self, request_id: &str) -> Vec<Vec<u32>> {
         let Some(state) = self.get_request(request_id) else {
-            return self.order_groups(Vec::new(), Vec::new());
+            return self.empty_groups();
         };
-        self.order_groups(state.full_blocks.clone(), state.mamba_blocks.clone())
+        state.blocks.clone()
     }
 
     fn get_num_blocks_to_allocate(
@@ -419,32 +464,40 @@ impl HybridMambaKVCacheManager {
             PyKeyError::new_err(format!("request {running_request_id:?} has no blocks"))
         })?;
         let request_count = self.requests.len() as u32;
-        let full_common = state
-            .full_blocks
+        Ok(state
+            .blocks
             .iter()
-            .take_while(|&&block_id| self.pool.ref_count(block_id) == request_count)
-            .count();
-        Ok(self.order_groups(vec![full_common], vec![0]).into_iter().flatten().collect())
+            .zip(&self.group_is_mamba)
+            .map(|(blocks, &is_mamba)| {
+                if is_mamba {
+                    0
+                } else {
+                    blocks
+                        .iter()
+                        .take_while(|&&block_id| self.pool.ref_count(block_id) == request_count)
+                        .count()
+                }
+            })
+            .collect())
     }
 
     fn estimate_cached_tokens(&self, request_id: &str) -> usize {
         let Some(state) = self.get_request(request_id) else {
             return 0;
         };
-        let full_cached = state
-            .full_blocks
+        state
+            .blocks
             .iter()
-            .map(|&block_id| self.pool.hash_num_tokens(block_id))
-            .max()
-            .unwrap_or(0);
-        let mamba_cached = state
-            .mamba_blocks
-            .iter()
-            .filter(|&&block_id| block_id != 0)
-            .map(|&block_id| self.pool.hash_num_tokens(block_id))
-            .max()
-            .unwrap_or(0);
-        full_cached.min(mamba_cached)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|&&block_id| block_id != 0)
+                    .map(|&block_id| self.pool.hash_num_tokens(block_id))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .min()
+            .unwrap_or(0)
     }
 
     fn evict_blocks(&mut self, block_ids: Vec<u32>) -> PyResult<()> {
@@ -464,7 +517,7 @@ impl HybridMambaKVCacheManager {
     }
 
     fn take_new_block_ids(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.new_full_block_ids)
+        std::mem::take(&mut self.new_attention_block_ids)
     }
 
     fn get_zeroing_block_ids_in_range(
@@ -478,9 +531,15 @@ impl HybridMambaKVCacheManager {
         };
         let start_block = start_token / self.block_size;
         let end_block = end_token.div_ceil(self.block_size);
-        state.full_blocks
-            [start_block.min(state.full_blocks.len())..end_block.min(state.full_blocks.len())]
-            .to_vec()
+        state
+            .blocks
+            .iter()
+            .zip(&self.group_is_mamba)
+            .filter(|(_, is_mamba)| !**is_mamba)
+            .flat_map(|(blocks, _)| {
+                blocks[start_block.min(blocks.len())..end_block.min(blocks.len())].to_vec()
+            })
+            .collect()
     }
 
     fn record_blocks_for_zeroing(&mut self, request_id: &str, start_token: usize) -> PyResult<()> {
@@ -493,8 +552,14 @@ impl HybridMambaKVCacheManager {
             .get_request(request_id)
             .ok_or_else(|| PyKeyError::new_err(format!("request {request_id:?} has no blocks")))?;
         let start_block = start_token / self.block_size;
-        let block_ids = state.full_blocks[start_block.min(state.full_blocks.len())..].to_vec();
-        self.new_full_block_ids.extend(block_ids);
+        let block_ids = state
+            .blocks
+            .iter()
+            .zip(&self.group_is_mamba)
+            .filter(|(_, is_mamba)| !**is_mamba)
+            .flat_map(|(blocks, _)| blocks[start_block.min(blocks.len())..].iter().copied())
+            .collect::<Vec<_>>();
+        self.new_attention_block_ids.extend(block_ids);
         Ok(())
     }
 

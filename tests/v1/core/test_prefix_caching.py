@@ -390,8 +390,11 @@ def test_rust_full_attention_manager_matches_public_prefix_cache_contract():
     assert manager.reset_prefix_cache()
 
 
-def test_rust_hybrid_mamba_manager_matches_public_state_lifecycle():
-    """Guard Mamba hit deferral, aligned rollover, zeroing, and state release."""
+@pytest.mark.parametrize("mamba_group_count", [1, 3])
+def test_rust_hybrid_mamba_manager_matches_public_state_lifecycle(
+    mamba_group_count: int,
+):
+    """Guard Qwen-style group routing, rollover, zeroing, and state release."""
     pytest.importorskip("vllm._rust_kv_cache")
     from vllm.v1.core.rust_kv_cache_manager import (
         RustHybridMambaKVCacheManager,
@@ -399,7 +402,9 @@ def test_rust_hybrid_mamba_manager_matches_public_state_lifecycle():
 
     block_size = 16
     config = _make_hybrid_kv_cache_config(
-        block_size, num_blocks=128, spec_types=["full", "mamba_align"]
+        block_size,
+        num_blocks=256,
+        spec_types=["full", *(["mamba_align"] * mamba_group_count)],
     )
 
     def exercise(manager_cls):
@@ -475,13 +480,46 @@ def test_rust_hybrid_mamba_manager_matches_public_state_lifecycle():
     expected = exercise(KVCacheManager)
     actual = exercise(RustHybridMambaKVCacheManager)
     assert actual == expected
+    group_count = mamba_group_count + 1
     assert actual == (
-        ((10, 10), 10),
-        (True, 160, 160, (10, 10), (6, 6), (16, 16), 6),
-        ((1, 1), 1),
-        ((0, 0), 1, [17, 0]),
+        ((10,) * group_count, 10),
+        (
+            True,
+            160,
+            160,
+            (10,) * group_count,
+            (6,) * group_count,
+            (16,) * group_count,
+            6,
+        ),
+        ((1,) * group_count, 1),
+        ((0,) * group_count, 1, [17, *([0] * mamba_group_count)]),
         (0.0, True),
     )
+
+
+def test_rust_manager_factory_routes_qwen_style_hybrid_groups():
+    pytest.importorskip("vllm._rust_kv_cache")
+    from vllm.v1.core.rust_kv_cache_manager import (
+        RustHybridMambaKVCacheManager,
+        create_rust_kv_cache_manager,
+    )
+
+    block_size = 16
+    config = _make_hybrid_kv_cache_config(
+        block_size,
+        num_blocks=256,
+        spec_types=["full", "mamba_align", "mamba_align", "mamba_align"],
+    )
+    manager = create_rust_kv_cache_manager(
+        kv_cache_config=config,
+        max_model_len=4096,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    )
+
+    assert isinstance(manager, RustHybridMambaKVCacheManager)
+    assert len(manager.empty_kv_cache_blocks.blocks) == 4
 
 
 @pytest.mark.parametrize("cache_type", ["full", "hybrid-mamba"])

@@ -364,7 +364,7 @@ class RustFullAttentionKVCacheManager:
 
 
 class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
-    """Native manager for one FullAttention group and one Mamba-align group."""
+    """Native manager for FullAttention and Mamba-align KV cache groups."""
 
     def __init__(
         self,
@@ -384,7 +384,7 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
         watermark: float = 0.0,
     ) -> None:
         del max_in_flight_tokens
-        full_group_id, mamba_group_id = self._validate_hybrid_config(
+        group_is_mamba = self._validate_hybrid_config(
             kv_cache_config=kv_cache_config,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
@@ -408,13 +408,14 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
             kv_cache_config.num_blocks,
             self.block_size,
             enable_caching,
-            full_group_id,
-            mamba_group_id,
+            group_is_mamba,
         )
         self._blocks = tuple(
             KVCacheBlock(block_id) for block_id in range(kv_cache_config.num_blocks)
         )
-        self.empty_kv_cache_blocks = KVCacheBlocks(((), ()))
+        self.empty_kv_cache_blocks = KVCacheBlocks(
+            tuple(() for _ in kv_cache_config.kv_cache_groups)
+        )
         self.coordinator = _CoordinatorFacade(self)
         self.block_pool = _BlockPoolFacade(self)
 
@@ -430,11 +431,7 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
         dcp_world_size: int,
         pcp_world_size: int,
         metrics_collector: KVCacheMetricsCollector | None,
-    ) -> tuple[int, int]:
-        if len(kv_cache_config.kv_cache_groups) != 2:
-            raise ValueError(
-                "The Rust hybrid manager requires exactly two KV cache groups."
-            )
+    ) -> list[bool]:
         full_groups = [
             index
             for index, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -445,13 +442,16 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
             for index, group in enumerate(kv_cache_config.kv_cache_groups)
             if isinstance(group.kv_cache_spec, MambaSpec)
         ]
-        if len(full_groups) != 1 or len(mamba_groups) != 1:
+        if (
+            not full_groups
+            or not mamba_groups
+            or len(full_groups) + len(mamba_groups)
+            != len(kv_cache_config.kv_cache_groups)
+        ):
             raise ValueError(
-                "The Rust hybrid manager requires one FullAttention group and "
-                "one Mamba group."
+                "The Rust hybrid manager requires only FullAttention and Mamba "
+                "groups, with at least one group of each type."
             )
-        mamba_spec = kv_cache_config.kv_cache_groups[mamba_groups[0]].kv_cache_spec
-        assert isinstance(mamba_spec, MambaSpec)
         specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
         if not (
             all(spec.block_size == scheduler_block_size for spec in specs)
@@ -463,9 +463,10 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
                 "The Rust hybrid manager requires identical cache, scheduler, "
                 "and hash block sizes with DCP=PCP=1."
             )
-        if mamba_spec.mamba_cache_mode != "align":
+        mamba_specs = [spec for spec in specs if isinstance(spec, MambaSpec)]
+        if any(spec.mamba_cache_mode != "align" for spec in mamba_specs):
             raise ValueError("The Rust hybrid manager requires Mamba align mode.")
-        if mamba_spec.num_speculative_blocks:
+        if any(spec.num_speculative_blocks for spec in mamba_specs):
             raise ValueError(
                 "The Rust hybrid manager does not support speculative Mamba blocks."
             )
@@ -480,7 +481,7 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
             raise ValueError(
                 "The Rust hybrid manager does not support: " + ", ".join(unsupported)
             )
-        return full_groups[0], mamba_groups[0]
+        return [isinstance(spec, MambaSpec) for spec in specs]
 
     def _wrap_group_block_ids(
         self, block_ids: Iterable[Iterable[int]]
@@ -651,6 +652,6 @@ def create_rust_kv_cache_manager(**kwargs: Any) -> RustFullAttentionKVCacheManag
     """Construct the native manager selected by the KV cache group layout."""
     kv_cache_config = kwargs["kv_cache_config"]
     specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
-    if len(specs) == 2 and any(isinstance(spec, MambaSpec) for spec in specs):
+    if any(isinstance(spec, MambaSpec) for spec in specs):
         return RustHybridMambaKVCacheManager(**kwargs)
     return RustFullAttentionKVCacheManager(**kwargs)
