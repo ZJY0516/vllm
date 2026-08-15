@@ -390,12 +390,107 @@ def test_rust_full_attention_manager_matches_public_prefix_cache_contract():
     assert manager.reset_prefix_cache()
 
 
-def test_rust_manager_long_context_operations_are_faster_than_python():
+def test_rust_hybrid_mamba_manager_matches_public_state_lifecycle():
+    """Guard Mamba hit deferral, aligned rollover, zeroing, and state release."""
+    pytest.importorskip("vllm._rust_kv_cache")
+    from vllm.v1.core.rust_kv_cache_manager import (
+        RustHybridMambaKVCacheManager,
+    )
+
+    block_size = 16
+    config = _make_hybrid_kv_cache_config(
+        block_size, num_blocks=128, spec_types=["full", "mamba_align"]
+    )
+
+    def exercise(manager_cls):
+        manager = manager_cls(
+            config,
+            max_model_len=4096,
+            scheduler_block_size=block_size,
+            hash_block_size=block_size,
+            enable_caching=True,
+        )
+        producer = make_request("producer", list(range(160)), block_size, sha256)
+        producer_blocks = manager.allocate_slots(producer, producer.num_tokens)
+        assert producer_blocks is not None
+        producer_result = (
+            tuple(len(group) for group in producer_blocks.get_block_ids()),
+            len(manager.take_new_block_ids()),
+        )
+        manager.free(producer)
+
+        consumer = make_request("consumer", list(range(256)), block_size, sha256)
+        same_step_computed, same_step_hit, _ = manager.get_computed_blocks(consumer)
+        same_step_allocation = manager.allocate_slots(
+            consumer,
+            consumer.num_tokens - same_step_hit,
+            num_new_computed_tokens=same_step_hit,
+            new_computed_blocks=same_step_computed,
+        )
+        manager.new_step_starts()
+        computed, next_step_hit, _ = manager.get_computed_blocks(consumer)
+        new_blocks = manager.allocate_slots(
+            consumer,
+            consumer.num_tokens - next_step_hit,
+            num_new_computed_tokens=next_step_hit,
+            new_computed_blocks=computed,
+        )
+        assert new_blocks is not None
+        admission_result = (
+            same_step_allocation is None,
+            same_step_hit,
+            next_step_hit,
+            tuple(len(group) for group in computed.get_block_ids()),
+            tuple(len(group) for group in new_blocks.get_block_ids()),
+            tuple(len(group) for group in manager.get_block_ids("consumer")),
+            len(manager.take_new_block_ids()),
+        )
+
+        consumer.num_computed_tokens = 256
+        rollover = manager.allocate_slots(consumer, 1)
+        assert rollover is not None
+        rollover_result = (
+            tuple(len(group) for group in rollover.get_block_ids()),
+            len(manager.take_new_block_ids()),
+        )
+        consumer.num_computed_tokens = 257
+        steady = manager.allocate_slots(consumer, 1)
+        assert steady is not None
+        block_ids = manager.get_block_ids("consumer")
+        release_result = (
+            tuple(len(group) for group in steady.get_block_ids()),
+            sum(block_id != 0 for block_id in block_ids[1]),
+            manager.get_num_common_prefix_blocks("consumer"),
+        )
+        manager.free(consumer)
+        final_result = (manager.usage, manager.reset_prefix_cache())
+        return (
+            producer_result,
+            admission_result,
+            rollover_result,
+            release_result,
+            final_result,
+        )
+
+    expected = exercise(KVCacheManager)
+    actual = exercise(RustHybridMambaKVCacheManager)
+    assert actual == expected
+    assert actual == (
+        ((10, 10), 10),
+        (True, 160, 160, (10, 10), (6, 6), (16, 16), 6),
+        ((1, 1), 1),
+        ((0, 0), 1, [17, 0]),
+        (0.0, True),
+    )
+
+
+@pytest.mark.parametrize("cache_type", ["full", "hybrid-mamba"])
+def test_rust_manager_long_context_operations_are_faster_than_python(cache_type):
     pytest.importorskip("vllm._rust_kv_cache")
     from benchmarks.benchmark_kv_cache_manager import run_scenario
 
     scenario = dict(
-        cache_type="full",
+        cache_type=cache_type,
         prompt_tokens=100_000,
         hit_rate=1.0,
         block_size=16,
@@ -418,6 +513,34 @@ def test_rust_manager_long_context_operations_are_faster_than_python():
         assert rust_result.median_us < python_result.median_us, (
             f"{operation}: Rust median {rust_result.median_us:.3f} us is not "
             f"faster than Python median {python_result.median_us:.3f} us"
+        )
+
+
+def test_rust_hybrid_mamba_manager_speeds_up_real_scheduler_path():
+    pytest.importorskip("vllm._rust_kv_cache")
+    from benchmarks.benchmark_scheduler_kv_cache import run_scheduler_scenario
+
+    scenario = dict(
+        cache_type="hybrid-mamba",
+        prompt_tokens=100_000,
+        warmups=5,
+        iterations=31,
+        decode_steps=101,
+    )
+    python_result = run_scheduler_scenario(manager_backend="python", **scenario)
+    rust_result = run_scheduler_scenario(manager_backend="rust", **scenario)
+
+    assert rust_result.cached_tokens_median == python_result.cached_tokens_median
+    for metric in (
+        "admission_schedule_median_us",
+        "finish_update_median_us",
+        "decode_schedule_median_us",
+    ):
+        rust_median = getattr(rust_result, metric)
+        python_median = getattr(python_result, metric)
+        assert rust_median < python_median, (
+            f"{metric}: Rust median {rust_median:.3f} us is not faster than "
+            f"Python median {python_median:.3f} us"
         )
 
 

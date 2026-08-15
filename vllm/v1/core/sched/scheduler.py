@@ -275,18 +275,18 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
-        kv_cache_manager_cls: Any = KVCacheManager
+        kv_cache_manager_factory: Any = KVCacheManager
         if envs.VLLM_USE_RUST_KV_CACHE_MANAGER:
             if self.connector is not None:
                 raise ValueError(
                     "The Rust KV cache manager does not support KV connectors yet."
                 )
             from vllm.v1.core.rust_kv_cache_manager import (
-                RustFullAttentionKVCacheManager,
+                create_rust_kv_cache_manager,
             )
 
-            kv_cache_manager_cls = RustFullAttentionKVCacheManager
-        self.kv_cache_manager = kv_cache_manager_cls(
+            kv_cache_manager_factory = create_rust_kv_cache_manager
+        self.kv_cache_manager = kv_cache_manager_factory(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,

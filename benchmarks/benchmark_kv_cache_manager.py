@@ -102,6 +102,7 @@ def _mamba_spec(block_size: int) -> MambaSpec:
         block_size=block_size,
         shapes=((1, 1),),
         dtypes=(torch.float32,),
+        mamba_cache_mode="align",
     )
 
 
@@ -220,10 +221,10 @@ def run_scenario(
         manager = KVCacheManager(**manager_kwargs)
     else:
         from vllm.v1.core.rust_kv_cache_manager import (
-            RustFullAttentionKVCacheManager,
+            create_rust_kv_cache_manager,
         )
 
-        manager = RustFullAttentionKVCacheManager(**manager_kwargs)
+        manager = create_rust_kv_cache_manager(**manager_kwargs)
 
     token_ids = [token_id % 32_000 for token_id in range(prompt_tokens)]
     if requested_cached_tokens:
@@ -325,8 +326,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--prompt-lengths must contain values greater than one")
     if any(not 0 <= hit_rate <= 1 for hit_rate in args.hit_rates):
         raise ValueError("--hit-rates values must be between zero and one")
-    if "rust" in args.manager_backends and args.cache_types != ["full"]:
-        raise ValueError("the Rust manager benchmark supports --cache-types full only")
+    rust_cache_types = set(args.cache_types) - {"full", "hybrid-mamba"}
+    if "rust" in args.manager_backends and rust_cache_types:
+        raise ValueError(
+            "the Rust manager benchmark supports --cache-types full and "
+            "hybrid-mamba only"
+        )
     if args.assert_rust_faster and set(args.manager_backends) != {"python", "rust"}:
         raise ValueError("--assert-rust-faster requires --manager-backends python rust")
 
