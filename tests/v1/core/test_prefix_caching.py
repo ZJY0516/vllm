@@ -351,6 +351,7 @@ def test_prefill(hash_fn):
 
 def test_rust_full_attention_manager_matches_public_prefix_cache_contract():
     pytest.importorskip("vllm._rust_kv_cache")
+    from vllm.v1.core.kv_cache_manager import KVCacheBlockIds
     from vllm.v1.core.rust_kv_cache_manager import (
         RustFullAttentionKVCacheManager,
     )
@@ -373,6 +374,9 @@ def test_rust_full_attention_manager_matches_public_prefix_cache_contract():
     assert num_computed_tokens == 1600
     assert shared_prefix_boundary == 0
     assert len(computed.get_block_ids()[0]) == 100
+    assert isinstance(computed, KVCacheBlockIds)
+    assert computed.blocks[0][0].block_id == computed.get_block_ids()[0][0]
+    assert not hasattr(manager, "_blocks")
 
     new_blocks = manager.allocate_slots(
         consumer,
@@ -381,6 +385,7 @@ def test_rust_full_attention_manager_matches_public_prefix_cache_contract():
         new_computed_blocks=computed,
     )
     assert new_blocks is not None
+    assert isinstance(new_blocks, KVCacheBlockIds)
     assert len(new_blocks.get_block_ids()[0]) == 28
     assert len(manager.get_block_ids("consumer")[0]) == 128
     assert manager.estimate_cached_tokens(consumer) == 2048
@@ -390,12 +395,40 @@ def test_rust_full_attention_manager_matches_public_prefix_cache_contract():
     assert manager.reset_prefix_cache()
 
 
+def test_rust_full_attention_lookup_stops_at_an_evicted_parent():
+    """A cached descendant must not hide an evicted block in its prefix."""
+    pytest.importorskip("vllm._rust_kv_cache")
+    from vllm.v1.core.rust_kv_cache_manager import (
+        RustFullAttentionKVCacheManager,
+    )
+
+    block_size = 16
+    manager = RustFullAttentionKVCacheManager(
+        make_kv_cache_config(block_size, 16),
+        max_model_len=4096,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+    )
+    producer = make_request("producer", list(range(160)), block_size, sha256)
+    assert manager.allocate_slots(producer, producer.num_tokens) is not None
+    producer_block_ids = manager.get_block_ids(producer.request_id)[0]
+    manager.free(producer)
+
+    manager.evict_blocks({producer_block_ids[4]})
+    consumer = make_request("consumer", list(range(160)), block_size, sha256)
+    computed, num_computed_tokens, _ = manager.get_computed_blocks(consumer)
+
+    assert num_computed_tokens == 4 * block_size
+    assert computed.get_block_ids()[0] == producer_block_ids[:4]
+
+
 @pytest.mark.parametrize("mamba_group_count", [1, 3])
 def test_rust_hybrid_mamba_manager_matches_public_state_lifecycle(
     mamba_group_count: int,
 ):
     """Guard Qwen-style group routing, rollover, zeroing, and state release."""
     pytest.importorskip("vllm._rust_kv_cache")
+    from vllm.v1.core.kv_cache_manager import KVCacheBlockIds
     from vllm.v1.core.rust_kv_cache_manager import (
         RustHybridMambaKVCacheManager,
     )
@@ -418,6 +451,8 @@ def test_rust_hybrid_mamba_manager_matches_public_state_lifecycle(
         producer = make_request("producer", list(range(160)), block_size, sha256)
         producer_blocks = manager.allocate_slots(producer, producer.num_tokens)
         assert producer_blocks is not None
+        if manager_cls is RustHybridMambaKVCacheManager:
+            assert isinstance(producer_blocks, KVCacheBlockIds)
         producer_result = (
             tuple(len(group) for group in producer_blocks.get_block_ids()),
             len(manager.take_new_block_ids()),

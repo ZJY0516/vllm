@@ -2,136 +2,131 @@
 
 ## Status
 
-This document describes the implementation plan for a self-contained Rust KV cache manager for vLLM V1. The first hybrid target is one full-attention group plus one Mamba group in `align` mode, matching the cache structure used by Qwen3.5. Sliding-window support follows as another native group policy after the shared hybrid core is established.
+The opt-in Rust backend now implements a self-contained KV cache manager for a single full-attention group and for multi-group FullAttention plus Mamba configurations in `align` mode. This document describes the implemented ownership boundary, the long-prefix lookup optimization, the supported configuration, and the evidence required before enabling the backend more broadly.
 
-## Motivation
+The backend is selected with `VLLM_USE_RUST_KV_CACHE_MANAGER=1` when the scheduler is constructed. The Python manager remains the reference implementation, and unsupported configurations fail during construction instead of falling back to a partially native state machine.
 
-The Python KV cache manager is not the end-to-end bottleneck in every workload because asynchronous scheduling can overlap CPU planning with GPU execution, but direct scheduler measurements show that the metadata path has substantial headroom. A CPU-only `Scheduler` test using a 100K-token initial context and a 200-turn conversation, with every turn adding 100 input tokens and generating 100 output tokens, produced the following medians.
+## Motivation and measured result
 
-| Manager | Admission schedule | Decode schedule step | Finish update | Total schedule time per turn |
+Asynchronous scheduling can overlap KV cache planning with GPU execution, so a faster manager does not automatically improve end-to-end latency. Direct measurements through the real scheduler nevertheless show substantial CPU headroom for long cached prefixes. With a 100K-token cached prefix, 31 measured iterations, and medians rather than means, the retained implementation produced these admission results:
+
+| Cache layout | Batch | Python median | Rust median | Change |
 | --- | ---: | ---: | ---: | ---: |
-| Python full attention | 5.872 ms | 294.3 us | 644.0 us | 34.926 ms |
-| Python full attention + sliding window | 6.112 ms | 295.0 us | 941.0 us | 35.628 ms |
-| Python full attention + Mamba | 6.518 ms | 296.5 us | 948.8 us | 36.569 ms |
-| Rust full attention | 1.534 ms | 16.4 us | 51.1 us | 3.285 ms |
+| Full attention, block size 16 | 4 | 16.976 ms | 1.418 ms | -91.6% |
+| Full attention, block size 16 | 32 | 130.972 ms | 10.707 ms | -91.8% |
+| Qwen3.5 hybrid, block size 544 | 4 | 0.753 ms | 0.147 ms | -80.4% |
+| Qwen3.5 hybrid, block size 544 | 32 | 5.705 ms | 1.044 ms | -81.7% |
 
-The final 25 turns increase the Python full-attention schedule total to 39.811 ms, the Python Mamba hybrid total to 41.513 ms, and the Rust full-attention total to 3.638 ms. The dominant repeated cost is the full-attention block-table and common-prefix work shared by both hybrid layouts, while Mamba adds the largest admission and release overhead. Rewriting only isolated Mamba or sliding-window functions would leave the shared coordinator, block pool, request tables, and cross-group transitions in Python and would not capture most of the available scheduler reduction.
+End-to-end validation used Qwen3-4B on a GB200 with the Rust frontend, asynchronous scheduling, CUDA graphs, and no eager mode. The workload had 32 concurrent conversations sharing a 100K-token prefix and 20 turns that each added 100 input tokens and generated 100 output tokens. The median across two run-level results per backend improved TTFT by 17.2%, end-to-end latency by 4.1%, and throughput by 3.8%. Median TPOT changed by -0.1%, while mean, p90, and p99 TPOT also improved. Repeated TPOT measurements are required because scheduler work may be hidden by asynchronous GPU execution and a single run can be noisy.
 
 ## Goals
 
-- Rust exclusively owns mutable KV cache metadata for every supported group, including the block arena, intrusive free/LRU queue, prefix-hash indices, reference counts, request block tables, cached boundaries, Mamba rolling-state bookkeeping, and pending block-copy actions.
-- The scheduler selects one Python adapter at construction time, and the adapter delegates high-level cache operations to one native state machine without calling back into Python during a transition.
-- The first hybrid implementation preserves the observable behavior of `KVCacheManager`, `HybridKVCacheCoordinator`, `FullAttentionManager`, and `MambaManager` for a two-group full-attention plus Mamba `align` configuration.
-- Capacity checks that span groups are performed before mutation so an unsuccessful allocation cannot partially update one group.
-- Unsupported configurations fail during scheduler construction with an actionable error instead of silently falling back to partially native behavior.
-- Correctness is established through public scheduler and manager APIs, and CPU performance is guarded with medians over long-context operations.
+- Rust exclusively owns the mutable metadata for every supported cache group: the block arena, intrusive free/LRU queue, prefix-hash index, reference counts, parent links, request block tables, cached boundaries, and Mamba rolling-state bookkeeping.
+- Python passes immutable request facts into high-level native operations and receives raw block IDs or token counts without callbacks from Rust into Python.
+- Capacity checks spanning cache groups happen before mutation, so an unsuccessful allocation cannot partially update one group.
+- The native backend preserves the observable scheduler contract for cache lookup, allocation, caching, eviction, reset, common-prefix queries, skipped-block release, and request release.
+- Unsupported configurations fail early with an actionable error.
 
 ## Non-goals
 
-- Rust does not own GPU KV payloads, launch kernels, tokenize prompts, or compute request block hashes in the first implementation.
-- The first hybrid implementation does not support KV connectors, KV events, KV metrics collection, cache zeroing, EAGLE/MTP, DCP, PCP, speculative Mamba blocks, or different hash and scheduler block sizes.
-- The first hybrid implementation does not change the existing eviction policy or cache-hit semantics.
-- Sliding-window, chunked-local, cross-attention, R-SWA, and sink-attention policies are not part of the first code change, although the native group-policy boundary must allow them to be added without duplicating the block pool.
+- Rust does not own GPU KV payloads, launch kernels, tokenize prompts, compute request block hashes, or replace the scheduler in this change.
+- This implementation does not add sliding-window, chunked-local, cross-attention, R-SWA, or sink-attention policies.
+- It does not change eviction policy or cache-hit semantics.
+- It does not add a scheduler-wide `plan_step` FFI call. The current high-level manager calls are retained because further call fusion did not demonstrate an incremental end-to-end gain.
 
 ## Ownership boundary
-
-The native manager is the source of truth for all mutable cache metadata. Python keeps immutable request facts and compatibility handles for existing scheduler outputs, but it must not mirror reference counts, queue links, cache membership, or request block tables.
 
 | Component | Owner | Responsibility |
 | --- | --- | --- |
 | Scheduler request state | Python | Token counts, request status, block hashes, scheduling policy, and model-facing output |
-| Python KV adapter | Python | Configuration validation, conversion of request facts into native inputs, and wrapping returned block IDs |
-| Block arena and free/LRU queue | Rust | Block identity, reference counts, cache metadata, eviction order, and free capacity |
-| Hybrid coordinator | Rust | Cross-group hit reconciliation, atomic capacity planning, allocation, caching, skipped-block release, and request release |
-| Full-attention policy | Rust | Contiguous prefix lookup, dense block-table growth, full-block caching, and common-prefix counting |
-| Mamba `align` policy | Rust | Checkpoint lookup, sparse position-indexed block tables, rolling-state allocation, old-state release, and copy actions |
-| GPU model runner | Python/CUDA | Consumption of block tables and execution of returned block-copy actions |
+| Python KV adapter | Python | Configuration validation, conversion of request facts into native inputs, and wrapping raw block IDs |
+| Block arena and free/LRU queue | Rust | Block identity, allocation generation, reference counts, cache metadata, eviction order, and free capacity |
+| Full-attention policy | Rust | Prefix lookup, parent-path reconstruction, dense block-table growth, caching, and common-prefix counting |
+| Hybrid coordinator | Rust | Cross-group hit reconciliation, capacity planning, allocation, Mamba state movement, skipped-block release, and request release |
+| GPU model runner | Python/CUDA | Consumption of block tables and execution of the model |
+
+The native manager is the only source of truth for mutable cache metadata. Python must not mirror reference counts, queue links, cache membership, parent links, or native request tables.
 
 ## Native data model
 
-`BlockPool` stores a contiguous arena of block records and a shared intrusive free/LRU queue. Each block record contains its reference count, optional group-qualified hash metadata, free-queue links, and queue membership. Block zero remains the null block and is never placed in the free queue.
+`BlockPool` stores a contiguous arena of block records and one intrusive free/LRU queue. Each record contains its reference count, optional group-qualified cache key, cached token boundary, allocation generation, optional full-attention parent reference, queue links, and queue membership. Block zero is the null block and is never placed in the free queue.
 
-`CacheIndex` maps a key composed of the block hash and KV cache group ID to one or more block IDs. Keeping the group ID in the key preserves independent cache residency for identical tokens in different cache groups while retaining a single physical allocation pool and eviction queue.
+The cache index maps a block hash plus KV cache group ID to one or more block IDs. The group ID preserves independent cache residency for identical token prefixes in different groups while all groups share one physical allocation pool and eviction queue.
 
-`RequestState` stores one position-indexed block table per group, the number of cached blocks or checkpoint boundary per group, and Mamba `align` state such as the previous resident checkpoint position. Mamba positions without a resident state use the null block ID in the returned table, matching the current Python contract.
+Each parent reference contains a block ID and the parent's generation. Allocating a physical block increments its generation. Path reconstruction validates the generation, cache group, cache-key presence, and expected length, preventing an evicted or reused parent from silently connecting a cached descendant to an unrelated allocation.
 
-`PendingActions` stores block copies produced while advancing a Mamba `align` request. Actions are drained in a batch through the existing scheduler-facing copy API; Rust never invokes a Python callback while holding mutable manager state.
+The full-attention manager stores a dense block table and cached boundary for each request. The hybrid manager stores one position-indexed table per group, a cached boundary per group, and Mamba `align` state for resident checkpoints. Mamba positions without a resident state use the null block ID, matching the Python contract.
+
+`KVCacheBlockIds` keeps native results as `list[int]` values per cache group and exposes lazy `KVCacheBlock` views only when an existing scheduler path requests `.blocks`. This avoids allocating one Python object per cached block on the admission hot path while preserving the `KVCacheBlocks` interface.
 
 ## Operation semantics
 
-### Prefix lookup
+### Full-attention prefix lookup
 
-The full-attention policy scans block hashes from the start and stops on the first miss. The Mamba policy searches for the latest reusable checkpoint no deeper than the current full-attention hit. The hybrid coordinator reconciles both results to a boundary valid for every group, truncates full-attention blocks to that boundary, and returns a sparse Mamba table ending at the matching checkpoint. Prefix hits remain aligned to the scheduler block size in the initial configuration.
+vLLM block hashes are cumulative. The native manager checks the first block and binary-searches the deepest cached cumulative hash, reducing Python hash extraction and hash-map probes from O(N) to O(log N) for an N-block candidate prefix. It then reconstructs the required O(N) block-ID table by walking parent links entirely in Rust.
 
-### Allocation
+If a parent path is absent or fails validation, the manager falls back to scalar forward lookup. This preserves the rule that a hit stops at the first missing block, including cases where a deeper cumulative hash remains cached after an ancestor was evicted.
 
-The coordinator first computes the evictable hit blocks and new physical blocks required by both groups, applies reserved-block and watermark constraints once, and returns `None` without mutation if capacity is insufficient. On success it touches all local hit blocks before any eviction, creates the request state, grows the dense full-attention table, advances the sparse Mamba table, records required Mamba state copies, caches newly finalized blocks, and returns new block IDs grouped in model-facing order.
+### Hybrid lookup
 
-### Cache commit
+Every full-attention group must contain the binary-search candidate, and every reconstructed parent path is validated independently. The Mamba policy then searches backward within the full-attention hit range for the newest reusable state checkpoint, truncates the full-attention tables to that position, and preserves the same-step Mamba reuse guard. Mamba blocks do not have parent links because a Mamba hit is one sparse state checkpoint rather than a dense prefix table.
 
-Full-attention blocks are inserted into the group-qualified hash index when their token range is finalized. Mamba `align` checkpoints are cached only at boundaries permitted by the existing reachability rules. Duplicate hashes retain multiple physical block IDs until request release, matching the append-only block-table behavior of vLLM V1.
+### Allocation and cache commit
 
-### Skipped-block release
+The manager computes evictable hit blocks and new physical blocks required by all groups, applies reserved-block and watermark constraints, and returns `None` before mutation when capacity is insufficient. On success it touches local hits before possible eviction, installs native request state, grows full-attention tables, advances Mamba state, and caches newly finalized blocks under group-qualified keys.
 
-When a Mamba `align` request advances, state blocks older than the copy source and current destination are released and their table positions become the null block. The source block remains referenced until its copy action is safe for the model runner to execute.
+Computed block-ID vectors are moved into native request tables rather than cloned. Returned new allocations and cache-hit tables remain raw IDs until a compatibility consumer explicitly asks for block objects.
 
-### Request release and eviction
+### Request release, eviction, and common prefix
 
-Request release decrements group tables in reverse position order. Uncached blocks return to the free-queue head for immediate reuse, while cached blocks return to the tail to preserve LRU behavior. Allocating a cached free block removes its group-qualified hash entry before reuse.
+Request release decrements group tables in reverse position order. Uncached blocks return to the free-queue head for immediate reuse, while cached blocks return to the tail to preserve LRU behavior. Reusing a cached free block removes its cache-index entry and parent metadata before allocation.
 
-### Common prefix
+The full-attention common prefix is the leading run of blocks whose reference count equals the number of active native request tables. Mamba groups return zero because cascade attention does not consume Mamba checkpoints.
 
-The full-attention group counts the leading blocks whose reference count equals the number of active request tables. The Mamba group returns zero because cascade attention does not consume Mamba checkpoints. Both values are produced from the same native request registry without reconstructing Python block objects.
+## Python interface and rejected FFI fusion
 
-## Python interface and FFI evolution
+The adapter implements the existing `KVCacheManager` surface with high-level native calls. Each call completes one manager operation and exchanges immutable request facts, raw IDs, or scalar results. Python performs scheduler policy and validation but does not participate in an in-progress native mutation.
 
-The compatibility adapter initially implements the existing `KVCacheManager` methods with high-level native calls so scheduler behavior can be compared without changing unrelated Python cache classes. Each native call completes an atomic manager transition and returns plain block IDs or batched actions; Python `KVCacheBlock` objects remain immutable ID handles only.
+An experiment kept cache-hit IDs as pending Rust state between lookup and allocation. It reduced the 32-request full-attention admission median from about 11.0 ms to 4.8 ms, but repeated end-to-end measurements showed no incremental benefit because asynchronous scheduling hid the remaining CPU work. It also introduced Python-visible pending state and additional cleanup paths, so it was reverted. A future `plan_step` or pending-admission interface must first demonstrate a stable end-to-end gain on a workload that crosses the scheduler-overlap threshold.
 
-After hybrid correctness is established, the interface can add `plan_step`, accepting descriptors for all running and newly admitted requests in one scheduler iteration and returning lookup results, allocations, preemptions, per-group block-table updates, common-prefix counts, frees, and copy actions in one result. The native ownership model in this document is required from the first phase so adding `plan_step` changes the call shape rather than migrating state a second time.
+## Supported configuration
 
-## Supported initial configuration
-
-- Exactly two KV cache groups: one `FullAttentionSpec` and one `MambaSpec` using `mamba_cache_mode="align"`.
-- Prefix caching enabled, identical cache, scheduler, and hash block sizes, and DCP/PCP world size one.
-- No connector, event publisher, metrics collector, zeroing, EAGLE/MTP, speculative Mamba blocks, deferred frees, or external computed blocks.
-- A shared block pool with group-qualified cache keys and one null block.
-
-The existing single-group Rust full-attention manager remains supported. Backend construction validates the complete configuration before allocating native state and names every unsupported feature in the error.
+- One `FullAttentionSpec` group, or multiple groups containing only `FullAttentionSpec` and `MambaSpec` with at least one group of each type.
+- Every Mamba group uses `mamba_cache_mode="align"` and has no speculative blocks.
+- Cache, scheduler, and hash block sizes are identical, with DCP/PCP world size one.
+- No EAGLE/MTP, KV connector, KV cache event publisher, KV cache metrics collector, deferred free, external computed KV, or encoder KV allocation.
+- The single-group full-attention backend does not support KV cache zeroing. The hybrid adapter exposes the existing block-zeroing bookkeeping required by Mamba align mode.
 
 ## Rust module layout
 
-- `block_pool.rs` owns block records, the intrusive free/LRU queue, group-qualified cache indices, touching, eviction, and release.
-- `full_attention.rs` owns full-attention lookup, dense table growth, caching, and common-prefix logic.
-- `mamba.rs` owns `align` checkpoint lookup, sparse tables, rolling-state transitions, and copy actions.
-- `hybrid.rs` owns request state, cross-group reconciliation, atomic capacity planning, operation ordering, and public native methods.
-- `python.rs` exposes PyO3 classes and converts Python inputs and native outputs without owning cache state.
-
-The implementation should share the block-pool and full-attention code between the unitary and hybrid managers instead of maintaining two independent allocators.
+- `block_pool.rs` owns block records, generations, parent references, the intrusive free/LRU queue, group-qualified cache indices, allocation, touching, eviction, and release.
+- `full_attention.rs` owns the single-group request registry, prefix lookup, dense table growth, caching, and common-prefix logic.
+- `hybrid.rs` owns multi-group request state, FullAttention/Mamba hit reconciliation, capacity planning, allocation ordering, Mamba transitions, zeroing block IDs, and public hybrid methods.
+- `lib.rs` registers the PyO3 module and exports the native manager classes.
+- `vllm/v1/core/rust_kv_cache_manager.py` validates configuration and adapts scheduler calls without owning native cache metadata.
 
 ## Correctness invariants
 
-- Every non-null block is in exactly one of two states: referenced by at least one request and absent from the free queue, or unreferenced and present exactly once in the free queue.
-- Every cached block has one matching group-qualified cache-index entry, and eviction removes both directions of that relationship before the block is reused.
-- A request table never references a block whose reference count is zero, except for the distinguished null block.
-- A failed cross-group capacity check leaves block metadata, request tables, cache indices, pending actions, and queue order unchanged.
-- Local hit blocks for every group are touched before allocating any block that may evict cache entries.
-- A Mamba source state remains resident until the corresponding copy action has been emitted, and older positions are replaced with the null block before their physical blocks are reused.
-- The reconciled hit length never exceeds any individual group hit and is aligned to the scheduler block size.
+- Every non-null block is either referenced and absent from the free queue, or unreferenced and present exactly once in the free queue.
+- Every cached block has a matching group-qualified cache-index entry, and eviction removes the index entry before reuse.
+- Every valid full-attention parent reference points to the expected cache group and allocation generation.
+- A request table never references an unallocated block except for the distinguished null block in sparse Mamba positions.
+- A failed cross-group capacity check leaves block metadata, request tables, cache indices, and queue order unchanged.
+- Local hit blocks for every group are touched before allocating a block that may evict cache entries.
+- The reconciled hybrid hit never exceeds any individual group hit and remains scheduler-block aligned.
 
-## Testing
+## Validation
 
-Rust unit tests cover queue transitions, group-qualified duplicate hashes, cross-group capacity rollback, full and Mamba hit reconciliation, rolling Mamba state copies, reverse release order, eviction, reset, and common-prefix counting. Tests use deterministic fixtures and snapshot complete manager state where practical.
+Focused pytest coverage compares cache hits, allocation, eviction, reset, an evicted parent with a cached descendant, hybrid group routing, Mamba state lifecycle, and lazy block-ID compatibility. CPU performance tests use medians over 31 measured iterations and require the Rust implementation to be faster for the covered long-context manager operations and real scheduler paths.
 
-Python parity tests execute the same public manager scenarios against the Python and Rust backends and compare cached-token counts, per-group block tables, allocation failures, copy actions, usage, eviction, reset, and release behavior. Scheduler tests drive real `schedule()` and `update_from_output()` calls without a GPU.
+```bash
+.venv/bin/python -m pytest tests/v1/core/test_prefix_caching.py -q -k 'rust_'
+.venv/bin/python -m benchmarks.benchmark_scheduler_kv_cache --breakdown --cache-type full --prefix-modes shared --batch-sizes 4 32 --phases admission
+.venv/bin/python -m benchmarks.benchmark_scheduler_kv_cache --breakdown --cache-type hybrid-mamba --prefix-modes shared --batch-sizes 4 32 --phases admission --block-size 544
+```
 
-The CPU performance test uses a 100K-token initial context and a 200-turn conversation with 100 input and 100 output tokens per turn. It reports the median across turns and the median of the final 25 turns for admission, decode schedule steps, finish updates, and total schedule time per turn. The performance gate compares matched medians and requires Rust to be strictly faster for every supported operation.
+Model-level validation uses the repository Rust `vllm-bench`, the Rust frontend, default asynchronous scheduling, CUDA graphs, and no `--enforce-eager`. TTFT is compared at matching turn indices or as a run-level distribution rather than averaging turns whose context lengths differ. TPOT p50, mean, and tail percentiles must not regress across repeated A/B runs.
 
-End-to-end validation uses the repository Rust `vllm-bench`, default asynchronous scheduling, and no `--enforce-eager`. Qwen3.5-0.8B is the first hybrid-Mamba target because its fast model execution is most likely to expose scheduler savings, followed by gpt-oss-20b after the sliding-window policy is implemented. Per-turn TTFT is compared at matching turn indices instead of averaging turns with different context lengths.
+## Rollout and risks
 
-## Rollout
-
-The backend remains opt-in behind `VLLM_USE_RUST_KV_CACHE_MANAGER`. Construction logs the selected native layout, and unsupported configurations fail closed. The Python implementation remains the reference behavior until parity, CPU scheduler performance, and model-level validation are complete. Sliding-window support and the batched `plan_step` interface are separate follow-up changes built on the same native block pool and hybrid coordinator.
-
-## Risks
-
-The highest correctness risk is cross-group partial mutation during allocation failure, so planning and mutation must be separate phases. The highest Mamba-specific risk is releasing a checkpoint before its copy action is consumed, so copy-source lifetime must be explicit in native state. The highest performance risk is preserving too many small Python-to-Rust calls, which is why the ownership boundary forbids Python-side metadata and the follow-up `plan_step` API is part of the design. The end-to-end risk is that asynchronous scheduling continues to hide CPU savings; this does not invalidate the manager speedup, but model validation must distinguish scheduler headroom from visible latency.
+The backend remains opt-in while the Python implementation is the reference. The highest correctness risk is stale parent metadata after eviction or block reuse, which is addressed by cache-key validation, allocation generations, scalar fallback, and focused tests. The highest performance risk is that asynchronous scheduling hides CPU savings; therefore both scheduler-only medians and repeated model-level TTFT, TPOT, latency, and throughput results are required before expanding support.

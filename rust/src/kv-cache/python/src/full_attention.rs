@@ -70,10 +70,12 @@ impl FullAttentionKVCacheManager {
         let block_ids = request_blocks[num_cached_blocks..num_full_blocks].to_vec();
         for (index, block_id) in (num_cached_blocks..num_full_blocks).zip(block_ids) {
             let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
+            let parent_block_id = index.checked_sub(1).map(|index| request_blocks[index]);
             self.pool.cache(
                 block_id,
                 CacheKey::new(block_hash, 0),
                 (index + 1) * self.block_size,
+                parent_block_id,
             )?;
         }
         self.request_cached_blocks.insert(request_id.to_owned(), num_full_blocks);
@@ -105,10 +107,34 @@ impl FullAttentionKVCacheManager {
         if !self.enable_caching {
             return Ok((Vec::new(), 0));
         }
-        let max_blocks = max_cache_hit_length / self.block_size;
+        let max_blocks = (max_cache_hit_length / self.block_size).min(block_hashes.len()?);
+        if max_blocks == 0 {
+            return Ok((Vec::new(), 0));
+        }
+
+        let first_hash = block_hashes.get_item(0)?.extract::<Vec<u8>>()?;
+        let Some(mut terminal_block_id) = self.pool.find_cached(first_hash, 0) else {
+            return Ok((Vec::new(), 0));
+        };
+        let mut low = 0;
+        let mut high = max_blocks;
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            let block_hash = block_hashes.get_item(middle)?.extract::<Vec<u8>>()?;
+            if let Some(block_id) = self.pool.find_cached(block_hash, 0) {
+                low = middle;
+                terminal_block_id = block_id;
+            } else {
+                high = middle;
+            }
+        }
+        if let Some(block_ids) = self.pool.find_cached_path(terminal_block_id, 0, low + 1) {
+            return Ok((block_ids, (low + 1) * self.block_size));
+        }
+
         let mut block_ids = Vec::with_capacity(max_blocks);
-        for item in block_hashes.try_iter()?.take(max_blocks) {
-            let block_hash = item?.extract::<Vec<u8>>()?;
+        for index in 0..max_blocks {
+            let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
             let Some(block_id) = self.pool.find_cached(block_hash, 0) else {
                 break;
             };
@@ -161,9 +187,9 @@ impl FullAttentionKVCacheManager {
 
         if !self.request_blocks.contains_key(request_id) {
             self.pool.touch(&computed_block_ids)?;
-            self.request_blocks.insert(request_id.to_owned(), computed_block_ids.clone());
-            self.request_cached_blocks
-                .insert(request_id.to_owned(), computed_block_ids.len());
+            let num_computed_blocks = computed_block_ids.len();
+            self.request_blocks.insert(request_id.to_owned(), computed_block_ids);
+            self.request_cached_blocks.insert(request_id.to_owned(), num_computed_blocks);
         }
 
         let required_blocks = num_tokens.div_ceil(self.block_size);

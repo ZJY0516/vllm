@@ -219,7 +219,16 @@ impl HybridMambaKVCacheManager {
                 }
                 let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
                 let cache_key = CacheKey::new(block_hash, group_id);
-                self.pool.cache(block_id, cache_key.clone(), (index + 1) * self.block_size)?;
+                let parent_block_id = (!self.group_is_mamba[group_id])
+                    .then(|| index.checked_sub(1))
+                    .flatten()
+                    .map(|index| self.requests[request_id].blocks[group_id][index]);
+                self.pool.cache(
+                    block_id,
+                    cache_key.clone(),
+                    (index + 1) * self.block_size,
+                    parent_block_id,
+                )?;
                 if self.group_is_mamba[group_id] {
                     self.mamba_cached_this_step.insert(cache_key);
                 }
@@ -234,6 +243,91 @@ impl HybridMambaKVCacheManager {
 
     fn get_request(&self, request_id: &str) -> Option<&RequestState> {
         self.requests.get(request_id)
+    }
+
+    fn find_full_attention_hits(
+        &self,
+        block_hashes: &Bound<'_, PyAny>,
+        max_blocks: usize,
+    ) -> PyResult<Vec<Vec<u32>>> {
+        let mut hit_groups = self.empty_groups();
+        if max_blocks == 0 {
+            return Ok(hit_groups);
+        }
+
+        let first_hash = block_hashes.get_item(0)?.extract::<Vec<u8>>()?;
+        let mut terminal_blocks = Vec::new();
+        for (group_id, &is_mamba) in self.group_is_mamba.iter().enumerate() {
+            if is_mamba {
+                continue;
+            }
+            let Some(block_id) = self.pool.find_cached(first_hash.clone(), group_id) else {
+                return Ok(hit_groups);
+            };
+            terminal_blocks.push((group_id, block_id));
+        }
+
+        let mut low = 0;
+        let mut high = max_blocks;
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            let block_hash = block_hashes.get_item(middle)?.extract::<Vec<u8>>()?;
+            let mut middle_blocks = Vec::with_capacity(terminal_blocks.len());
+            for &(group_id, _) in &terminal_blocks {
+                let Some(block_id) = self.pool.find_cached(block_hash.clone(), group_id) else {
+                    middle_blocks.clear();
+                    break;
+                };
+                middle_blocks.push((group_id, block_id));
+            }
+            if middle_blocks.is_empty() {
+                high = middle;
+            } else {
+                low = middle;
+                terminal_blocks = middle_blocks;
+            }
+        }
+
+        let mut paths = Vec::with_capacity(terminal_blocks.len());
+        for &(group_id, block_id) in &terminal_blocks {
+            let Some(path) = self.pool.find_cached_path(block_id, group_id, low + 1) else {
+                return self.find_full_attention_hits_scalar(block_hashes, max_blocks);
+            };
+            paths.push((group_id, path));
+        }
+        for (group_id, path) in paths {
+            hit_groups[group_id] = path;
+        }
+        Ok(hit_groups)
+    }
+
+    fn find_full_attention_hits_scalar(
+        &self,
+        block_hashes: &Bound<'_, PyAny>,
+        max_blocks: usize,
+    ) -> PyResult<Vec<Vec<u32>>> {
+        let mut hit_groups = self.empty_groups();
+        for index in 0..max_blocks {
+            let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
+            let mut block_ids = Vec::new();
+            for (group_id, &is_mamba) in self.group_is_mamba.iter().enumerate() {
+                if is_mamba {
+                    continue;
+                }
+                let Some(block_id) = self.pool.find_cached(block_hash.clone(), group_id) else {
+                    block_ids.clear();
+                    break;
+                };
+                block_ids.push((group_id, block_id));
+            }
+            if block_ids.is_empty() {
+                break;
+            }
+            for (group_id, block_id) in block_ids {
+                hit_groups[group_id].push(block_id);
+            }
+        }
+        Ok(hit_groups)
     }
 }
 
@@ -277,27 +371,7 @@ impl HybridMambaKVCacheManager {
             return Ok((self.empty_groups(), 0, 0));
         }
         let max_blocks = (max_cache_hit_length / self.block_size).min(block_hashes.len()?);
-        let mut hit_groups = self.empty_groups();
-        for index in 0..max_blocks {
-            let block_hash = block_hashes.get_item(index)?.extract::<Vec<u8>>()?;
-            let mut block_ids = Vec::new();
-            for (group_id, &is_mamba) in self.group_is_mamba.iter().enumerate() {
-                if is_mamba {
-                    continue;
-                }
-                let Some(block_id) = self.pool.find_cached(block_hash.clone(), group_id) else {
-                    block_ids.clear();
-                    break;
-                };
-                block_ids.push((group_id, block_id));
-            }
-            if block_ids.is_empty() {
-                break;
-            }
-            for (group_id, block_id) in block_ids {
-                hit_groups[group_id].push(block_id);
-            }
-        }
+        let mut hit_groups = self.find_full_attention_hits(block_hashes, max_blocks)?;
         let full_hit_blocks = self
             .group_is_mamba
             .iter()

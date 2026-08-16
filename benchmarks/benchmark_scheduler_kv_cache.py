@@ -6,7 +6,9 @@ import json
 import os
 import statistics
 import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass
+from typing import Any
 
 from benchmarks.benchmark_kv_cache_manager import make_kv_cache_config
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
@@ -17,12 +19,13 @@ from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
 )
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 
@@ -37,6 +40,56 @@ class SchedulerBenchmarkResult:
     decode_update_median_us: float
 
 
+@dataclass(frozen=True)
+class SchedulerBreakdownResult:
+    manager_backend: str
+    cache_type: str
+    prefix_mode: str
+    batch_size: int
+    phase: str
+    schedule_median_us: float
+    schedule_p90_us: float
+    kv_manager_median_us: float
+    non_kv_median_us: float
+    non_kv_share_median: float
+    kv_calls_per_step_median: float
+
+
+class _TimedKVManager:
+    """Measure complete public KV-manager calls made by the scheduler."""
+
+    def __init__(self, manager: Any) -> None:
+        self._manager = manager
+        self._wrappers = {}
+        self.reset()
+
+    def reset(self) -> None:
+        self.elapsed_ns = 0
+        self.call_count = 0
+        self.by_method_ns: dict[str, int] = defaultdict(int)
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._manager, name)
+        if not callable(value):
+            return value
+        wrapper = self._wrappers.get(name)
+        if wrapper is None:
+
+            def timed(*args: Any, **kwargs: Any) -> Any:
+                start_ns = time.perf_counter_ns()
+                try:
+                    return getattr(self._manager, name)(*args, **kwargs)
+                finally:
+                    elapsed_ns = time.perf_counter_ns() - start_ns
+                    self.elapsed_ns += elapsed_ns
+                    self.call_count += 1
+                    self.by_method_ns[name] += elapsed_ns
+
+            wrapper = timed
+            self._wrappers[name] = wrapper
+        return wrapper
+
+
 def _median_us(samples_ns: list[int]) -> float:
     return statistics.median(samples_ns) / 1_000
 
@@ -49,6 +102,7 @@ def _make_scheduler(
     num_blocks: int,
     max_num_seqs: int,
     max_num_batched_tokens: int,
+    async_scheduling: bool = False,
 ) -> Scheduler:
     model_config = ModelConfig(
         model="facebook/opt-125m",
@@ -74,6 +128,7 @@ def _make_scheduler(
         enable_chunked_prefill=True,
         is_encoder_decoder=False,
         watermark=0.0,
+        async_scheduling=async_scheduling,
     )
     vllm_config = VllmConfig(
         model_config=model_config,
@@ -84,7 +139,8 @@ def _make_scheduler(
         cache_type, num_blocks, block_size, sliding_window=4096
     )
     register_all_kvcache_specs(vllm_config)
-    scheduler = Scheduler(
+    scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
+    scheduler = scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         block_size=block_size,
@@ -101,10 +157,11 @@ def _make_request(
     prompt_tokens: int,
     max_tokens: int,
     block_size: int,
+    token_id: int = 0,
 ) -> Request:
     return Request(
         request_id=request_id,
-        prompt_token_ids=[0] * prompt_tokens,
+        prompt_token_ids=[token_id] * prompt_tokens,
         sampling_params=SamplingParams(max_tokens=max_tokens, ignore_eos=True),
         pooling_params=None,
         block_hasher=get_request_block_hasher(block_size, sha256),
@@ -130,8 +187,13 @@ def _model_output(
     )
 
 
-def _seed_prefix(scheduler: Scheduler, prompt_tokens: int, block_size: int) -> None:
-    producer = _make_request("producer", prompt_tokens, 1, block_size)
+def _seed_prefix(
+    scheduler: Scheduler,
+    prompt_tokens: int,
+    block_size: int,
+    token_id: int = 0,
+) -> None:
+    producer = _make_request("producer", prompt_tokens, 1, block_size, token_id)
     scheduler.add_request(producer)
     while producer.request_id in scheduler.requests:
         scheduler_output = scheduler.schedule()
@@ -234,6 +296,171 @@ def run_scheduler_scenario(
             os.environ["VLLM_USE_RUST_KV_CACHE_MANAGER"] = previous_backend
 
 
+def _percentile_us(samples_ns: list[int], percentile: float) -> float:
+    index = round((len(samples_ns) - 1) * percentile)
+    return sorted(samples_ns)[index] / 1_000
+
+
+def _make_profile_requests(
+    prefix_mode: str,
+    batch_size: int,
+    iteration: int,
+    prompt_tokens: int,
+    output_tokens: int,
+    block_size: int,
+) -> list[Request]:
+    return [
+        _make_request(
+            f"{prefix_mode}-{iteration}-{index}",
+            prompt_tokens,
+            output_tokens,
+            block_size,
+            token_id=(
+                0 if prefix_mode == "shared" else iteration * batch_size + index + 1
+            ),
+        )
+        for index in range(batch_size)
+    ]
+
+
+def _measure_schedule(
+    scheduler: Scheduler,
+    manager: _TimedKVManager,
+) -> tuple[SchedulerOutput, int, int, int]:
+    manager.reset()
+    start_ns = time.perf_counter_ns()
+    output = scheduler.schedule()
+    total_ns = time.perf_counter_ns() - start_ns
+    return output, total_ns, manager.elapsed_ns, manager.call_count
+
+
+def run_scheduler_breakdown(
+    *,
+    manager_backend: str,
+    cache_type: str,
+    prefix_mode: str,
+    batch_size: int,
+    phase: str,
+    prompt_tokens: int = 100_000,
+    block_size: int = 16,
+    max_model_len: int = 160_000,
+    max_num_batched_tokens: int = 8192,
+    warmups: int = 5,
+    iterations: int = 31,
+) -> SchedulerBreakdownResult:
+    """Separate KV-manager time from the rest of async Scheduler.schedule."""
+    if manager_backend not in {"python", "rust"}:
+        raise ValueError("manager_backend must be python or rust")
+    if cache_type not in {"full", "hybrid-mamba"}:
+        raise ValueError("cache_type must be full or hybrid-mamba")
+    if prefix_mode not in {"shared", "independent"}:
+        raise ValueError("prefix_mode must be shared or independent")
+    if phase not in {"admission", "decode"}:
+        raise ValueError("phase must be admission or decode")
+
+    previous_backend = os.environ.get("VLLM_USE_RUST_KV_CACHE_MANAGER")
+    os.environ["VLLM_USE_RUST_KV_CACHE_MANAGER"] = (
+        "1" if manager_backend == "rust" else "0"
+    )
+    try:
+        num_blocks = max(50_000, batch_size * prompt_tokens // block_size + 10_000)
+        scheduler = _make_scheduler(
+            cache_type=cache_type,
+            block_size=block_size,
+            max_model_len=max_model_len,
+            num_blocks=num_blocks,
+            max_num_seqs=batch_size,
+            max_num_batched_tokens=max_num_batched_tokens,
+            async_scheduling=True,
+        )
+        if prefix_mode == "shared":
+            _seed_prefix(scheduler, prompt_tokens, block_size)
+        elif phase == "decode":
+            for token_id in range(1, batch_size + 1):
+                _seed_prefix(scheduler, prompt_tokens, block_size, token_id)
+
+        timed_manager = _TimedKVManager(scheduler.kv_cache_manager)
+        scheduler.kv_cache_manager = timed_manager
+        total_samples = []
+        kv_samples = []
+        call_samples = []
+
+        if phase == "admission":
+            for iteration in range(warmups + iterations):
+                requests = _make_profile_requests(
+                    prefix_mode,
+                    batch_size,
+                    iteration,
+                    prompt_tokens,
+                    100,
+                    block_size,
+                )
+                for request in requests:
+                    scheduler.add_request(request)
+                _, total_ns, kv_ns, call_count = _measure_schedule(
+                    scheduler, timed_manager
+                )
+                scheduler.finish_requests(
+                    [request.request_id for request in requests],
+                    RequestStatus.FINISHED_ABORTED,
+                )
+                if iteration >= warmups:
+                    total_samples.append(total_ns)
+                    kv_samples.append(kv_ns)
+                    call_samples.append(call_count)
+        else:
+            requests = _make_profile_requests(
+                prefix_mode,
+                batch_size,
+                0,
+                prompt_tokens,
+                warmups + iterations + 16,
+                block_size,
+            )
+            for request in requests:
+                scheduler.add_request(request)
+            while any(request.num_output_tokens == 0 for request in requests):
+                output = scheduler.schedule()
+                scheduler.update_from_output(output, _model_output(scheduler, output))
+
+            for iteration in range(warmups + iterations):
+                output, total_ns, kv_ns, call_count = _measure_schedule(
+                    scheduler, timed_manager
+                )
+                scheduler.update_from_output(output, _model_output(scheduler, output))
+                if iteration >= warmups:
+                    total_samples.append(total_ns)
+                    kv_samples.append(kv_ns)
+                    call_samples.append(call_count)
+
+        non_kv_samples = [
+            max(total_ns - kv_ns, 0)
+            for total_ns, kv_ns in zip(total_samples, kv_samples)
+        ]
+        non_kv_shares = [
+            non_kv_ns / total_ns
+            for total_ns, non_kv_ns in zip(total_samples, non_kv_samples)
+        ]
+        return SchedulerBreakdownResult(
+            manager_backend=manager_backend,
+            cache_type=cache_type,
+            prefix_mode=prefix_mode,
+            batch_size=batch_size,
+            phase=phase,
+            schedule_median_us=_median_us(total_samples),
+            schedule_p90_us=_percentile_us(total_samples, 0.9),
+            kv_manager_median_us=_median_us(kv_samples),
+            non_kv_median_us=_median_us(non_kv_samples),
+            non_kv_share_median=statistics.median(non_kv_shares),
+            kv_calls_per_step_median=statistics.median(call_samples),
+        )
+    finally:
+        if previous_backend is None:
+            os.environ.pop("VLLM_USE_RUST_KV_CACHE_MANAGER", None)
+        else:
+            os.environ["VLLM_USE_RUST_KV_CACHE_MANAGER"] = previous_backend
+
+
 def invoke_main() -> None:
     parser = FlexibleArgumentParser(
         description="Benchmark KV cache planning through Scheduler."
@@ -256,24 +483,56 @@ def invoke_main() -> None:
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=31)
     parser.add_argument("--decode-steps", type=int, default=301)
+    parser.add_argument("--breakdown", action="store_true")
+    parser.add_argument(
+        "--prefix-modes",
+        nargs="+",
+        choices=("shared", "independent"),
+        default=["shared", "independent"],
+    )
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=[4, 32])
+    parser.add_argument(
+        "--phases", nargs="+", choices=("admission", "decode"), default=["decode"]
+    )
     args = parser.parse_args()
     init_none_hash(sha256)
-    results = [
-        run_scheduler_scenario(
-            manager_backend=backend,
-            cache_type=args.cache_type,
-            prompt_tokens=args.prompt_tokens,
-            block_size=args.block_size,
-            max_model_len=args.max_model_len,
-            num_blocks=args.num_blocks,
-            max_num_seqs=args.max_num_seqs,
-            max_num_batched_tokens=args.max_num_batched_tokens,
-            warmups=args.warmups,
-            iterations=args.iterations,
-            decode_steps=args.decode_steps,
-        )
-        for backend in args.manager_backends
-    ]
+    if args.breakdown:
+        results = [
+            run_scheduler_breakdown(
+                manager_backend=backend,
+                cache_type=args.cache_type,
+                prefix_mode=prefix_mode,
+                batch_size=batch_size,
+                phase=phase,
+                prompt_tokens=args.prompt_tokens,
+                block_size=args.block_size,
+                max_model_len=args.max_model_len,
+                max_num_batched_tokens=args.max_num_batched_tokens,
+                warmups=args.warmups,
+                iterations=args.iterations,
+            )
+            for backend in args.manager_backends
+            for prefix_mode in args.prefix_modes
+            for batch_size in args.batch_sizes
+            for phase in args.phases
+        ]
+    else:
+        results = [
+            run_scheduler_scenario(
+                manager_backend=backend,
+                cache_type=args.cache_type,
+                prompt_tokens=args.prompt_tokens,
+                block_size=args.block_size,
+                max_model_len=args.max_model_len,
+                num_blocks=args.num_blocks,
+                max_num_seqs=args.max_num_seqs,
+                max_num_batched_tokens=args.max_num_batched_tokens,
+                warmups=args.warmups,
+                iterations=args.iterations,
+                decode_steps=args.decode_steps,
+            )
+            for backend in args.manager_backends
+        ]
     print(json.dumps([asdict(result) for result in results], indent=2))
 
 

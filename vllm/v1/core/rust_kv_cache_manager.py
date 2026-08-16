@@ -7,7 +7,7 @@ from typing import Any
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.utils.math_utils import cdiv
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_manager import KVCacheBlockIds, KVCacheBlocks
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
@@ -116,10 +116,7 @@ class RustFullAttentionKVCacheManager:
         self._core = _NativeFullAttentionManager(
             kv_cache_config.num_blocks, self.block_size, enable_caching
         )
-        self._blocks = tuple(
-            KVCacheBlock(block_id) for block_id in range(kv_cache_config.num_blocks)
-        )
-        self.empty_kv_cache_blocks = KVCacheBlocks(((),))
+        self.empty_kv_cache_blocks = KVCacheBlockIds(((),))
         self.coordinator = _CoordinatorFacade(self)
         self.block_pool = _BlockPoolFacade(self)
 
@@ -172,7 +169,7 @@ class RustFullAttentionKVCacheManager:
         ids = list(block_ids)
         if not ids:
             return self.empty_kv_cache_blocks
-        return KVCacheBlocks((tuple(self._blocks[block_id] for block_id in ids),))
+        return KVCacheBlockIds((ids,))
 
     def _get_num_blocks_to_allocate(
         self,
@@ -228,8 +225,7 @@ class RustFullAttentionKVCacheManager:
                 "Rust manager"
             )
         computed = new_computed_blocks or self.empty_kv_cache_blocks
-        (computed_group,) = computed.blocks
-        computed_ids = [block.block_id for block in computed_group]
+        (computed_ids,) = computed.get_block_ids()
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
         )
@@ -332,8 +328,8 @@ class RustFullAttentionKVCacheManager:
     def truncate_computed_blocks(
         self, blocks: KVCacheBlocks, num_computed_tokens: int
     ) -> KVCacheBlocks:
-        (group,) = blocks.blocks
-        return KVCacheBlocks((group[: num_computed_tokens // self.block_size],))
+        (group,) = blocks.get_block_ids()
+        return KVCacheBlockIds((group[: num_computed_tokens // self.block_size],))
 
     def take_events(self) -> list[KVCacheEvent]:
         return []
@@ -410,10 +406,7 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
             enable_caching,
             group_is_mamba,
         )
-        self._blocks = tuple(
-            KVCacheBlock(block_id) for block_id in range(kv_cache_config.num_blocks)
-        )
-        self.empty_kv_cache_blocks = KVCacheBlocks(
+        self.empty_kv_cache_blocks = KVCacheBlockIds(
             tuple(() for _ in kv_cache_config.kv_cache_groups)
         )
         self.coordinator = _CoordinatorFacade(self)
@@ -486,12 +479,10 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
     def _wrap_group_block_ids(
         self, block_ids: Iterable[Iterable[int]]
     ) -> KVCacheBlocks:
-        groups = tuple(
-            tuple(self._blocks[block_id] for block_id in group) for group in block_ids
-        )
+        groups = tuple(list(group) for group in block_ids)
         if not any(groups):
             return self.empty_kv_cache_blocks
-        return KVCacheBlocks(groups)
+        return KVCacheBlockIds(groups)
 
     def _get_num_blocks_to_allocate(
         self,
@@ -547,9 +538,7 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
                 "Rust manager"
             )
         computed = new_computed_blocks or self.empty_kv_cache_blocks
-        computed_ids = tuple(
-            [block.block_id for block in group] for group in computed.blocks
-        )
+        computed_ids = computed.get_block_ids()
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
         )

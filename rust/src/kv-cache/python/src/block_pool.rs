@@ -25,9 +25,17 @@ struct BlockState {
     ref_count: u32,
     cache_key: Option<CacheKey>,
     block_hash_num_tokens: usize,
+    parent: Option<BlockReference>,
+    generation: u32,
     previous_free: Option<u32>,
     next_free: Option<u32>,
     in_free_queue: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockReference {
+    block_id: u32,
+    generation: u32,
 }
 
 pub(crate) struct BlockPool {
@@ -182,6 +190,7 @@ impl BlockPool {
             self.cached_blocks.remove(&cache_key);
         }
         self.blocks[block_id as usize].block_hash_num_tokens = 0;
+        self.blocks[block_id as usize].parent = None;
     }
 
     pub(crate) fn allocate(&mut self) -> PyResult<u32> {
@@ -195,6 +204,7 @@ impl BlockPool {
             )));
         }
         state.ref_count = 1;
+        state.generation = state.generation.wrapping_add(1);
         Ok(block_id)
     }
 
@@ -263,6 +273,7 @@ impl BlockPool {
         block_id: u32,
         cache_key: CacheKey,
         num_tokens: usize,
+        parent_block_id: Option<u32>,
     ) -> PyResult<()> {
         if block_id == 0 {
             return Ok(());
@@ -273,11 +284,62 @@ impl BlockPool {
                 "uncached request block {block_id} already has a hash"
             )));
         }
+        let parent = parent_block_id
+            .map(|parent_block_id| {
+                let parent_state = self.state(parent_block_id)?;
+                let parent_cache_key = parent_state.cache_key.as_ref().ok_or_else(|| {
+                    PyAssertionError::new_err(format!(
+                        "parent block {parent_block_id} is not cached"
+                    ))
+                })?;
+                if parent_cache_key.group_id != cache_key.group_id {
+                    return Err(PyAssertionError::new_err(format!(
+                        "parent block {parent_block_id} belongs to cache group {}, not {}",
+                        parent_cache_key.group_id, cache_key.group_id
+                    )));
+                }
+                Ok(BlockReference {
+                    block_id: parent_block_id,
+                    generation: parent_state.generation,
+                })
+            })
+            .transpose()?;
         self.cached_blocks.entry(cache_key.clone()).or_default().push(block_id);
         let state = &mut self.blocks[block_id as usize];
         state.cache_key = Some(cache_key);
         state.block_hash_num_tokens = num_tokens;
+        state.parent = parent;
         Ok(())
+    }
+
+    pub(crate) fn find_cached_path(
+        &self,
+        terminal_block_id: u32,
+        group_id: usize,
+        expected_len: usize,
+    ) -> Option<Vec<u32>> {
+        let mut block_ids = Vec::with_capacity(expected_len);
+        let mut block_id = terminal_block_id;
+        for index in (0..expected_len).rev() {
+            let state = self.blocks.get(block_id as usize)?;
+            if state.cache_key.as_ref()?.group_id != group_id {
+                return None;
+            }
+            block_ids.push(block_id);
+            match (index, state.parent) {
+                (0, None) => {}
+                (0, Some(_)) | (_, None) => return None,
+                (_, Some(parent)) => {
+                    let parent_state = self.blocks.get(parent.block_id as usize)?;
+                    if parent_state.generation != parent.generation {
+                        return None;
+                    }
+                    block_id = parent.block_id;
+                }
+            }
+        }
+        block_ids.reverse();
+        Some(block_ids)
     }
 
     pub(crate) fn ref_count(&self, block_id: u32) -> u32 {
@@ -308,6 +370,7 @@ impl BlockPool {
         for state in &mut self.blocks {
             state.cache_key = None;
             state.block_hash_num_tokens = 0;
+            state.parent = None;
         }
         true
     }

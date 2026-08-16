@@ -115,6 +115,77 @@ class KVCacheBlocks:
         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
 
 
+class _BlockIdSequence(Sequence[KVCacheBlock]):
+    """Lazily expose raw block IDs through the legacy block-object interface."""
+
+    def __init__(self, block_ids: list[int]) -> None:
+        self.block_ids = block_ids
+
+    @overload
+    def __getitem__(self, index: int) -> KVCacheBlock: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[KVCacheBlock]: ...
+
+    def __getitem__(self, index: int | slice) -> KVCacheBlock | Sequence[KVCacheBlock]:
+        if isinstance(index, slice):
+            return _BlockIdSequence(self.block_ids[index])
+        return KVCacheBlock(self.block_ids[index])
+
+    def __len__(self) -> int:
+        return len(self.block_ids)
+
+
+class KVCacheBlockIds(KVCacheBlocks):
+    """KV cache allocation result backed directly by block ID lists.
+
+    Native managers use this representation to avoid materializing Python
+    ``KVCacheBlock`` objects only to convert them back to IDs for model input.
+    The ``blocks`` attribute remains available as a lazy compatibility view.
+    """
+
+    def __init__(self, block_ids: tuple[Sequence[int], ...]) -> None:
+        self._block_ids = tuple(
+            group if isinstance(group, list) else list(group) for group in block_ids
+        )
+        super().__init__(tuple(_BlockIdSequence(group) for group in self._block_ids))
+
+    def __add__(self, other: KVCacheBlocks) -> KVCacheBlocks:
+        if isinstance(other, KVCacheBlockIds):
+            return KVCacheBlockIds(
+                tuple(
+                    first + second
+                    for first, second in zip(
+                        self._block_ids, other._block_ids, strict=True
+                    )
+                )
+            )
+        return super().__add__(other)
+
+    @overload
+    def get_block_ids(
+        self,
+        allow_none: Literal[False] = False,
+    ) -> tuple[list[int], ...]: ...
+
+    @overload
+    def get_block_ids(
+        self,
+        allow_none: Literal[True] = True,
+    ) -> tuple[list[int], ...] | None: ...
+
+    def get_block_ids(
+        self,
+        allow_none: bool = False,
+    ) -> tuple[list[int], ...] | None:
+        if allow_none and all(len(group) == 0 for group in self._block_ids):
+            return None
+        return self._block_ids
+
+    def new_empty(self) -> KVCacheBlocks:
+        return KVCacheBlockIds(tuple(() for _ in self._block_ids))
+
+
 class KVCacheManager:
     def __init__(
         self,
