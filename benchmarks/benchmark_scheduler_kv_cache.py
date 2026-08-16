@@ -10,7 +10,10 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from benchmarks.benchmark_kv_cache_manager import make_kv_cache_config
+from benchmarks.benchmark_kv_cache_manager import (
+    get_kv_cache_block_sizes,
+    make_kv_cache_config,
+)
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -104,6 +107,9 @@ def _make_scheduler(
     max_num_batched_tokens: int,
     async_scheduling: bool = False,
 ) -> Scheduler:
+    scheduler_block_size, hash_block_size, _ = get_kv_cache_block_sizes(
+        cache_type, block_size
+    )
     model_config = ModelConfig(
         model="facebook/opt-125m",
         trust_remote_code=True,
@@ -114,7 +120,7 @@ def _make_scheduler(
         hf_overrides={"max_position_embeddings": max_model_len},
     )
     cache_config = CacheConfig(
-        block_size=block_size,
+        block_size=scheduler_block_size,
         gpu_memory_utilization=0.9,
         cache_dtype="auto",
         enable_prefix_caching=True,
@@ -143,8 +149,8 @@ def _make_scheduler(
     scheduler = scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
-        block_size=block_size,
-        hash_block_size=block_size,
+        block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
         log_stats=False,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )
@@ -219,13 +225,16 @@ def run_scheduler_scenario(
     """Measure scheduler admission, decode, and finish medians."""
     if manager_backend not in {"python", "rust"}:
         raise ValueError("manager_backend must be python or rust")
-    if cache_type not in {"full", "hybrid-mamba"}:
-        raise ValueError("cache_type must be full or hybrid-mamba")
+    if cache_type not in {"full", "hybrid-swa", "hybrid-mamba", "deepseek-v4"}:
+        raise ValueError(
+            "cache_type must be full, hybrid-swa, hybrid-mamba, or deepseek-v4"
+        )
     previous_backend = os.environ.get("VLLM_USE_RUST_KV_CACHE_MANAGER")
     os.environ["VLLM_USE_RUST_KV_CACHE_MANAGER"] = (
         "1" if manager_backend == "rust" else "0"
     )
     try:
+        _, hash_block_size, _ = get_kv_cache_block_sizes(cache_type, block_size)
         scheduler = _make_scheduler(
             cache_type=cache_type,
             block_size=block_size,
@@ -234,13 +243,15 @@ def run_scheduler_scenario(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
         )
-        _seed_prefix(scheduler, prompt_tokens, block_size)
+        _seed_prefix(scheduler, prompt_tokens, hash_block_size)
 
         admission_samples = []
         finish_samples = []
         hit_samples = []
         for index in range(warmups + iterations):
-            request = _make_request(f"admission-{index}", prompt_tokens, 1, block_size)
+            request = _make_request(
+                f"admission-{index}", prompt_tokens, 1, hash_block_size
+            )
             scheduler.add_request(request)
             start_ns = time.perf_counter_ns()
             scheduler_output = scheduler.schedule()
@@ -257,7 +268,7 @@ def run_scheduler_scenario(
                 hit_samples.append(hit_tokens)
 
         steady = _make_request(
-            "steady", prompt_tokens, warmups + decode_steps + 1, block_size
+            "steady", prompt_tokens, warmups + decode_steps + 1, hash_block_size
         )
         scheduler.add_request(steady)
         scheduler_output = scheduler.schedule()
@@ -351,8 +362,10 @@ def run_scheduler_breakdown(
     """Separate KV-manager time from the rest of async Scheduler.schedule."""
     if manager_backend not in {"python", "rust"}:
         raise ValueError("manager_backend must be python or rust")
-    if cache_type not in {"full", "hybrid-mamba"}:
-        raise ValueError("cache_type must be full or hybrid-mamba")
+    if cache_type not in {"full", "hybrid-swa", "hybrid-mamba", "deepseek-v4"}:
+        raise ValueError(
+            "cache_type must be full, hybrid-swa, hybrid-mamba, or deepseek-v4"
+        )
     if prefix_mode not in {"shared", "independent"}:
         raise ValueError("prefix_mode must be shared or independent")
     if phase not in {"admission", "decode"}:
@@ -363,7 +376,13 @@ def run_scheduler_breakdown(
         "1" if manager_backend == "rust" else "0"
     )
     try:
-        num_blocks = max(50_000, batch_size * prompt_tokens // block_size + 10_000)
+        scheduler_block_size, hash_block_size, _ = get_kv_cache_block_sizes(
+            cache_type, block_size
+        )
+        num_blocks = max(
+            50_000,
+            batch_size * prompt_tokens // scheduler_block_size + 10_000,
+        )
         scheduler = _make_scheduler(
             cache_type=cache_type,
             block_size=block_size,
@@ -374,10 +393,10 @@ def run_scheduler_breakdown(
             async_scheduling=True,
         )
         if prefix_mode == "shared":
-            _seed_prefix(scheduler, prompt_tokens, block_size)
+            _seed_prefix(scheduler, prompt_tokens, hash_block_size)
         elif phase == "decode":
             for token_id in range(1, batch_size + 1):
-                _seed_prefix(scheduler, prompt_tokens, block_size, token_id)
+                _seed_prefix(scheduler, prompt_tokens, hash_block_size, token_id)
 
         timed_manager = _TimedKVManager(scheduler.kv_cache_manager)
         scheduler.kv_cache_manager = timed_manager
@@ -393,7 +412,7 @@ def run_scheduler_breakdown(
                     iteration,
                     prompt_tokens,
                     100,
-                    block_size,
+                    hash_block_size,
                 )
                 for request in requests:
                     scheduler.add_request(request)
@@ -415,7 +434,7 @@ def run_scheduler_breakdown(
                 0,
                 prompt_tokens,
                 warmups + iterations + 16,
-                block_size,
+                hash_block_size,
             )
             for request in requests:
                 scheduler.add_request(request)
@@ -472,7 +491,9 @@ def invoke_main() -> None:
         default=["python", "rust"],
     )
     parser.add_argument(
-        "--cache-type", choices=("full", "hybrid-mamba"), default="hybrid-mamba"
+        "--cache-type",
+        choices=("full", "hybrid-swa", "hybrid-mamba", "deepseek-v4"),
+        default="hybrid-mamba",
     )
     parser.add_argument("--prompt-tokens", type=int, default=100_000)
     parser.add_argument("--block-size", type=int, default=16)

@@ -33,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
@@ -106,6 +108,54 @@ def _mamba_spec(block_size: int) -> MambaSpec:
     )
 
 
+def _deepseek_v4_specs() -> list[MLAAttentionSpec | SlidingWindowMLASpec]:
+    return [
+        MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+        SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=128,
+        ),
+        SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=128,
+        ),
+        SlidingWindowMLASpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=8,
+        ),
+        SlidingWindowMLASpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=128,
+        ),
+    ]
+
+
+def get_kv_cache_block_sizes(
+    cache_type: str, block_size: int
+) -> tuple[int, int, tuple[int, ...]]:
+    if cache_type == "deepseek-v4":
+        return 256, 4, (256, 64, 64, 4, 8)
+    num_groups = 3 if cache_type == "hybrid-all" else 1 + cache_type.count("hybrid")
+    return block_size, block_size, (block_size,) * num_groups
+
+
 def make_kv_cache_config(
     cache_type: str,
     num_blocks: int,
@@ -127,6 +177,7 @@ def make_kv_cache_config(
             _sliding_window_spec(block_size, sliding_window),
             _mamba_spec(block_size),
         ],
+        "deepseek-v4": _deepseek_v4_specs(),
     }[cache_type]
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -200,21 +251,25 @@ def run_scenario(
     warmups: int,
     iterations: int,
 ) -> list[BenchmarkResult]:
-    max_cached_blocks = (prompt_tokens - 1) // block_size
-    requested_cached_blocks = int(max_cached_blocks * hit_rate)
-    requested_cached_tokens = requested_cached_blocks * block_size
+    scheduler_block_size, hash_block_size, group_block_sizes = get_kv_cache_block_sizes(
+        cache_type, block_size
+    )
 
-    num_groups = 1 + cache_type.count("hybrid")
-    if cache_type == "hybrid-all":
-        num_groups = 3
-    prompt_blocks = math.ceil(prompt_tokens / block_size)
-    num_blocks = (num_groups + 1) * (prompt_blocks + 2) + 64
+    max_cached_blocks = (prompt_tokens - 1) // scheduler_block_size
+    requested_cached_blocks = int(max_cached_blocks * hit_rate)
+    requested_cached_tokens = requested_cached_blocks * scheduler_block_size
+
+    prompt_blocks = sum(
+        math.ceil(prompt_tokens / group_block_size)
+        for group_block_size in group_block_sizes
+    )
+    num_blocks = 2 * (prompt_blocks + len(group_block_sizes)) + 64
     config = make_kv_cache_config(cache_type, num_blocks, block_size, sliding_window)
     manager_kwargs = dict(
         kv_cache_config=config,
         max_model_len=prompt_tokens,
-        scheduler_block_size=block_size,
-        hash_block_size=block_size,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
         enable_caching=True,
     )
     if manager_backend == "python":
@@ -231,7 +286,7 @@ def run_scenario(
         producer = _make_request(
             "producer",
             token_ids[:requested_cached_tokens],
-            block_size,
+            hash_block_size,
             sha256,
         )
         producer_blocks = manager.allocate_slots(
@@ -241,7 +296,7 @@ def run_scenario(
             raise RuntimeError("failed to populate the prefix cache")
         manager.free(producer)
 
-    consumer = _make_request("consumer", token_ids, block_size, sha256)
+    consumer = _make_request("consumer", token_ids, hash_block_size, sha256)
     manager.new_step_starts()
     _, expected_cached_tokens, _ = manager.get_computed_blocks(consumer)
     if expected_cached_tokens != requested_cached_tokens:
@@ -269,7 +324,7 @@ def run_scenario(
     finally:
         gc.enable()
 
-    steady_request = _make_request("steady", token_ids, block_size, sha256)
+    steady_request = _make_request("steady", token_ids, hash_block_size, sha256)
     if manager.allocate_slots(steady_request, steady_request.num_tokens) is None:
         raise RuntimeError("failed to prepare steady-state allocation benchmark")
     steady_request.num_computed_tokens = steady_request.num_tokens - 1
@@ -326,11 +381,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--prompt-lengths must contain values greater than one")
     if any(not 0 <= hit_rate <= 1 for hit_rate in args.hit_rates):
         raise ValueError("--hit-rates values must be between zero and one")
-    rust_cache_types = set(args.cache_types) - {"full", "hybrid-mamba"}
+    rust_cache_types = set(args.cache_types) - {
+        "full",
+        "hybrid-swa",
+        "hybrid-mamba",
+        "deepseek-v4",
+    }
     if "rust" in args.manager_backends and rust_cache_types:
         raise ValueError(
-            "the Rust manager benchmark supports --cache-types full and "
-            "hybrid-mamba only"
+            "the Rust manager benchmark supports --cache-types full, "
+            "hybrid-swa, hybrid-mamba, and deepseek-v4 only"
         )
     if args.assert_rust_faster and set(args.manager_backends) != {"python", "rust"}:
         raise ValueError("--assert-rust-faster requires --manager-backends python rust")
@@ -434,7 +494,13 @@ def invoke_main() -> None:
     parser.add_argument(
         "--cache-types",
         nargs="+",
-        choices=("full", "hybrid-swa", "hybrid-mamba", "hybrid-all"),
+        choices=(
+            "full",
+            "hybrid-swa",
+            "hybrid-mamba",
+            "hybrid-all",
+            "deepseek-v4",
+        ),
         default=["full", "hybrid-swa", "hybrid-mamba", "hybrid-all"],
     )
     parser.add_argument(

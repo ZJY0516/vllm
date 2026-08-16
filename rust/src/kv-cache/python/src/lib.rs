@@ -13,6 +13,6 @@ use pyo3::types::PyModule;
 #[pymodule]
 fn _rust_kv_cache(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<full_attention::FullAttentionKVCacheManager>()?;
-    m.add_class::<hybrid::HybridMambaKVCacheManager>()?;
+    m.add_class::<hybrid::HybridKVCacheManager>()?;
     Ok(())
 }

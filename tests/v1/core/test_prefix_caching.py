@@ -47,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpecKind,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 
@@ -422,6 +423,217 @@ def test_rust_full_attention_lookup_stops_at_an_evicted_parent():
     assert computed.get_block_ids()[0] == producer_block_ids[:4]
 
 
+def _make_rust_target_model_layout(model: str) -> tuple[KVCacheConfig, int, int]:
+    def full(block_size: int) -> FullAttentionSpec:
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        )
+
+    def sliding(
+        block_size: int,
+        window: int,
+        *,
+        extra_retained_tokens: int = 0,
+        mla: bool = False,
+    ) -> SlidingWindowSpec:
+        spec_cls = SlidingWindowMLASpec if mla else SlidingWindowSpec
+        return spec_cls(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=window,
+            extra_retained_tokens=extra_retained_tokens,
+        )
+
+    if model == "gpt-oss":
+        specs = [full(16), sliding(16, 128)]
+        scheduler_block_size = hash_block_size = 16
+    elif model == "gemma4":
+        specs = [full(16), sliding(16, 128, extra_retained_tokens=32)]
+        scheduler_block_size = hash_block_size = 16
+    elif model == "deepseek-v4":
+        specs = [
+            MLAAttentionSpec(
+                block_size=256,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+            sliding(64, 128, mla=True),
+            sliding(64, 128, mla=True),
+            sliding(4, 8, mla=True),
+            sliding(8, 128, mla=True),
+        ]
+        scheduler_block_size = 256
+        hash_block_size = 4
+    elif model == "glm-5.2":
+        specs = [
+            MLAAttentionSpec(
+                block_size=64,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            )
+        ]
+        scheduler_block_size = hash_block_size = 64
+    else:
+        raise ValueError(f"unknown model layout: {model}")
+
+    return (
+        KVCacheConfig(
+            num_blocks=2048,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec([f"layer_{index}"], spec)
+                for index, spec in enumerate(specs)
+            ],
+        ),
+        scheduler_block_size,
+        hash_block_size,
+    )
+
+
+@pytest.mark.parametrize("model", ["gpt-oss", "gemma4", "deepseek-v4", "glm-5.2"])
+def test_rust_manager_matches_important_model_layouts(model: str):
+    """Protect sparse hits, recycling, and mixed block sizes used by target models."""
+    pytest.importorskip("vllm._rust_kv_cache")
+    from vllm.v1.core.rust_kv_cache_manager import create_rust_kv_cache_manager
+
+    config, scheduler_block_size, hash_block_size = _make_rust_target_model_layout(
+        model
+    )
+
+    def exercise(manager_cls):
+        manager = manager_cls(
+            kv_cache_config=config,
+            max_model_len=2048,
+            scheduler_block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+            enable_caching=True,
+        )
+        token_ids = list(range(768))
+        producer = make_request("producer", token_ids[:512], hash_block_size, sha256)
+        producer_blocks = manager.allocate_slots(producer, producer.num_tokens)
+        assert producer_blocks is not None
+        producer_shape = tuple(len(group) for group in producer_blocks.get_block_ids())
+        manager.free(producer)
+
+        consumer = make_request("consumer", token_ids, hash_block_size, sha256)
+        computed, hit_tokens, shared_prefix_boundary = manager.get_computed_blocks(
+            consumer
+        )
+        computed_ids = computed.get_block_ids()
+        hit_shape = tuple(
+            (
+                len(group),
+                sum(block_id != 0 for block_id in group),
+                next(
+                    (index for index, block_id in enumerate(group) if block_id != 0),
+                    len(group),
+                ),
+            )
+            for group in computed_ids
+        )
+        new_blocks = manager.allocate_slots(
+            consumer,
+            consumer.num_tokens - hit_tokens,
+            num_new_computed_tokens=hit_tokens,
+            new_computed_blocks=computed,
+        )
+        assert new_blocks is not None
+        admission_shape = tuple(len(group) for group in new_blocks.get_block_ids())
+
+        consumer.num_computed_tokens = consumer.num_tokens
+        steady_blocks = manager.allocate_slots(consumer, 1)
+        assert steady_blocks is not None
+        request_ids = manager.get_block_ids(consumer.request_id)
+        steady_shape = tuple(
+            (
+                len(group),
+                sum(block_id != 0 for block_id in group),
+                next(
+                    (index for index, block_id in enumerate(group) if block_id != 0),
+                    len(group),
+                ),
+            )
+            for group in request_ids
+        )
+        common_prefix = manager.get_num_common_prefix_blocks(consumer.request_id)
+        manager.free(consumer)
+        final_state = (manager.usage, manager.reset_prefix_cache())
+        return (
+            producer_shape,
+            hit_tokens,
+            shared_prefix_boundary,
+            hit_shape,
+            admission_shape,
+            steady_shape,
+            common_prefix,
+            final_state,
+        )
+
+    assert exercise(create_rust_kv_cache_manager) == exercise(KVCacheManager)
+
+
+def test_rust_deepseek_v4_dspark_matches_speculative_block_lifecycle():
+    """Guard DSpark's dropped cache tail and seven lookahead slots."""
+    pytest.importorskip("vllm._rust_kv_cache")
+    from vllm.v1.core.rust_kv_cache_manager import create_rust_kv_cache_manager
+
+    config, scheduler_block_size, hash_block_size = _make_rust_target_model_layout(
+        "deepseek-v4"
+    )
+    config.kv_cache_groups[2].is_eagle_group = True
+
+    def exercise(manager_cls):
+        manager = manager_cls(
+            kv_cache_config=config,
+            max_model_len=2048,
+            scheduler_block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+            enable_caching=True,
+            use_eagle=True,
+            num_prefill_lookahead=1,
+        )
+        token_ids = list(range(1280))
+        producer = make_request("producer", token_ids[:1024], hash_block_size, sha256)
+        assert manager.allocate_slots(producer, producer.num_tokens) is not None
+        manager.free(producer)
+
+        consumer = make_request("consumer", token_ids, hash_block_size, sha256)
+        computed, hit_tokens, shared_prefix_boundary = manager.get_computed_blocks(
+            consumer
+        )
+        new_blocks = manager.allocate_slots(
+            consumer,
+            consumer.num_tokens - hit_tokens,
+            num_new_computed_tokens=hit_tokens,
+            new_computed_blocks=computed,
+            num_lookahead_tokens=7,
+        )
+        assert new_blocks is not None
+        result = (
+            hit_tokens,
+            shared_prefix_boundary,
+            tuple(len(group) for group in computed.get_block_ids()),
+            tuple(len(group) for group in new_blocks.get_block_ids()),
+            tuple(len(group) for group in manager.get_block_ids("consumer")),
+        )
+        manager.free(consumer)
+        return result, manager.usage
+
+    expected = exercise(KVCacheManager)
+    actual = exercise(create_rust_kv_cache_manager)
+    assert actual == expected
+    assert actual[0][0] == 768
+    assert actual[0][1] == 1024
+    assert actual[1] == 0.0
+
+
 @pytest.mark.parametrize("mamba_group_count", [1, 3])
 def test_rust_hybrid_mamba_manager_matches_public_state_lifecycle(
     mamba_group_count: int,
@@ -557,7 +769,9 @@ def test_rust_manager_factory_routes_qwen_style_hybrid_groups():
     assert len(manager.empty_kv_cache_blocks.blocks) == 4
 
 
-@pytest.mark.parametrize("cache_type", ["full", "hybrid-mamba"])
+@pytest.mark.parametrize(
+    "cache_type", ["full", "hybrid-swa", "hybrid-mamba", "deepseek-v4"]
+)
 def test_rust_manager_long_context_operations_are_faster_than_python(cache_type):
     pytest.importorskip("vllm._rust_kv_cache")
     from benchmarks.benchmark_kv_cache_manager import run_scenario
@@ -589,12 +803,13 @@ def test_rust_manager_long_context_operations_are_faster_than_python(cache_type)
         )
 
 
-def test_rust_hybrid_mamba_manager_speeds_up_real_scheduler_path():
+@pytest.mark.parametrize("cache_type", ["hybrid-swa", "hybrid-mamba", "deepseek-v4"])
+def test_rust_hybrid_manager_speeds_up_real_scheduler_path(cache_type: str):
     pytest.importorskip("vllm._rust_kv_cache")
     from benchmarks.benchmark_scheduler_kv_cache import run_scheduler_scenario
 
     scenario = dict(
-        cache_type="hybrid-mamba",
+        cache_type=cache_type,
         prompt_tokens=100_000,
         warmups=5,
         iterations=31,

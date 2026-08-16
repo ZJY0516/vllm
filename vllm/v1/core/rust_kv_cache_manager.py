@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Python orchestration for the self-contained Rust KV cache manager."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from vllm.distributed.kv_events import KVCacheEvent
@@ -10,7 +10,14 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlockIds, KVCacheBlocks
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    MambaSpec,
+    RSWASpec,
+    SinkFullAttentionSpec,
+    SlidingWindowSpec,
+)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
@@ -19,7 +26,7 @@ try:
         FullAttentionKVCacheManager as _NativeFullAttentionManager,
     )
     from vllm._rust_kv_cache import (
-        HybridMambaKVCacheManager as _NativeHybridMambaManager,
+        HybridKVCacheManager as _NativeHybridManager,
     )
 except ImportError as exc:  # pragma: no cover - depends on the build configuration.
     raise ImportError(
@@ -65,6 +72,12 @@ class _BlockPoolFacade:
         raise RuntimeError(
             "deferred block release is not supported by the Rust KV cache manager"
         )
+
+
+class _PendingNativeBlocks(KVCacheBlockIds):
+    def __init__(self, block_ids: tuple[Sequence[int], ...], request_id: str) -> None:
+        super().__init__(block_ids)
+        self.request_id = request_id
 
 
 class RustFullAttentionKVCacheManager:
@@ -359,8 +372,8 @@ class RustFullAttentionKVCacheManager:
         pass
 
 
-class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
-    """Native manager for FullAttention and Mamba-align KV cache groups."""
+class RustHybridKVCacheManager(RustFullAttentionKVCacheManager):
+    """Native manager for heterogeneous FullAttention, SWA, and Mamba groups."""
 
     def __init__(
         self,
@@ -379,9 +392,19 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
     ) -> None:
-        del max_in_flight_tokens
-        group_is_mamba = self._validate_hybrid_config(
+        if max_in_flight_tokens is None:
+            max_in_flight_tokens = max_model_len
+        (
+            group_kinds,
+            group_block_sizes,
+            sliding_windows,
+            extra_retained_tokens,
+            max_admission_blocks,
+            eagle_groups,
+        ) = self._validate_hybrid_config(
             kv_cache_config=kv_cache_config,
+            max_model_len=max_model_len,
+            max_in_flight_tokens=max_in_flight_tokens,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             use_eagle=use_eagle,
@@ -394,17 +417,24 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.block_size = scheduler_block_size
+        self.group_block_sizes = group_block_sizes
         self.enable_caching = enable_caching
         self.log_stats = log_stats
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
         if watermark < 0:
             raise ValueError("watermark must be non-negative")
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
-        self._core = _NativeHybridMambaManager(
+        self._core = _NativeHybridManager(
             kv_cache_config.num_blocks,
-            self.block_size,
+            scheduler_block_size,
+            hash_block_size,
             enable_caching,
-            group_is_mamba,
+            group_kinds,
+            group_block_sizes,
+            sliding_windows,
+            extra_retained_tokens,
+            max_admission_blocks,
+            eagle_groups,
         )
         self.empty_kv_cache_blocks = KVCacheBlockIds(
             tuple(() for _ in kv_cache_config.kv_cache_groups)
@@ -416,6 +446,8 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
     def _validate_hybrid_config(
         *,
         kv_cache_config: KVCacheConfig,
+        max_model_len: int,
+        max_in_flight_tokens: int,
         scheduler_block_size: int,
         hash_block_size: int,
         use_eagle: bool,
@@ -424,37 +456,34 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
         dcp_world_size: int,
         pcp_world_size: int,
         metrics_collector: KVCacheMetricsCollector | None,
-    ) -> list[bool]:
-        full_groups = [
-            index
-            for index, group in enumerate(kv_cache_config.kv_cache_groups)
-            if isinstance(group.kv_cache_spec, FullAttentionSpec)
-        ]
-        mamba_groups = [
-            index
-            for index, group in enumerate(kv_cache_config.kv_cache_groups)
-            if isinstance(group.kv_cache_spec, MambaSpec)
-        ]
-        if (
-            not full_groups
-            or not mamba_groups
-            or len(full_groups) + len(mamba_groups)
-            != len(kv_cache_config.kv_cache_groups)
-        ):
-            raise ValueError(
-                "The Rust hybrid manager requires only FullAttention and Mamba "
-                "groups, with at least one group of each type."
-            )
+    ) -> tuple[list[int], list[int], list[int], list[int], list[int], list[bool]]:
         specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
+        if not specs:
+            raise ValueError("The Rust hybrid manager requires a KV cache group.")
+        if any(isinstance(spec, (RSWASpec, SinkFullAttentionSpec)) for spec in specs):
+            raise ValueError(
+                "The Rust hybrid manager does not support R-SWA or sink attention."
+            )
+        supported = (FullAttentionSpec, SlidingWindowSpec, MambaSpec)
+        if any(not isinstance(spec, supported) for spec in specs):
+            names = ", ".join(type(spec).__name__ for spec in specs)
+            raise ValueError(
+                "The Rust hybrid manager supports FullAttention, SlidingWindow, "
+                f"and Mamba align groups, got: {names}."
+            )
         if not (
-            all(spec.block_size == scheduler_block_size for spec in specs)
-            and scheduler_block_size == hash_block_size
+            all(
+                scheduler_block_size % spec.block_size == 0
+                and spec.block_size % hash_block_size == 0
+                for spec in specs
+            )
             and dcp_world_size == 1
             and pcp_world_size == 1
         ):
             raise ValueError(
-                "The Rust hybrid manager requires identical cache, scheduler, "
-                "and hash block sizes with DCP=PCP=1."
+                "The Rust hybrid manager requires every group block size to divide "
+                "the scheduler block size and be divisible by the hash block size, "
+                "with DCP=PCP=1."
             )
         mamba_specs = [spec for spec in specs if isinstance(spec, MambaSpec)]
         if any(spec.mamba_cache_mode != "align" for spec in mamba_specs):
@@ -463,9 +492,45 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
             raise ValueError(
                 "The Rust hybrid manager does not support speculative Mamba blocks."
             )
+        if mamba_specs and any(isinstance(spec, SlidingWindowSpec) for spec in specs):
+            raise ValueError(
+                "The Rust hybrid manager does not yet combine Mamba and "
+                "sliding-window groups."
+            )
+        if mamba_specs and (
+            not any(isinstance(spec, FullAttentionSpec) for spec in specs)
+            or any(spec.block_size != scheduler_block_size for spec in specs)
+            or hash_block_size != scheduler_block_size
+        ):
+            raise ValueError(
+                "Mamba align currently requires a full-attention group and "
+                "identical scheduler, hash, and group block sizes."
+            )
+        eagle_groups = [
+            group.is_eagle_group for group in kv_cache_config.kv_cache_groups
+        ]
+        if use_eagle and not any(eagle_groups):
+            eagle_groups = [True] * len(specs)
+        if not use_eagle:
+            eagle_groups = [False] * len(specs)
+        if any(
+            is_eagle
+            and (
+                isinstance(spec, MambaSpec)
+                or (
+                    isinstance(spec, FullAttentionSpec)
+                    and spec.block_size != scheduler_block_size
+                )
+            )
+            for is_eagle, spec in zip(eagle_groups, specs)
+        ):
+            raise ValueError(
+                "The Rust hybrid manager supports EAGLE/DSpark on sliding-window "
+                "groups or scheduler-sized full-attention groups."
+            )
         unsupported = []
-        if use_eagle or num_prefill_lookahead:
-            unsupported.append("EAGLE/MTP")
+        if num_prefill_lookahead > 1:
+            unsupported.append("multi-module MTP")
         if enable_kv_cache_events:
             unsupported.append("KV cache events")
         if metrics_collector is not None:
@@ -474,14 +539,51 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
             raise ValueError(
                 "The Rust hybrid manager does not support: " + ", ".join(unsupported)
             )
-        return [isinstance(spec, MambaSpec) for spec in specs]
+        group_kinds = [
+            1
+            if isinstance(spec, MambaSpec)
+            else 2
+            if isinstance(spec, SlidingWindowSpec)
+            else 0
+            for spec in specs
+        ]
+        group_block_sizes = [spec.block_size for spec in specs]
+        sliding_windows = [
+            spec.sliding_window if isinstance(spec, SlidingWindowSpec) else 0
+            for spec in specs
+        ]
+        extra_retained_tokens = [
+            spec.extra_retained_tokens if isinstance(spec, SlidingWindowSpec) else 0
+            for spec in specs
+        ]
+        max_admission_blocks = [
+            spec.max_admission_blocks_per_request(
+                max_in_flight_tokens=max_in_flight_tokens,
+                max_model_len=max_model_len,
+            )
+            if isinstance(spec, SlidingWindowSpec)
+            else 0
+            for spec in specs
+        ]
+        return (
+            group_kinds,
+            group_block_sizes,
+            sliding_windows,
+            extra_retained_tokens,
+            max_admission_blocks,
+            eagle_groups,
+        )
 
     def _wrap_group_block_ids(
-        self, block_ids: Iterable[Iterable[int]]
+        self,
+        block_ids: Iterable[Iterable[int]],
+        pending_request_id: str | None = None,
     ) -> KVCacheBlocks:
         groups = tuple(list(group) for group in block_ids)
         if not any(groups):
             return self.empty_kv_cache_blocks
+        if pending_request_id is not None:
+            return _PendingNativeBlocks(groups, pending_request_id)
         return KVCacheBlockIds(groups)
 
     def _get_num_blocks_to_allocate(
@@ -490,6 +592,7 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
         num_tokens: int,
         computed_groups: tuple[list[int], ...],
         num_tokens_main_model: int | None = None,
+        apply_admission_cap: bool = False,
         **_: Any,
     ) -> int:
         return self._core.get_num_blocks_to_allocate(
@@ -497,6 +600,7 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
             num_tokens,
             num_tokens if num_tokens_main_model is None else num_tokens_main_model,
             computed_groups,
+            apply_admission_cap,
         )
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
@@ -504,14 +608,18 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
             return self.empty_kv_cache_blocks, 0, 0
         block_ids, num_computed_tokens, num_uncached = (
             self._core.find_longest_cache_hit(
-                request.block_hashes, request.num_tokens - 1
+                request.request_id,
+                request.block_hashes,
+                request.num_tokens - 1,
             )
         )
         shared_prefix_boundary = (
             num_computed_tokens + num_uncached if num_uncached else 0
         )
         return (
-            self._wrap_group_block_ids(block_ids),
+            self._wrap_group_block_ids(
+                block_ids, pending_request_id=request.request_id
+            ),
             num_computed_tokens,
             shared_prefix_boundary,
         )
@@ -538,7 +646,12 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
                 "Rust manager"
             )
         computed = new_computed_blocks or self.empty_kv_cache_blocks
-        computed_ids = computed.get_block_ids()
+        computed_ids = (
+            None
+            if isinstance(computed, _PendingNativeBlocks)
+            and computed.request_id == request.request_id
+            else computed.get_block_ids()
+        )
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
         )
@@ -595,9 +708,13 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
     def get_block_ids_for_computed_tokens(
         self, request_id: str, num_computed_tokens: int
     ) -> tuple[list[int], ...]:
-        num_blocks = cdiv(num_computed_tokens, self.block_size)
         return tuple(
-            group[:num_blocks] for group in self._core.get_block_ids(request_id)
+            group[: cdiv(num_computed_tokens, block_size)]
+            for group, block_size in zip(
+                self._core.get_block_ids(request_id),
+                self.group_block_sizes,
+                strict=True,
+            )
         )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
@@ -615,9 +732,13 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
     ) -> KVCacheBlocks:
         if num_computed_tokens % self.block_size:
             raise ValueError("num_computed_tokens must be block aligned")
-        num_blocks = num_computed_tokens // self.block_size
+        if isinstance(blocks, _PendingNativeBlocks):
+            self._core.discard_pending_hit(blocks.request_id)
         return self._wrap_group_block_ids(
-            group[:num_blocks] for group in blocks.get_block_ids()
+            group[: num_computed_tokens // block_size]
+            for group, block_size in zip(
+                blocks.get_block_ids(), self.group_block_sizes, strict=True
+            )
         )
 
     def new_step_starts(self) -> None:
@@ -637,10 +758,17 @@ class RustHybridMambaKVCacheManager(RustFullAttentionKVCacheManager):
         self._core.record_blocks_for_zeroing(request_id, start_token)
 
 
+RustHybridMambaKVCacheManager = RustHybridKVCacheManager
+
+
 def create_rust_kv_cache_manager(**kwargs: Any) -> RustFullAttentionKVCacheManager:
     """Construct the native manager selected by the KV cache group layout."""
     kv_cache_config = kwargs["kv_cache_config"]
     specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
-    if any(isinstance(spec, MambaSpec) for spec in specs):
-        return RustHybridMambaKVCacheManager(**kwargs)
-    return RustFullAttentionKVCacheManager(**kwargs)
+    if (
+        len(specs) == 1
+        and isinstance(specs[0], FullAttentionSpec)
+        and not isinstance(specs[0], (RSWASpec, SinkFullAttentionSpec))
+    ):
+        return RustFullAttentionKVCacheManager(**kwargs)
+    return RustHybridKVCacheManager(**kwargs)
