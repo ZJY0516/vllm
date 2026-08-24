@@ -11,7 +11,6 @@ from typing import Any
 import pytest
 import torch
 
-import vllm.v1.core.kv_cache_planning as kv_cache_planning
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
 import vllm.v1.hisparse.runtime as hisparse_runtime_module
 from tests.v1.core.utils import (
@@ -37,9 +36,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor, xxhash, xxhash_cbor
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
-from vllm.v1.core.kv_cache_planning import (
-    get_kv_cache_groups,
-)
+from vllm.v1.core.kv_cache_planning import DefaultKVCacheConfigBuilder
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
@@ -86,6 +83,8 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
+
+default_builder = DefaultKVCacheConfigBuilder()
 
 pytestmark = pytest.mark.cpu_test
 
@@ -1227,13 +1226,16 @@ def test_dcp_target_allocates_replicated_draft_independently(
     specs = {"target": new_mla_spec(), "draft": draft}
     layout = resolve_kv_cache_layout(config, [["LBHNC", "BLHNC"]], specs.values())
     assert layout == KVCacheLayout.BLHNC
-    groups = get_kv_cache_groups(config, specs)
+    groups = default_builder.get_kv_cache_groups(config, specs)
     assert [group.layer_names for group in groups] == [["target"], ["draft"]]
     widths = [g.kv_cache_spec.max_num_blocks_per_req(config, 1024) for g in groups]
     assert widths == [16, 64]
 
-    cache_config = kv_cache_planning.get_kv_cache_config_from_groups(
-        config, groups, available_memory=16 * 1024 * 1024
+    num_blocks = (
+        16 * 1024 * 1024 // default_builder._get_pool_bytes_per_block(config, groups)
+    )
+    cache_config = default_builder.get_kv_cache_config_from_groups(
+        config, groups, num_blocks
     )
     scheduler_config = generate_scheduler_kv_cache_config([cache_config])
     assert get_max_concurrency_for_kv_cache_config(config, cache_config) > 0
@@ -1300,6 +1302,24 @@ def test_full_attention_merge_preserves_replicated_cache_geometry(use_mla):
     assert kv_cache_utils.resolve_dcp_kv_block_size(merged, 4) == 16
     with pytest.raises(AssertionError):
         type(draft).merge([draft, replace(draft, dcp_sharded=True)])
+
+
+def test_dcp_world_size_for_kv_cache_spec_shards_full_attention_only():
+    dcp = 8
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    mla = new_mla_spec()
+    mamba = new_mamba_spec()
+    uniform_mla = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"layer": mla})
+    assert full.dcp_sharded
+    assert mla.dcp_sharded
+    assert uniform_mla.dcp_sharded
+    assert not mamba.dcp_sharded
+    assert kv_cache_utils.resolve_dcp_kv_block_size(full, dcp) == 16 * dcp
+    assert kv_cache_utils.resolve_dcp_kv_block_size(uniform_mla, dcp) == 16 * dcp
+    assert kv_cache_utils.resolve_dcp_kv_block_size(mamba, dcp) == 16
+    assert kv_cache_utils.resolve_dcp_kv_block_size(full, 1) == 16
 
 
 @pytest.mark.parametrize(
