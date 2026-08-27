@@ -245,3 +245,24 @@ def test_unaligned_resume_never_runs_past_its_block(
             f"intermediate chunk end {end} is neither block-aligned nor the "
             f"partial-tail boundary"
         )
+
+
+def test_partial_hit_eagle_keeps_last_full_boundary_stop() -> None:
+    """With fine-grained partial hits the EAGLE drop shrinks to one hash unit,
+    so the last full boundary stays reachable and must remain a split stop;
+    the coarse one-block backoff would orphan it and zero the hit."""
+    (request,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    assert _split(request, PROMPT_LEN, partial_hit=True) == MAMBA_BLOCK_SIZE
+    # Coarse hits keep the one-block backoff: no stop inside a short prompt.
+    (request2,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    assert _split(request2, PROMPT_LEN, partial_hit=False) == PROMPT_LEN
+
+
+def test_partial_hit_eagle_fallback_stop_without_tail_entry() -> None:
+    """A prompt whose tail extends less than one hash unit past the last full
+    boundary registers no partial-tail entry, so the consumer's hash-unit
+    EAGLE drop crosses below that boundary; one block back must remain a
+    split stop as the fallback checkpoint."""
+    prompt_len = 2 * MAMBA_BLOCK_SIZE + 8
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    assert _split(request, prompt_len, partial_hit=True) == MAMBA_BLOCK_SIZE
