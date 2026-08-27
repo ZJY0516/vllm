@@ -845,7 +845,10 @@ def _expand_pools_and_append_tail_kernel(
     o = cols % POOL_SIZE
     pid = tl.load(pool_ids_ptr + row * pid_s0 + g, mask=mask & is_history, other=-1)
     hist_val = (pid * POOL_SIZE + o).to(tl.int32)
-    hist_out = tl.where(pid >= 0, hist_val, -1)
+    # Treat every pool id outside the request's completed-pool range as
+    # invalid. This is defense in depth for custom/top-k kernels: a malformed
+    # positive id must not become an out-of-range sparse-attention gather.
+    hist_out = tl.where((pid >= 0) & (pid < pool_len), hist_val, -1)
 
     # Tail region [topk, out_cols): the request's trailing incomplete pool.
     tail_off = cols - topk
