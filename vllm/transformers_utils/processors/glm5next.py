@@ -2,9 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vLLM-native multimodal processor for GLM-5.3-Flash."""
 
-import json
 import math
-import os
 
 import numpy as np
 import torch
@@ -803,7 +801,10 @@ class Glm5NextProcessor(ProcessorMixin):
         """
         from transformers import AutoTokenizer
 
+        from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
+
         model_path = pretrained_model_name_or_path
+        revision = kwargs.get("revision") or "main"
         tokenizer = AutoTokenizer.from_pretrained(model_path, **kwargs)
 
         def _cap_cfg(cfg: dict, *, is_video: bool) -> dict:
@@ -822,8 +823,17 @@ class Glm5NextProcessor(ProcessorMixin):
             **{k: v for k, v in ip_cfg.items() if k != "image_processor_type"}
         )
 
-        with open(os.path.join(model_path, "processor_config.json")) as f:
-            vp_cfg = _cap_cfg(dict(json.load(f)["video_processor"]), is_video=True)
+        # Hub-aware: ``model_path`` may be a repo id rather than a local
+        # directory, and this runs during startup profiling for text-only
+        # deployments too.
+        proc_cfg = get_hf_file_to_dict("processor_config.json", model_path, revision)
+        if proc_cfg is None or "video_processor" not in proc_cfg:
+            raise ValueError(
+                f"GLM-5.3-Flash requires a processor_config.json with a "
+                f"'video_processor' section; none was found for {model_path!r} "
+                f"(revision {revision!r})."
+            )
+        vp_cfg = _cap_cfg(dict(proc_cfg["video_processor"]), is_video=True)
         video_processor = Glm5NextVideoProcessor(
             **{k: v for k, v in vp_cfg.items() if k != "video_processor_type"}
         )
