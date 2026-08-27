@@ -376,10 +376,18 @@ class Scheduler(SchedulerInterface):
         block_size = self.cache_config.block_size
         # The last block-aligned position whose state can be cached. With
         # Eagle, FullAttn prunes the last matching block, so back off one
-        # block to avoid a Mamba cache miss.
+        # block to avoid a Mamba cache miss. With fine-grained hash hits the
+        # prune unit shrinks to hash_block_size, so the last full boundary
+        # itself stays reachable and must be checkpointed; the previous
+        # boundary is kept as a fallback stop for prompts whose tail has no
+        # partial entry (the hash-unit drop then crosses below the boundary).
         last_cache_position = request.num_tokens - request.num_tokens % block_size
+        eagle_fallback_position = 0
         if self.use_eagle:
-            last_cache_position = max(last_cache_position - block_size, 0)
+            if self.mamba_partial_cache_hit:
+                eagle_fallback_position = max(last_cache_position - block_size, 0)
+            else:
+                last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
@@ -408,6 +416,10 @@ class Scheduler(SchedulerInterface):
             next_block_boundary if start % block_size != 0 else 0,
             # Never run past the last cacheable block boundary mid-chunk.
             last_cache_position,
+            # Fine-grained Eagle: also checkpoint one block back, so prompts
+            # whose tail has no partial entry still leave a state at/below
+            # the consumer's dropped candidate.
+            eagle_fallback_position,
             # Fine-grained hits: the prompt's partial-tail entry can only be
             # registered by a chunk ending exactly at its last hash boundary.
             tail_boundary
