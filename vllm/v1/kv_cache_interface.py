@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
 from fractions import Fraction
+from functools import cached_property
 from math import prod
 from typing import TYPE_CHECKING, TypeVar
 
@@ -549,6 +550,8 @@ class MLAAttentionSpec(FullAttentionSpec):
     # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
     alignment: int | None = None  # Default to None for no padding.
     model_version: str | None = None
+    storage_block_size: int | None = None
+    """Token width used to view storage when it differs from the kernel block."""
     # Marks draft groups that flatten a non-causal query block into decode rows.
     non_causal_multi_token_decode: bool = False
     # MLA stores a single latent vector per state; there is no separate V.
@@ -566,13 +569,16 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        storage_block_size_set = set(spec.storage_block_size for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
+            and len(storage_block_size_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, tokens per state, and model version."
+            "quantization method, tokens per state, model version, and storage "
+            "block size."
         )
         merged_spec = cls(
             block_size=specs[0].block_size,
@@ -586,6 +592,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
+            storage_block_size=storage_block_size_set.pop(),
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
             ),
@@ -1180,6 +1187,8 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    # Whether this group is part of the externally transferable KV state.
+    enable_kv_transfer: bool = True
 
 
 @dataclass
@@ -1204,6 +1213,42 @@ class KVCacheConfig:
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
+
+    @cached_property
+    def transfer_group_ids(self) -> tuple[int, ...]:
+        """IDs of cache groups that participate in external KV transfer."""
+        return tuple(
+            group_id
+            for group_id, group in enumerate(self.kv_cache_groups)
+            if group.enable_kv_transfer
+        )
+
+    @cached_property
+    def transfer_groups(self) -> tuple[KVCacheGroupSpec, ...]:
+        """Cache groups that participate in external KV transfer."""
+        return tuple(
+            self.kv_cache_groups[group_id] for group_id in self.transfer_group_ids
+        )
+
+    @cached_property
+    def transfer_group_index_by_layer(self) -> dict[str, int]:
+        """Transfer-group tuple index for each participating layer."""
+        return {
+            layer_name: group_index
+            for group_index, group in enumerate(self.transfer_groups)
+            for layer_name in group.layer_names
+        }
+
+    def select_transfer_block_ids(
+        self, block_ids: Sequence[list[int]]
+    ) -> tuple[list[int], ...]:
+        """Select block IDs for externally transferable cache groups."""
+        if len(block_ids) != len(self.kv_cache_groups):
+            raise ValueError(
+                f"Expected {len(self.kv_cache_groups)} KV cache groups, "
+                f"got {len(block_ids)}."
+            )
+        return tuple(block_ids[group_id] for group_id in self.transfer_group_ids)
 
     @property
     def has_mamba_layers(self) -> bool:

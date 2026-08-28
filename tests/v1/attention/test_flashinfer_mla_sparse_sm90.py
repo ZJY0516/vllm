@@ -2,25 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests for the FlashInfer SM90 sparse MLA backend wiring (no GPU).
 
-The FlashInfer wrapper is replaced by a recorder, and the top-k conversion
-Triton kernel runs via TRITON_INTERPRET; the tests pin the contract between
-the impl and the kernel API: page_size=1 varlen rows, reserved-buffer
-refresh, plan parameters (dims, NoPE/rope scale, causality), ckv/kpe cache
-splitting, and the backend's model-shape gates.
+The FlashInfer wrapper and top-k conversion are replaced by CPU recorders;
+the tests pin the contract between the impl and the kernel API: page_size=1
+varlen rows, reserved-buffer refresh, plan parameters (dims, NoPE/rope scale,
+causality), ckv/kpe cache splitting, and the backend's model-shape gates.
 """
 
-import os
+from types import SimpleNamespace
 
-os.environ.setdefault("TRITON_INTERPRET", "1")
-
-from types import SimpleNamespace  # noqa: E402
-
-import pytest  # noqa: E402
-import torch  # noqa: E402
+import pytest
+import torch
 
 # isort: off
-import vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 as sm90_mod  # noqa: E402
-from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (  # noqa: E402
+import vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 as sm90_mod
+from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import (
     FlashInferMLASparseSM90Backend,
     FlashInferMLASparseSM90Builder,
     FlashInferMLASparseSM90Impl,
@@ -108,6 +103,9 @@ def test_forward_wiring(monkeypatch, qk_rope, kv_dtype):
     impl, rows = make_impl(qk_rope, kv_dtype)
     state = FakeState(TOPK)
     monkeypatch.setattr(sm90_mod, "_SM90_STATE", state)
+    monkeypatch.setattr(
+        sm90_mod, "triton_convert_req_index_to_global_index", ref_convert
+    )
 
     # req with context 10 < topk: 8 valid + -1 padding.
     topk_rows = [
@@ -173,6 +171,10 @@ def test_plan_uses_state_params(monkeypatch):
     state.max_tokens = 4
     state.topk_width = TOPK
     state.kv_indices = torch.zeros(4 * TOPK)
+    state._arange_cpu = torch.arange(5, dtype=torch.int32)
+    state._qo_cpu = torch.empty(5, dtype=torch.int32)
+    state._kv_cpu = torch.empty(5, dtype=torch.int32)
+    state._lens_cpu = torch.full((4,), TOPK, dtype=torch.int32)
 
     state.plan(3, torch.tensor([2, 5, 7], dtype=torch.int32))
     assert wrapper.plan_args is not None
@@ -193,10 +195,13 @@ def test_kv_lens_host_formula():
     builder = object.__new__(FlashInferMLASparseSM90Builder)
     builder._index_topk = 2048
     builder._index_kpool = 4
+    builder._async_scheduling = False
     cam = SimpleNamespace(
         num_reqs=3,
         query_start_loc_cpu=torch.tensor([0, 5, 7, 10], dtype=torch.int32),
         seq_lens=torch.tensor([100, 9, 3000], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([100, 9, 3000], dtype=torch.int32),
+        positions=None,
     )
     num_rows, lens = builder._kv_lens_host(cam)
     assert num_rows == 10

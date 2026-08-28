@@ -59,7 +59,7 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping, LoRAMappingType
-from vllm.model_executor.layers.attention import Attention, MLAAttention
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -132,7 +132,6 @@ from vllm.utils.torch_utils import (
     PIN_MEMORY,
     async_tensor_h2d,
     current_stream,
-    is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import (
@@ -1026,60 +1025,6 @@ class GPUModelRunner(
         """
         self.encoder_cache.clear()
         self.late_interaction_runner.clear()
-
-    def post_kv_cache_wake_up(self) -> None:
-        self.init_fp8_kv_scales()
-
-    @torch.inference_mode()
-    def init_fp8_kv_scales(self) -> None:
-        """
-        Re-initialize the KV cache and FP8 scales after waking from sleep.
-        1. Zero out the KV cache tensors to remove garbage data from re-allocation.
-        2. Reset Attention layer scaling factors (_k_scale, _v_scale) to 1.0.
-          If these are left at 0.0 (default after wake_up), all KV cache values
-          become effectively zero, causing gibberish output.
-        """
-        if not is_quantized_kv_cache(self.cache_config.cache_dtype):
-            return
-
-        kv_caches = getattr(self, "kv_caches", [])
-        for cache_entry in kv_caches:
-            if cache_entry is None:
-                continue
-            # Hybrid models (Mamba, DeltaNet) store per-layer state as a
-            # list of tensors rather than a single tensor.
-            if isinstance(cache_entry, list):
-                for t in cache_entry:
-                    t.zero_()
-            else:
-                cache_entry.zero_()
-
-        k_attr_names = ("_k_scale", "k_scale")
-        v_attr_names = ("_v_scale", "v_scale")
-
-        attn_layers = self.compilation_config.static_forward_context
-        for name, module in attn_layers.items():
-            if isinstance(module, (Attention, MLAAttention)):
-                # TODO: Generally, scale is 1.0 if user uses on-the-fly fp8
-                # kvcache quant. However, to get better accuracy, compression
-                # frameworks like llm-compressors allow users to tune the
-                # scale. We may need to restore the specific calibrated scales
-                # here in the future.
-                k_scale_val, v_scale_val = 1.0, 1.0
-
-                # Processing K Scale
-                for attr in k_attr_names:
-                    if hasattr(module, attr):
-                        param = getattr(module, attr)
-                        if isinstance(param, torch.Tensor):
-                            param.fill_(k_scale_val)
-
-                # Processing V Scale
-                for attr in v_attr_names:
-                    if hasattr(module, attr):
-                        param = getattr(module, attr)
-                        if isinstance(param, torch.Tensor):
-                            param.fill_(v_scale_val)
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -3981,18 +3926,6 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
-    def _all_reqs_past_prompt(self, num_reqs: int) -> bool:
-        """Return whether every scheduled request has finished its prompt."""
-        if num_reqs <= 0:
-            return True
-        batch = self.input_batch
-        return bool(
-            np.all(
-                batch.num_computed_tokens_cpu[:num_reqs]
-                >= batch.num_prompt_tokens[:num_reqs]
-            )
-        )
-
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -4000,7 +3933,6 @@ class GPUModelRunner(
         num_tokens: int,
         num_reqs: int,
         force_uniform_decode: bool | None = None,
-        all_reqs_past_prompt: bool = True,
     ) -> bool:
         """
         Checks if it's a decode batch with same amount scheduled tokens
@@ -4010,7 +3942,6 @@ class GPUModelRunner(
             (
                 (max_num_scheduled_tokens == uniform_decode_query_len)
                 and (num_tokens == max_num_scheduled_tokens * num_reqs)
-                and all_reqs_past_prompt
             )
             if force_uniform_decode is None
             else force_uniform_decode
@@ -4089,7 +4020,6 @@ class GPUModelRunner(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
-            all_reqs_past_prompt=self._all_reqs_past_prompt(num_reqs),
         )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
@@ -7459,7 +7389,10 @@ class GPUModelRunner(
             yield from attn_groups
 
     def initialize_kv_cache_tensors(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int],
+        kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Initialize the memory buffer for KV cache.
@@ -7473,12 +7406,14 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
 
-        kv_caches = allocate_kv_cache(
-            kv_cache_config,
-            self.device,
-            self.cache_config.get_resolved_kv_cache_layout(),
-            kernel_block_sizes,
-        )
+        allocation_context = kv_cache_allocation_context or nullcontext()
+        with allocation_context:
+            kv_caches = allocate_kv_cache(
+                kv_cache_config,
+                self.device,
+                self.cache_config.get_resolved_kv_cache_layout(),
+                kernel_block_sizes,
+            )
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -7528,6 +7463,7 @@ class GPUModelRunner(
         self,
         kv_cache_config: KVCacheConfig,
         is_profiling: bool = False,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
     ) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
@@ -7560,7 +7496,9 @@ class GPUModelRunner(
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
         kv_caches = self.initialize_kv_cache_tensors(
-            kv_cache_config, kernel_block_sizes
+            kv_cache_config,
+            kernel_block_sizes,
+            kv_cache_allocation_context=kv_cache_allocation_context,
         )
 
         if (
