@@ -54,7 +54,11 @@ def build_offloading_config(
     )
 
     _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-    for group in groups:
+    for group, kv_cache_group in zip(groups, kv_cache_config.kv_cache_groups):
+        if not kv_cache_group.kv_cache_spec.prefix_cacheable:
+            # Per-request scratch groups (e.g. KpoolTailSpec) carry no prefix
+            # hashes and are excluded from offloading by the scheduler.
+            continue
         assert group.tokens_per_block % tokens_per_hash == 0, (
             f"tokens_per_block={group.tokens_per_block} not divisible by "
             f"tokens_per_hash={tokens_per_hash}. "
@@ -81,7 +85,11 @@ def build_offloading_config(
     elif tokens_per_chunk is not None:
         tokens_per_chunk_int = int(tokens_per_chunk)
 
-        unique_tokens_per_block = {group.tokens_per_block for group in groups}
+        unique_tokens_per_block = {
+            group.tokens_per_block
+            for group, kv_cache_group in zip(groups, kv_cache_config.kv_cache_groups)
+            if kv_cache_group.kv_cache_spec.prefix_cacheable
+        }
 
         assert len(unique_tokens_per_block) == 1, (
             "If 'block_size' is specified in kv_connector_extra_config, "
