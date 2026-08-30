@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU tests for the decode top-k row->token mapping (no GPU required).
+"""Tests for the decode top-k row-to-token mapping.
 
 On non-uniform decode batches (``requires_padding`` -- mixed plain-decode and
 spec-verify requests, or variable MTP verify lens; taken on Hopper where the
@@ -18,6 +18,7 @@ expansion consequences via the pure-torch expand/append pair that the fused
 kernel is documented to replicate.
 """
 
+import pytest
 import torch
 
 # Bootstrap the glm5next package before entering the indexer module: its
@@ -35,6 +36,7 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import (  # noqa: E402
 import vllm.model_executor.layers.sparse_attn_indexer_kpool as indexer_mod
 from vllm.model_executor.layers.sparse_attn_indexer_kpool import (
     _decode_topk_seq_lens,
+    _fill_causal_indices,
     _fill_short_decode_causal_indices,
 )
 from vllm.platforms import current_platform
@@ -67,6 +69,28 @@ def test_short_decode_leaves_buffer_unchanged_for_sparse_context():
 
     assert not _fill_short_decode_causal_indices(topk, torch.tensor([7, 8]), 2, 9, 8)
     assert torch.equal(topk, before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_cols", [7, 2048, 2051])
+def test_fill_causal_indices_cuda_supports_strided_views(num_cols):
+    positions_storage = torch.tensor(
+        [[0, -99], [num_cols // 2, -99], [num_cols - 1, -99]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    positions = positions_storage[:, 0]
+    rows_storage = torch.full((3, 2 * num_cols), 99, device="cuda", dtype=torch.int32)
+    rows = rows_storage[:, ::2]
+
+    _fill_causal_indices(rows, positions)
+
+    causal_range = torch.arange(num_cols, device="cuda", dtype=torch.int32)
+    expected = torch.where(
+        causal_range[None, :] <= positions[:, None], causal_range[None, :], -1
+    )
+    torch.testing.assert_close(rows, expected)
+    assert torch.all(rows_storage[:, 1::2] == 99)
 
 
 def make_non_uniform_batch():

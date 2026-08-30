@@ -14,6 +14,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
 if TYPE_CHECKING:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
@@ -193,7 +194,44 @@ def _decode_topk_seq_lens(
     return padded.reshape(n) + 1  # pad rows: -1 + 1 = 0 -> empty tail
 
 
+@triton.jit
+def _fill_causal_indices_kernel(
+    rows_ptr,
+    positions_ptr,
+    row_stride,
+    col_stride,
+    position_stride,
+    num_cols: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    col_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < num_cols
+    position = tl.load(positions_ptr + row_idx * position_stride)
+    values = tl.where(col_offsets <= position, col_offsets, -1)
+    tl.store(
+        rows_ptr + row_idx * row_stride + col_offsets * col_stride,
+        values,
+        mask=mask,
+    )
+
+
 def _fill_causal_indices(rows: torch.Tensor, positions: torch.Tensor) -> None:
+    if current_platform.is_cuda() and rows.is_cuda:
+        block_size = min(2048, triton.next_power_of_2(rows.shape[1]))
+        grid = (rows.shape[0], triton.cdiv(rows.shape[1], block_size))
+        _fill_causal_indices_kernel[grid](
+            rows,
+            positions,
+            rows.stride(0),
+            rows.stride(1),
+            positions.stride(0),
+            rows.shape[1],
+            block_size,
+            num_warps=4,
+        )
+        return
+
     causal_range = torch.arange(rows.shape[1], device=rows.device, dtype=torch.int32)
     positions = positions.to(torch.int32)
     rows[:] = causal_range[None, :]
@@ -732,7 +770,7 @@ def sparse_attn_indexer_kpool(
                     head_dim,
                     round_scale=(scale_fmt is not None),
                 )
-        if current_platform.is_rocm() and _fill_short_decode_causal_indices(
+        if current_platform.is_cuda_alike() and _fill_short_decode_causal_indices(
             topk_indices_buffer,
             positions,
             num_decode_tokens,
