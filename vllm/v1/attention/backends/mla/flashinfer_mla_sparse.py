@@ -220,6 +220,16 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
                     "FLASHINFER_MLA_SPARSE_SM120 requires index_topk=2048; "
                     f"got {index_topk}"
                 )
+            # The shipped FlashInfer SM120 sparse-MLA dispatch does not cover
+            # NoPE MLA (qk_rope_head_dim == 0) at this top-k; only the with-rope
+            # (d_qk=576) table has the 2048 slot. Decline so the selector can
+            # fall through to a NoPE-capable backend. Remove once FlashInfer
+            # #4842 (GLM53_NOPE kernel) is in a pinned FlashInfer release.
+            if getattr(hf_text_config, "qk_rope_head_dim", None) == 0:
+                return (
+                    "FLASHINFER_MLA_SPARSE_SM120 does not support NoPE MLA "
+                    "(qk_rope_head_dim == 0) at this top-k"
+                )
         return None
 
 
