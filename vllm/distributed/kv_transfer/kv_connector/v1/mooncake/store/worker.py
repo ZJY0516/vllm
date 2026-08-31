@@ -2014,7 +2014,7 @@ class MooncakeStoreWorker:
         # candidate_meta stores the (group, hash_bytes) for key slice.
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
-        fine_grained = False
+        fine_grained = self.coord.enable_partial_hash_hits
         lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
         for g_idx, db in enumerate(self.token_dbs):
             if (
