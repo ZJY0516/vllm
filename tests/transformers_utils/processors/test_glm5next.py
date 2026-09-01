@@ -11,7 +11,9 @@ from transformers.image_utils import PILImageResampling
 from transformers.video_utils import VideoMetadata
 
 from vllm.transformers_utils.processors.glm5next import (
+    _MAX_VIDEO_TOKENS,
     Glm5NextImageProcessor,
+    Glm5NextProcessor,
     Glm5NextVideoProcessor,
     _get_pad_content_size,
     _resize_or_pad,
@@ -387,3 +389,68 @@ def test_video_config_fields_land():
         )
         == 16
     )
+
+
+def _offline_tokenizer():
+    """A minimal fast tokenizer; ``ProcessorMixin`` type-checks the real class."""
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(
+        models.WordLevel({"<|image|>": 0, "<|video|>": 1}, unk_token="<|image|>")
+    )
+    return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+
+def test_from_pretrained_reads_processor_config_hub_aware(monkeypatch):
+    """``processor_config.json`` must resolve from a repo id, not only a path.
+
+    The tokenizer and the image-processor config were hub-aware while the
+    video-processor config was read with a bare ``open(os.path.join(...))``,
+    so serving with a repo id instead of a local snapshot died with
+    ``FileNotFoundError``. That read happens during startup profiling, so it
+    hit text-only deployments too.
+    """
+    from vllm.transformers_utils.processors import glm5next as mod
+
+    calls = []
+
+    def fake_get_hf_file_to_dict(file_name, model, revision="main"):
+        calls.append((file_name, model, revision))
+        return {"video_processor": {"max_image_tokens": 240000}}
+
+    monkeypatch.setattr(
+        "vllm.transformers_utils.repo_utils.get_hf_file_to_dict",
+        fake_get_hf_file_to_dict,
+    )
+    monkeypatch.setattr(mod, "get_image_processor_config", lambda path: {})
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained",
+        lambda path, **kwargs: _offline_tokenizer(),
+    )
+
+    proc = Glm5NextProcessor.from_pretrained(
+        "zai-org/GLM-5.3-Flash", revision="deadbeef"
+    )
+
+    assert calls == [("processor_config.json", "zai-org/GLM-5.3-Flash", "deadbeef")]
+    # The serving cap on the video token budget still applies.
+    assert proc.video_processor.max_image_tokens == _MAX_VIDEO_TOKENS
+
+
+def test_from_pretrained_rejects_missing_processor_config(monkeypatch):
+    """A missing config must say so, not raise on a ``None`` subscript."""
+    from vllm.transformers_utils.processors import glm5next as mod
+
+    monkeypatch.setattr(
+        "vllm.transformers_utils.repo_utils.get_hf_file_to_dict",
+        lambda file_name, model, revision="main": None,
+    )
+    monkeypatch.setattr(mod, "get_image_processor_config", lambda path: {})
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained",
+        lambda path, **kwargs: _offline_tokenizer(),
+    )
+
+    with pytest.raises(ValueError, match="processor_config.json"):
+        Glm5NextProcessor.from_pretrained("zai-org/GLM-5.3-Flash")
