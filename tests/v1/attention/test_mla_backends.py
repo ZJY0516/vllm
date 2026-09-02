@@ -188,18 +188,32 @@ def test_masked_mha_routing_is_dimension_specific():
 
 
 @pytest.mark.parametrize(
-    ("cache_dtype", "expected_quant_mode"),
+    (
+        "cache_dtype",
+        "expected_quant_mode",
+        "head_size",
+        "qk_rope_head_dim",
+        "expected_page_size_bytes",
+    ),
     [
-        ("auto", KVQuantMode.NONE),
-        ("fp8_ds_mla", KVQuantMode.FP8_PER_TENSOR),
+        ("auto", KVQuantMode.NONE, 576, 64, None),
+        ("fp8_ds_mla", KVQuantMode.FP8_PER_TENSOR, 576, 64, 64 * 656),
+        # A NoPE model (GLM-5.3): no RoPE elements, so the packed entry is
+        # 512 + 16 rather than 656.
+        ("fp8_ds_mla", KVQuantMode.FP8_PER_TENSOR, 512, 0, 64 * 528),
     ],
 )
 def test_mla_kv_cache_spec_uses_layer_cache_dtype(
-    cache_dtype: str, expected_quant_mode: KVQuantMode
+    cache_dtype: str,
+    expected_quant_mode: KVQuantMode,
+    head_size: int,
+    qk_rope_head_dim: int,
+    expected_page_size_bytes: int | None,
 ):
     layer = SimpleNamespace(
         kv_cache_dtype=cache_dtype,
-        head_size=576,
+        head_size=head_size,
+        qk_rope_head_dim=qk_rope_head_dim,
         non_causal_multi_token_decode=False,
         sliding_window=None,
     )
@@ -212,8 +226,8 @@ def test_mla_kv_cache_spec_uses_layer_cache_dtype(
     assert isinstance(spec, MLAAttentionSpec)
     assert spec.cache_dtype_str == cache_dtype
     assert spec.kv_quant_mode == expected_quant_mode
-    if cache_dtype == "fp8_ds_mla":
-        assert spec.page_size_bytes == 64 * 656
+    if expected_page_size_bytes is not None:
+        assert spec.page_size_bytes == expected_page_size_bytes
 
 
 @pytest.mark.cpu_test

@@ -532,8 +532,10 @@ __global__ void concat_and_cache_ds_mla_kernel(
   // For the NoPE part, each tile of 128 elements is handled by half of one warp
   // (16 threads). There are 4 total tiles, so 2 warps (64 threads).
   // Lanes 0 and 16 of each warp write the scale values for that warp's tiles.
-  // The RoPE part (last 64 elements) is handled by another 1 warp (32 threads).
-  // So in total, we use 3 warps (96 threads) per block.
+  // The RoPE part (last pe_dim elements) is handled by another pe_dim / 2
+  // threads -- 1 warp for DeepSeek's pe_dim == 64, and none at all for a
+  // rope-free (NoPE) model, where the entry ends after the scales.
+  // So a block is 64 + pe_dim / 2 threads: 96 for DeepSeek, 64 for NoPE.
 
   // Cast kv_cache to 16_bit for RoPE values
   scalar_t* kv_cache_16bit =
@@ -925,9 +927,17 @@ void concat_and_cache_mla(
   if (kv_cache_dtype == "fp8_ds_mla") {
     STD_TORCH_CHECK(kv_lora_rank == 512,
                     "kv_lora_rank must be 512 for fp8_ds_mla");
-    STD_TORCH_CHECK(pe_dim == 64, "pe_dim must be 64 for fp8_ds_mla");
-    STD_TORCH_CHECK(kv_cache.size(2) == 656 / kv_cache.element_size(),
-                    "kv_cache.size(2) must be 656 bytes for fp8_ds_mla");
+    // pe_dim == 0 is the NoPE case (GLM-5.3 sets qk_rope_head_dim=0). The
+    // entry is then the 512 packed fp8 values plus 16 bytes of scales;
+    // DeepSeek's 64-dim RoPE adds 128 bytes on top, giving the familiar 656.
+    STD_TORCH_CHECK(pe_dim == 64 || pe_dim == 0,
+                    "pe_dim must be 64 (RoPE) or 0 (NoPE) for fp8_ds_mla, got ",
+                    pe_dim);
+    const int64_t ds_mla_entry_bytes = 512 + 16 + 2 * pe_dim;
+    STD_TORCH_CHECK(
+        kv_cache.size(2) == ds_mla_entry_bytes / kv_cache.element_size(),
+        "kv_cache.size(2) must be ", ds_mla_entry_bytes,
+        " bytes for fp8_ds_mla with pe_dim=", pe_dim);
     STD_TORCH_CHECK(kv_c.element_size() == 2,
                     "kv_c.element_size() must be 2 for fp8_ds_mla");
     STD_TORCH_CHECK(k_pe.element_size() == 2,
@@ -967,7 +977,11 @@ void concat_and_cache_mla(
     // Lanes 0 and 16 of each warp write the scale values for that warp's tiles.
     // The RoPE part (last 64 elements) is handled by another 1 warp (32
     // threads). So in total, we use 3 warps (96 threads) per block.
-    dim3 block(96);
+    // Size the RoPE warp from pe_dim rather than hardcoding it: with NoPE
+    // (pe_dim == 0) there is no RoPE data, and the extra 32 threads would read
+    // past an empty k_pe and write past the end of the 528-byte entry. Each
+    // RoPE thread handles two elements, so pe_dim / 2 threads.
+    dim3 block(64 + pe_dim / 2);
     DISPATCH_BY_KV_CACHE_DTYPE(kv_c.scalar_type(), kv_cache_dtype,
                                CALL_CONCAT_AND_CACHE_DS_MLA);
   } else if (is_nvfp4_ds_mla) {

@@ -473,3 +473,31 @@ class TestMLAPrefillBackendConfig:
             mla_prefill_backend=MLAPrefillBackendEnum.TRTLLM_RAGGED,
         )
         assert config.mla_prefill_backend == MLAPrefillBackendEnum.TRTLLM_RAGGED
+
+
+def test_flash_attn_prefill_accepts_nope_mla_dimensions():
+    """A rope-free MLA model must be accepted by the FlashAttention prefill.
+
+    GLM-5.3 sets qk_rope_head_dim=0, so its dimensions are (256, 0, 256) --
+    the same 256 total qk head dim and 256 v head dim as the (192, 64, 256)
+    entry, only with the RoPE share at zero. This impl never splits on the
+    RoPE part, so the shape is identical from FlashAttention's point of view.
+    """
+    from vllm.v1.attention.backends.mla.prefill.flash_attn import (
+        FlashAttnPrefillBackend,
+    )
+
+    selector_config = MLAPrefillSelectorConfig(
+        dtype=torch.bfloat16,
+        mla_dimensions=MLADimensions(
+            qk_nope_head_dim=256,
+            qk_rope_head_dim=0,
+            v_head_dim=256,
+        ),
+    )
+    with patch.object(FlashAttnPrefillBackend, "is_available", return_value=True):
+        invalid_reasons = FlashAttnPrefillBackend.validate_configuration(
+            DeviceCapability(major=12, minor=0),
+            selector_config,
+        )
+    assert invalid_reasons == []
