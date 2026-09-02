@@ -327,6 +327,16 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
                 qk_rope_head_dim=64,
                 v_head_dim=128,
             ),
+            # GLM-5.3 (NoPE MLA): same total qk head dim (256) and v head dim
+            # (256) as the 192 + 64 entry above, only with the RoPE share at
+            # zero. This impl uses qk_nope + qk_rope purely as a total and
+            # never splits on the RoPE part, so the shape is identical from
+            # FlashAttention's point of view.
+            MLADimensions(
+                qk_nope_head_dim=256,
+                qk_rope_head_dim=0,
+                v_head_dim=256,
+            ),
         ]
 
     def __init__(

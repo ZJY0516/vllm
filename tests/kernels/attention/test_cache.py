@@ -793,7 +793,7 @@ def test_concat_and_cache_mla(
 
 
 @pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)
-@pytest.mark.parametrize("qk_rope_head_dim", QK_ROPE_HEAD_DIMS)
+@pytest.mark.parametrize("qk_rope_head_dim", [0, 64])
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_MLA)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES_MLA)
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS_MLA)
