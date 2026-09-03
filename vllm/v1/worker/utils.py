@@ -115,7 +115,6 @@ class KVBlockZeroer:
         attn_groups_iter: Iterable["AttentionGroup"],
         kernel_block_sizes: list[int],
         static_forward_context: dict[str, Any],
-        num_blocks: int,
         runner_only_attn_layers: set[str] | None = None,
     ) -> None:
         """Precompute the absolute-address table for the Triton zeroing kernel.
@@ -159,6 +158,8 @@ class KVBlockZeroer:
                 continue
             kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
             assert spec.block_size % kernel_bs == 0
+            ratio = spec.block_size // kernel_bs
+
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
@@ -166,12 +167,6 @@ class KVBlockZeroer:
                 if not isinstance(kv, torch.Tensor):
                     continue
                 dp = kv.data_ptr()
-
-                assert kv.shape[0] % num_blocks == 0, (
-                    f"{layer_name}: {kv.shape[0]} kernel blocks is not a "
-                    f"multiple of {num_blocks} logical blocks"
-                )
-                ratio = kv.shape[0] // num_blocks
 
                 el = kv.element_size()
                 block_stride_bytes = kv.stride(0) * el
