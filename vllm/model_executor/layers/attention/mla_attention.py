@@ -1269,6 +1269,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token
+        # blob, so the size is not derivable from head_size.
+        # See flashmla_sparse.py.
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            # 512 packed fp8 values + 16 bytes of scales + 2 bytes per RoPE
+            # element: DeepSeek's qk_rope_head_dim=64 gives the familiar 656,
+            # while a NoPE model such as GLM-5.3 needs 528.
+            state_content_bytes = 512 + 16 + 2 * self.qk_rope_head_dim
+        elif self.kv_cache_dtype == "nvfp4_ds_mla":
+            state_content_bytes = 352
+        else:
+            state_content_bytes = None
         common_kwargs = dict(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
@@ -1276,12 +1288,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             dtype=kv_cache_dtype,
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-            # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token
-            # blob, so the size is not derivable from head_size.
-            # See flashmla_sparse.py.
-            state_content_bytes={"fp8_ds_mla": 656, "nvfp4_ds_mla": 352}.get(
-                self.kv_cache_dtype
-            ),
+            state_content_bytes=state_content_bytes,
         )
         if self.sliding_window is not None:
             return SlidingWindowMLASpec(

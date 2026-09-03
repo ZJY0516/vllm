@@ -129,10 +129,23 @@ def _get_backend_priorities(
                 *sparse_backends,
             ]
         elif device_capability.major == 12:
-            return [
+            # FLASHINFER_MLA_SPARSE_SM120 only implements DeepSeek's shape
+            # (512 latent + 64 RoPE, query 576). A rope-free MLA model such as
+            # GLM-5.3 (query 512) has no kernel there, and with only these two
+            # entries the rope-free lane was never considered at all. The SM90
+            # backend is that lane; its supports_combination feature-detects
+            # the FlashInfer support it needs, so listing it here is safe.
+            sm12x_backends = [
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
+            if head_size == 512:
+                sm12x_backends.insert(
+                    0, AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90
+                )
+            else:
+                sm12x_backends.append(AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90)
+            return sm12x_backends
         else:
             sparse_tail = [
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,

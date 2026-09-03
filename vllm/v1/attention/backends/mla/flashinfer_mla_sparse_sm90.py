@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FlashInfer sparse MLA backend for SM90 (Hopper) NoPE models.
+"""FlashInfer sparse MLA backend for NoPE models on SM90 (Hopper) and SM12x.
+
+Named for SM90, where it landed first; the wrapper itself is not
+Hopper-specific and is also the rope-free lane on SM12x (Blackwell RTX).
 
 Wraps FlashInfer's ``BatchMLAPagedAttentionWrapper`` (FA2/FA3 paths), which
 as of FlashInfer 0.6.18 supports ``head_dim_kpe=0`` (GLM-5.3-Flash NoPE MLA)
@@ -42,6 +45,7 @@ from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import has_flashinfer_sm90_nope_mla
 from vllm.v1.attention.backend import (
@@ -62,6 +66,18 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 _FP8_KV_DTYPES = ("fp8", "fp8_e4m3")
 _WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+def _mla_jit_backend() -> str:
+    """FlashInfer MLA JIT variant for this device.
+
+    FA3 is Hopper-only: on SM12x it compiles but emits no kernel image for the
+    device, so the first MLA call fails with "no kernel image is available for
+    execution on the device". FA2 is the portable path.
+    """
+    cap = current_platform.get_device_capability()
+    major = cap[0] if isinstance(cap, tuple) else getattr(cap, "major", 9)
+    return "fa2" if major >= 12 else "fa3"
 
 
 class FlashInferMLASparseSM90Backend(AttentionBackend):
@@ -104,7 +120,10 @@ class FlashInferMLASparseSM90Backend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 9
+        # Despite the SM90 name this is the rope-free (NoPE) MLA lane, and its
+        # FA2 path also runs on SM12x. The real capability gate is
+        # has_flashinfer_sm90_nope_mla() in supports_combination below.
+        return capability.major in (9, 12)
 
     @classmethod
     def supports_combination(
@@ -199,7 +218,7 @@ class _SM90State:
             kv_indices=self.kv_indices,
             kv_len_arr=self.kv_len_arr,
             use_cuda_graph=True,
-            backend="fa3",
+            backend=_mla_jit_backend(),
         )
         self._arange_cpu = torch.arange(self.max_tokens + 1, dtype=torch.int32)
         self._qo_cpu = torch.empty(self.max_tokens + 1, dtype=torch.int32)
