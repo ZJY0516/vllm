@@ -32,7 +32,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import MLA_KERNEL_PAGE_ROWS, AttentionSpec
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -82,7 +82,8 @@ class FlashInferMLASparseTRTLLMBackend(_FlashInferMLASparseBackendBase):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [32, 64]
+        # Larger manager blocks are re-paged in forward_mqa (_kernel_paged_view).
+        return [MultipleOf(MLA_KERNEL_PAGE_ROWS)]
 
     @staticmethod
     def get_impl_cls() -> type[MLAAttentionImpl]:
@@ -311,6 +312,31 @@ def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
     return _fi_sparse_workspace
 
 
+def _kernel_paged_view(
+    kv_cache: torch.Tensor,
+    kv_rows: torch.Tensor,
+    block_size: int,
+    block_stride_rows: int,
+) -> torch.Tensor:
+    """``[pages, 1, page_rows, D]`` view for the TRT-LLM kernel.
+
+    Top-k indices are flat row ids, so blocks larger than the kernel's native
+    32/64 rows can be re-paged as long as the block stride is whole pages.
+    """
+    if block_size in (32, 64):
+        return kv_cache.unsqueeze(1)
+    page = MLA_KERNEL_PAGE_ROWS
+    assert block_size % page == 0 and block_stride_rows % page == 0, (
+        f"block_size {block_size} / block stride {block_stride_rows} rows are not "
+        f"whole {page}-row kernel pages"
+    )
+    num_rows, head_dim = kv_rows.shape
+    return kv_rows.as_strided(
+        (num_rows // page, 1, page, head_dim),
+        (page * head_dim, page * head_dim, head_dim, 1),
+    )
+
+
 class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     """FlashInfer MLA Sparse implementation.
 
@@ -397,8 +423,11 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        _, block_stride_rows = flat_kv_row_view(
+        kv_rows, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
+        )
+        kernel_kv_cache = _kernel_paged_view(
+            kv_c_and_k_pe_cache, kv_rows, attn_metadata.block_size, block_stride_rows
         )
 
         if self.dcp_world_size > 1:
@@ -475,7 +504,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
 
         kernel_out = trtllm_batch_decode_with_kv_cache_mla(
             query=query,
-            kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
+            kv_cache=kernel_kv_cache,
             workspace_buffer=self._workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
