@@ -613,6 +613,91 @@ def test_throttle_capacity_bound_guard_admits():
     assert "b" in output.num_scheduled_tokens
 
 
+@pytest.mark.parametrize("mamba_cache_mode", [None, "none", "align"])
+@pytest.mark.parametrize("already_running", [False, True])
+def test_mamba_defers_stateless_one_token_chunk(
+    mamba_cache_mode: str | None, already_running: bool
+):
+    """Defer a first chunk until it can initialize state on the prefill path."""
+    spec = (
+        MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode=mamba_cache_mode,
+        )
+        if mamba_cache_mode is not None
+        else None
+    )
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        max_num_batched_tokens=2,
+        max_model_len=64,
+        enable_prefix_caching=mamba_cache_mode == "align",
+        kv_cache_spec=spec,
+    )
+    (decode,) = create_requests(1, num_tokens=2, req_ids=["decode"])
+    scheduler.add_request(decode)
+    _model_output(scheduler, scheduler.schedule(), [[100]])
+
+    (fresh,) = create_requests(1, num_tokens=3, req_ids=["fresh"])
+    scheduler.add_request(fresh)
+    if already_running:
+        # A running request can lose its computed prefix after a failed KV load.
+        scheduler.waiting.pop_request()
+        fresh.status = RequestStatus.RUNNING
+        scheduler.running.append(fresh)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[decode.request_id] == 1
+    if mamba_cache_mode is None:
+        assert output.num_scheduled_tokens[fresh.request_id] == 1
+        return
+
+    assert fresh.request_id not in output.num_scheduled_tokens
+    assert fresh.num_computed_tokens == 0
+    _model_output(scheduler, output, [[EOS_TOKEN_ID]])
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[fresh.request_id] == 2
+    _model_output(scheduler, output, [[]])
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[fresh.request_id] == 1
+
+
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+@pytest.mark.parametrize("already_running", [False, True])
+@pytest.mark.parametrize("max_num_batched_tokens", [1, 2])
+def test_mamba_one_token_prompt_completes(
+    mamba_cache_mode: str, already_running: bool, max_num_batched_tokens: int
+):
+    """A one-token prompt must not wait for an impossible two-token chunk."""
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=64,
+        enable_prefix_caching=mamba_cache_mode == "align",
+        kv_cache_spec=MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode=mamba_cache_mode,
+        ),
+    )
+    (request,) = create_requests(1, num_tokens=1)
+    scheduler.add_request(request)
+    if already_running:
+        scheduler.waiting.pop_request()
+        request.status = RequestStatus.RUNNING
+        scheduler.running.append(request)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {request.request_id: 1}
+    _model_output(scheduler, output, [[EOS_TOKEN_ID]])
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert scheduler.get_num_unfinished_requests() == 0
+
+
 def test_no_mm_input_chunking():
     # Disable multimodal input chunking.
     scheduler = create_scheduler(
@@ -6263,6 +6348,22 @@ def _create_hybrid_mamba_connector_scheduler(
         hash_block_size=block_size,
         log_stats=True,
     )
+
+
+@pytest.mark.parametrize("matched_tokens", [0, 16])
+def test_mamba_one_token_prefill_uses_cached_state(matched_tokens: int):
+    """A local or external prefix hit can safely leave a one-token prefill."""
+    scheduler = _create_hybrid_mamba_connector_scheduler(matched_tokens)
+    warmup, request = create_requests(2, num_tokens=17, same_prompt=True)
+    if matched_tokens == 0:
+        scheduler.add_request(warmup)
+        _model_output(scheduler, scheduler.schedule(), [[100]])
+
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 1
+    assert output.scheduled_new_reqs[0].num_computed_tokens == 16
 
 
 @pytest.mark.parametrize(

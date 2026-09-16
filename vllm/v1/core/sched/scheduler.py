@@ -398,6 +398,23 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+    def _should_defer_mamba_prefill(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> bool:
+        """Keep stateless first chunks out of the shape-based decode path.
+
+        Decode kernels may read recycled Mamba state, so wait for a prefill
+        chunk of at least two tokens when the request has more tokens to process.
+        Complete one-token requests must still progress; their state initialization
+        and effective prefill limits of one are outside this workaround.
+        """
+        return (
+            self.has_mamba_layers
+            and num_computed_tokens == 0
+            and num_new_tokens == 1
+            and request.num_tokens > 1
+        )
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -691,7 +708,9 @@ class Scheduler(SchedulerInterface):
                 request, request.num_computed_tokens, num_new_tokens
             )
 
-            if num_new_tokens == 0:
+            if num_new_tokens == 0 or self._should_defer_mamba_prefill(
+                request, request.num_computed_tokens, num_new_tokens
+            ):
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -705,6 +724,7 @@ class Scheduler(SchedulerInterface):
                 #    models with mamba cache mode \"align\".
                 # 5. Insufficient budget to keep a multi-module MTP prefill
                 #    chunk out of the prefill-lookahead window.
+                # 6. A stateless Mamba prefill would contain only one token.
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
@@ -1112,7 +1132,9 @@ class Scheduler(SchedulerInterface):
                         request, num_computed_tokens, num_new_tokens
                     )
 
-                    if num_new_tokens == 0:
+                    if num_new_tokens == 0 or self._should_defer_mamba_prefill(
+                        request, num_computed_tokens, num_new_tokens
+                    ):
                         # The request cannot be scheduled.
                         break
 
