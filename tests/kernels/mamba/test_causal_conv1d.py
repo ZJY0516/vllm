@@ -11,6 +11,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_metadata import (
+    compute_causal_conv1d_metadata,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -281,9 +284,19 @@ def test_causal_conv1d_update_with_batch_gather(
 @pytest.mark.parametrize("dim", [64, 4096])
 @pytest.mark.parametrize("with_padding", [True, False])
 @pytest.mark.parametrize("batch", [4, 10])
+@pytest.mark.parametrize("use_metadata", [False, True])
 def test_causal_conv1d_varlen(
-    batch, with_padding, dim, seqlen, width, has_bias, silu_activation, itype
+    batch,
+    with_padding,
+    dim,
+    seqlen,
+    width,
+    has_bias,
+    silu_activation,
+    itype,
+    use_metadata,
 ):
+    """Precomputed launch metadata preserves output and convolution cache updates."""
     device = DEVICE
     if not current_platform.is_cpu():
         torch.accelerator.empty_cache()
@@ -355,6 +368,11 @@ def test_causal_conv1d_varlen(
         cache_indices=padded_state_indices,
         has_initial_state=has_initial_states,
         activation=activation,
+        metadata=(
+            compute_causal_conv1d_metadata(cumsum, device=torch.device(device))
+            if use_metadata
+            else None
+        ),
     )
 
     out_ref = []

@@ -1362,7 +1362,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata,
+                metadata=attn_metadata.causal_conv1d,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             assert mixed_qkv_non_spec is not None

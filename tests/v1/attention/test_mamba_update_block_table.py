@@ -13,11 +13,22 @@ buffers.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from tests.v1.attention.utils import MockMambaBuilder
+from tests.v1.attention.utils import (
+    BatchSpec,
+    MockMambaBuilder,
+    create_common_attn_metadata,
+)
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backends.mamba1_attn import Mamba1AttentionMetadataBuilder
+from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba_attn import BaseMambaAttentionMetadata
+from vllm.v1.attention.backends.short_conv_attn import (
+    PleShortConvAttentionMetadataBuilder,
+    ShortConvAttentionMetadataBuilder,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 
@@ -427,3 +438,65 @@ def test_block_idx_prev_step_cudagraph_capture_uses_persistent_buffer():
 
     # Tail values past num_decodes: zero-filled padding for cudagraph capture.
     assert torch.all(out.block_idx_last_scheduled_token_prev_step[num_decodes:] == 0)
+
+
+@pytest.mark.parametrize(
+    "builder_cls",
+    [
+        Mamba1AttentionMetadataBuilder,
+        Mamba2AttentionMetadataBuilder,
+        ShortConvAttentionMetadataBuilder,
+        PleShortConvAttentionMetadataBuilder,
+    ],
+)
+@pytest.mark.parametrize("with_prefill", [False, True])
+def test_stateful_builders_compose_only_their_kernel_metadata(
+    builder_cls, with_prefill
+):
+    """Shared routing excludes decodes from the convolution prefill block plan."""
+    config = _make_vllm_config(32, 3, block_size=16)
+    config.cache_config.mamba_cache_mode = "none"
+    config.model_config.get_mamba_chunk_size = lambda: 16
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((1,), (1,)),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="none",
+    )
+    builder = builder_cls(spec, ["layer0"], config, torch.device("cpu"))
+    query_lens = [1, 9, 17] if with_prefill else [1, 1, 1]
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[10, 25, 17], query_lens=query_lens),
+        block_size=16,
+        device=torch.device("cpu"),
+        arange_block_indices=True,
+    ).replace(is_prefilling=torch.tensor([False, with_prefill, with_prefill]))
+    metadata = builder.build(0, common)
+
+    assert metadata.num_decodes == (1 if with_prefill else 3)
+    assert metadata.num_prefills == (2 if with_prefill else 0)
+    torch.testing.assert_close(
+        metadata.state_indices_tensor_d[: metadata.num_decodes],
+        common.block_table_tensor[: metadata.num_decodes, :1],
+    )
+    if with_prefill:
+        assert metadata.query_start_loc_p.tolist() == [0, 9, 26]
+        assert metadata.has_initial_states_p.tolist() == [True, False]
+    else:
+        assert metadata.query_start_loc_p is None
+        assert (
+            metadata.state_indices_tensor_d.data_ptr()
+            == builder.state_indices_tensor_d.data_ptr()
+        )
+
+    if builder_cls is PleShortConvAttentionMetadataBuilder:
+        assert not hasattr(metadata, "causal_conv1d")
+        assert metadata.max_prefill_query_len == (17 if with_prefill else 0)
+    elif with_prefill:
+        conv = metadata.causal_conv1d
+        assert conv is not None
+        assert conv.nums_dict[8]["tot"] == 5
+        assert conv.batch_ptr[:5].tolist() == [0, 0, 1, 1, 1]
+        assert conv.token_chunk_offset_ptr[:5].tolist() == [0, 1, 0, 1, 2]
+    else:
+        assert metadata.causal_conv1d is None

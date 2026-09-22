@@ -577,7 +577,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata_narrowed,
+                metadata=attn_metadata_narrowed.causal_conv1d,
             ).transpose(0, 1)
             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
         elif attn_metadata_narrowed.num_decodes > 0:

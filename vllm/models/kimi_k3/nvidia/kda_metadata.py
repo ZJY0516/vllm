@@ -22,6 +22,9 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
 )
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_metadata import (
+    compute_causal_conv1d_metadata,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -37,7 +40,6 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
 )
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
-    compute_causal_conv1d_metadata,
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -608,17 +610,15 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
 
         # Unlike the shared GDN layer, Kimi-K3's prefill KDA wrapper prepares
         # its own chunk indices. Only causal-convolution metadata is needed here.
-        nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        causal_conv1d = None
         if num_prefills > 0:
             has_initial_state = m.compute_num_computed_tokens() > 0
             if num_spec_decodes > 0:
                 has_initial_state = has_initial_state[active_non_spec_mask_cpu]
                 assert non_spec_query_start_loc_cpu is not None
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(
-                    non_spec_query_start_loc_cpu,
-                    device=query_start_loc.device,
-                )
+            causal_conv1d = compute_causal_conv1d_metadata(
+                non_spec_query_start_loc_cpu,
+                device=query_start_loc.device,
             )
         else:
             has_initial_state = None
@@ -735,9 +735,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 if recoverssm_commit is not None
                 else None
             ),
-            nums_dict=nums_dict,
-            batch_ptr=batch_ptr,
-            token_chunk_offset_ptr=token_chunk_offset_ptr,
+            causal_conv1d=causal_conv1d,
             checkpoint=checkpoint,
         )
 

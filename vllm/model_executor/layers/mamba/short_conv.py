@@ -294,7 +294,7 @@ class ShortConv(MambaBase, PluggableLayer):
                 conv_states=conv_state,
                 has_initial_state=has_initial_states_p,
                 cache_indices=state_indices_tensor_p,
-                metadata=attn_metadata,
+                metadata=attn_metadata.causal_conv1d,
                 query_start_loc=query_start_loc_p,
             ).transpose(0, 1)[:num_prefill_tokens]
 

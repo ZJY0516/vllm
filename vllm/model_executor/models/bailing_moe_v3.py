@@ -967,7 +967,7 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=state_indices,
                 query_start_loc=query_start_loc,
-                metadata=attn_metadata,
+                metadata=attn_metadata.causal_conv1d,
             ).transpose(0, 1)
             k = causal_conv1d_fn(
                 k_proj_states_non_spec.transpose(0, 1),
@@ -978,7 +978,7 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=state_indices,
                 query_start_loc=query_start_loc,
-                metadata=attn_metadata,
+                metadata=attn_metadata.causal_conv1d,
             ).transpose(0, 1)
             v = causal_conv1d_fn(
                 v_proj_states_non_spec.transpose(0, 1),
@@ -989,7 +989,7 @@ class BailingMoeV3KimiDeltaAttention(PluggableLayer, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=state_indices,
                 query_start_loc=query_start_loc,
-                metadata=attn_metadata,
+                metadata=attn_metadata.causal_conv1d,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             assert q_proj_states_non_spec is not None

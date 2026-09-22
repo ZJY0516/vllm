@@ -8,6 +8,9 @@
 import numpy as np
 import torch
 
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_metadata import (
+    CausalConv1dMetadata,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
@@ -494,7 +497,7 @@ def causal_conv1d_fn(
     initial_state_idx: torch.Tensor | None = None,
     num_computed_tokens: torch.Tensor | None = None,
     block_size_to_align=0,
-    metadata=None,
+    metadata: CausalConv1dMetadata | None = None,
     validate_data=False,
 ):
     """Support varlen + continuous batching when x is 2D tensor.

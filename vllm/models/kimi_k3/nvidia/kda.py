@@ -1056,7 +1056,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         has_initial_state=has_initial_state,
                         cache_indices=non_spec_state_indices_tensor,
                         query_start_loc=non_spec_query_start_loc,
-                        metadata=m,
+                        metadata=m.causal_conv1d,
                     ).transpose(0, 1)
 
                 q_ns = _prefill_conv(q_ns, q_conv_state, q_conv_weight)

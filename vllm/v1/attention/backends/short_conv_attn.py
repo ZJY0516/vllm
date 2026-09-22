@@ -6,19 +6,22 @@ from typing import Any
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.ops.causal_conv1d_metadata import (
+    CausalConv1dMetadata,
+    compute_causal_conv1d_metadata,
+)
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.mamba_attn import (
-    BaseMambaAttentionMetadata,
-    BaseMambaAttentionMetadataBuilder,
+from vllm.v1.attention.backends.stateful_attn import (
+    BaseStatefulAttentionMetadata,
+    BaseStatefulAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
-    compute_causal_conv1d_metadata,
     mamba_get_block_table_tensor,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -39,18 +42,39 @@ class ShortConvAttentionBackend(AttentionBackend):
 
 
 @dataclass
-class ShortConvAttentionMetadata(BaseMambaAttentionMetadata):
-    pass
+class ShortConvAttentionMetadata(BaseStatefulAttentionMetadata):
+    causal_conv1d: CausalConv1dMetadata | None = None
 
 
 class ShortConvAttentionMetadataBuilder(
-    BaseMambaAttentionMetadataBuilder[ShortConvAttentionMetadata]
+    BaseStatefulAttentionMetadataBuilder[ShortConvAttentionMetadata]
 ):
     metadata_cls = ShortConvAttentionMetadata
 
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        **kwargs: Any,
+    ) -> ShortConvAttentionMetadata:
+        metadata = super().build(
+            common_prefix_len, common_attn_metadata, fast_build, **kwargs
+        )
+        if metadata.num_prefills > 0:
+            query_start_loc_p_cpu = (
+                common_attn_metadata.query_start_loc_cpu[-metadata.num_prefills - 1 :]
+                - metadata.num_decode_tokens
+            )
+            metadata.causal_conv1d = compute_causal_conv1d_metadata(
+                query_start_loc_p_cpu,
+                device=common_attn_metadata.query_start_loc.device,
+            )
+        return metadata
+
 
 @dataclass
-class PleShortConvAttentionMetadata(ShortConvAttentionMetadata):
+class PleShortConvAttentionMetadata(BaseStatefulAttentionMetadata):
     # Number of speculative-decode (multi-query / MTP) requests and the total
     # number of tokens they contribute. These are 0 when spec-decode is off.
     num_spec_decodes: int = 0
@@ -91,7 +115,7 @@ class PleShortConvAttentionMetadata(ShortConvAttentionMetadata):
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
 
-class PleShortConvAttentionBackend(ShortConvAttentionBackend):
+class PleShortConvAttentionBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
         return "PLE_SHORT_CONV_ATTN"
@@ -100,8 +124,14 @@ class PleShortConvAttentionBackend(ShortConvAttentionBackend):
     def get_builder_cls() -> type["PleShortConvAttentionMetadataBuilder"]:
         return PleShortConvAttentionMetadataBuilder
 
+    @classmethod
+    def is_ssm(cls) -> bool:
+        return True
 
-class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
+
+class PleShortConvAttentionMetadataBuilder(
+    BaseStatefulAttentionMetadataBuilder[PleShortConvAttentionMetadata]
+):
     metadata_cls = PleShortConvAttentionMetadata
     # Spec-decode requires a uniform (multi-token) decode batch for full
     # CUDA graph capture, matching the GDN backend.
@@ -174,7 +204,7 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         state_indices_p = metadata.state_indices_tensor_p
         if metadata.num_prefills == 0:
             assert state_indices_d is not None
-            # BaseMambaAttentionMetadataBuilder pads decode state indices into
+            # BaseStatefulAttentionMetadataBuilder pads decode state indices into
             # a persistent tensor for full CUDA graphs. Keep those rows so the
             # PLE decode receives one cache slot per graph-padded token.
             state_indices_tensor = state_indices_d
@@ -281,10 +311,6 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 spec_sequence_masks_cpu, device=query_start_loc.device
             )
 
-        # For causal_conv1d (non-spec prefill Triton kernel metadata).
-        nums_dict = None
-        batch_ptr = None
-        token_chunk_offset_ptr = None
         has_initial_states_p = None
         has_initial_states_d = None
         num_computed_tokens_p = None
@@ -341,7 +367,6 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             non_spec_state_indices_tensor = None
             spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
             non_spec_query_start_loc = None
-            non_spec_query_start_loc_cpu = None
         else:
             # Mixed batch: build a per-token group key consistent with the
             # request grouping above (spec=0 | decode=1 | prefill=2) and a
@@ -385,14 +410,6 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 dim=0,
                 out=non_spec_query_start_loc[1:],
             )
-            non_spec_query_start_loc_cpu = torch.zeros(
-                num_decodes + num_prefills + 1, dtype=torch.int32
-            )
-            torch.cumsum(
-                query_lens_cpu[non_spec_req_idx_cpu],
-                dim=0,
-                out=non_spec_query_start_loc_cpu[1:],
-            )
 
         assert num_accepted_tokens is not None
         # Accepted-token counts must follow the same request order as the
@@ -400,7 +417,7 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         num_accepted_tokens = num_accepted_tokens[spec_req_idx]
 
         # Compute the conv-state slots for the non-spec decode/prefill split,
-        # plus the initial-state masks and Triton causal_conv1d metadata.
+        # plus the initial-state masks.
         if non_spec_state_indices_tensor is None:
             state_indices_tensor = block_table_tensor[:0, 0]
         else:
@@ -431,21 +448,9 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 ]
                 has_initial_states_p = num_computed_tokens_p > 0
                 assert non_spec_query_start_loc is not None
-                assert non_spec_query_start_loc_cpu is not None
                 query_start_loc_p = (
                     non_spec_query_start_loc[num_decodes:] - num_decode_tokens
                 )
-                query_start_loc_p_cpu = (
-                    non_spec_query_start_loc_cpu[num_decodes:] - num_decode_tokens
-                )
-                if query_start_loc.device.type != "cpu":
-                    nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                        compute_causal_conv1d_metadata(
-                            query_start_loc_p_cpu,
-                            device=query_start_loc.device,
-                        )
-                    )
-
         # Prepare persistent tensors for CUDA graph capture and replay.
         # ``m.num_actual_tokens`` is already padded by the model runner.
         # Request-level buffers use ``m.num_reqs`` while token-level buffers
@@ -509,9 +514,6 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
-            nums_dict=nums_dict,
-            batch_ptr=batch_ptr,
-            token_chunk_offset_ptr=token_chunk_offset_ptr,
             query_start_loc_p=query_start_loc_p,
             query_start_loc_d=query_start_loc_d,
             state_indices_tensor_p=state_indices_tensor_p,

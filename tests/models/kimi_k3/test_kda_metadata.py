@@ -75,12 +75,23 @@ def _assert_matches_shared_gdn(
             continue
         if isinstance(actual_value, torch.Tensor):
             torch.testing.assert_close(actual_value, expected_value)
-        elif field.name == "nums_dict":
+        elif field.name == "causal_conv1d":
             assert (actual_value is None) == (expected_value is None)
             if actual_value is not None:
-                assert actual_value[8]["tot"] == expected_value[8]["tot"]
+                assert (
+                    actual_value.nums_dict[8]["tot"]
+                    == expected_value.nums_dict[8]["tot"]
+                )
                 torch.testing.assert_close(
-                    actual_value[8]["nums"], expected_value[8]["nums"]
+                    actual_value.batch_ptr, expected_value.batch_ptr
+                )
+                torch.testing.assert_close(
+                    actual_value.token_chunk_offset_ptr,
+                    expected_value.token_chunk_offset_ptr,
+                )
+                torch.testing.assert_close(
+                    actual_value.nums_dict[8]["nums"],
+                    expected_value.nums_dict[8]["nums"],
                 )
         else:
             assert actual_value == expected_value
@@ -145,7 +156,9 @@ def _make_builder(
 def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
     """Exercise KDA RecoverSSM startup without loading Kimi-K3 weights."""
     monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
-    monkeypatch.setattr("vllm.v1.attention.backends.utils.PIN_MEMORY", False)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.mamba.ops.causal_conv1d_metadata.PIN_MEMORY", False
+    )
     layout_config = SimpleNamespace(
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,
@@ -508,7 +521,7 @@ def test_mixed_regular_and_spec_decode_uses_packed_decode_metadata():
     assert actual.num_prefills == 0
     assert actual.num_prefill_tokens == 0
     assert actual.has_initial_state is None
-    assert actual.nums_dict is None
+    assert actual.causal_conv1d is None
     assert actual.non_spec_query_start_loc is None
     torch.testing.assert_close(actual.non_spec_token_indx, torch.tensor([0, 1]))
     torch.testing.assert_close(actual.spec_token_indx, torch.tensor([2, 3, 4]))
