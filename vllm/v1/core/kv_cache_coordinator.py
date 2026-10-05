@@ -244,6 +244,24 @@ class KVCacheCoordinator(ABC):
                 )
         return num_blocks_to_allocate
 
+    def commit_allocation_plan(
+        self,
+        request_id: str,
+        num_tokens_main_model: int,
+        total_computed_tokens: int,
+        prefill_end: int = 0,
+    ) -> None:
+        """Let each manager record what the allocation just admitted by
+        `get_num_blocks_to_allocate` needs; see
+        `SingleTypeKVCacheManager.commit_allocation_plan`.
+        """
+        if self.retention_interval != 0:
+            prefill_end = 0
+        for manager in self.single_type_managers:
+            manager.commit_allocation_plan(
+                request_id, num_tokens_main_model, total_computed_tokens, prefill_end
+            )
+
     def allocate_new_computed_blocks(
         self,
         request_id: str,

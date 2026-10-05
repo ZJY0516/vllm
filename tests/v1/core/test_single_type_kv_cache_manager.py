@@ -223,16 +223,23 @@ def test_mamba_checkpoint_admission_matches_allocation(
             apply_admission_cap=apply_admission_cap,
         )
 
+    def allocate(num_tokens, total_computed_tokens):
+        manager.commit_allocation_plan(request_id, num_tokens, total_computed_tokens)
+        manager.allocate_new_blocks(request_id, num_tokens, num_tokens)
+
     estimate(computed_tokens, 0, False)
-    manager.allocate_new_blocks(request_id, computed_tokens, computed_tokens)
+    allocate(computed_tokens, 0)
     assert request_id in manager._allocated_block_reqs
 
+    checkpoints_before = dict(manager._checkpoints)
     admission_estimate = estimate(prompt_tokens, computed_tokens, True)
     allocation_estimate = estimate(prompt_tokens, computed_tokens, False)
-    assert request_id in manager._checkpoints
+    # Counting is read-only: only committing the plan reserves the checkpoint.
+    assert manager._checkpoints == checkpoints_before
 
     free_before = pool.get_num_free_blocks()
-    manager.allocate_new_blocks(request_id, prompt_tokens, prompt_tokens)
+    allocate(prompt_tokens, computed_tokens)
+    assert request_id in manager._checkpoints
     allocated = free_before - pool.get_num_free_blocks()
 
     assert admission_estimate == allocation_estimate == allocated
