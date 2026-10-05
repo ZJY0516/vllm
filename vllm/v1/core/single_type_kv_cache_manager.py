@@ -141,9 +141,6 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
-        # ``CacheConfig.enable_mamba_shared_prefix_checkpoint``, narrowed and set
-        # by ``KVCacheManager``; only an EAGLE Mamba "align" group ever gets it.
-        self.shared_prefix_checkpoint = False
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
@@ -1531,7 +1528,7 @@ class MambaManager(SingleTypeKVCacheManager):
         # Allocate extra `num_speculative_blocks` blocks for
         # speculative decoding (MTP/EAGLE) with linear attention.
         if self.num_speculative_blocks > 0:
-            num_tokens += self.kv_cache_spec.block_size * self.num_speculative_blocks
+            num_tokens += self.block_size * self.num_speculative_blocks
         return super().get_num_blocks_to_allocate(
             request_id,
             num_tokens,
@@ -1591,6 +1588,9 @@ class MambaPrefixCacheManager(MambaManager):
         )
         # Mamba checkpoints follow Eagle's global replay boundary.
         self.drop_eagle_checkpoint_block = False
+        # ``CacheConfig.enable_mamba_shared_prefix_checkpoint``, narrowed and set
+        # by ``KVCacheManager``; only an EAGLE group ever gets it.
+        self.shared_prefix_checkpoint = False
         # Mapping from request ID to the index of the block
         # allocated in the previous step
         self.last_state_block_idx: dict[str, int] = {}
