@@ -3010,7 +3010,9 @@ class Scheduler(SchedulerInterface):
 
     def _request_remaining_blocks(self, request: Request) -> int:
         """Blocks `request` still needs to hold its full sequence and be promoted."""
-        num_blocks = self.kv_cache_manager.get_num_blocks_for_full_sequence(request)
+        num_blocks = self.kv_cache_manager.get_num_blocks_for_full_sequence(
+            request, request.num_computed_tokens
+        )
         return num_blocks + self._spec_decode_step_blocks()
 
     def _spec_decode_step_blocks(self) -> int:

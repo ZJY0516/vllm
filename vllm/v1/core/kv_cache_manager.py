@@ -521,9 +521,9 @@ class KVCacheManager:
             # First check and fail if the full request sequence won't fit.
             num_blocks_to_allocate = self.get_num_blocks_for_full_sequence(
                 request,
+                num_local_computed_tokens,
+                total_computed_tokens,
                 new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=num_local_computed_tokens,
-                total_computed_tokens=total_computed_tokens,
                 num_encoder_tokens=num_encoder_tokens,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
@@ -550,13 +550,16 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
+        # The count and the plan commit below must see the same token counts.
+        num_computed_with_external = (
+            num_local_computed_tokens + num_external_computed_tokens
+        )
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=num_local_computed_tokens
-            + num_external_computed_tokens,
+            total_computed_tokens=num_computed_with_external,
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
             prefill_end=prefill_end,
@@ -573,8 +576,7 @@ class KVCacheManager:
         self.coordinator.commit_allocation_plan(
             request.request_id,
             num_tokens_main_model,
-            total_computed_tokens=num_local_computed_tokens
-            + num_external_computed_tokens,
+            total_computed_tokens=num_computed_with_external,
             prefill_end=prefill_end,
         )
 
@@ -626,18 +628,17 @@ class KVCacheManager:
     def get_num_blocks_for_full_sequence(
         self,
         request: Request,
-        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...] | None = None,
-        num_local_computed_tokens: int | None = None,
+        num_local_computed_tokens: int,
         total_computed_tokens: int | None = None,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...] = (),
         num_encoder_tokens: int = 0,
     ) -> int:
         """Blocks the request still needs to hold its full sequence, under the
         recycling-aware admission cap. Does not change any state.
 
-        The computed-token counts default to `request.num_computed_tokens`.
+        `total_computed_tokens` (local plus external) defaults to
+        `num_local_computed_tokens`.
         """
-        if num_local_computed_tokens is None:
-            num_local_computed_tokens = request.num_computed_tokens
         if total_computed_tokens is None:
             total_computed_tokens = num_local_computed_tokens
         full_num_tokens = min(request.num_tokens, self.max_model_len)
@@ -645,8 +646,7 @@ class KVCacheManager:
             request_id=request.request_id,
             num_tokens=full_num_tokens,
             new_computed_blocks=new_computed_blocks
-            if new_computed_blocks is not None
-            else self.empty_kv_cache_blocks.blocks,
+            or self.empty_kv_cache_blocks.blocks,
             num_encoder_tokens=num_encoder_tokens,
             total_computed_tokens=total_computed_tokens,
             num_local_computed_tokens=num_local_computed_tokens,
