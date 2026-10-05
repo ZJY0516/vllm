@@ -2486,12 +2486,12 @@ def test_prefill_hybrid_model_combinations_eagle(
 
 
 def test_prefill_hybrid_model_mamba_align():
-    """Test that MambaManager.cache_blocks() handles null blocks in align mode.
+    """Test that MambaPrefixCacheManager.cache_blocks() handles null blocks.
 
     Regression test for https://github.com/vllm-project/vllm/issues/34361.
     In mamba_cache_mode="align", allocate_new_blocks() pads req_to_blocks with
     null blocks. cache_full_blocks() correctly skips them, but
-    MambaManager.cache_blocks() must also skip null blocks when tracking
+    MambaPrefixCacheManager.cache_blocks() must also skip null blocks when tracking
     cached_blocks_this_step.
     """
     block_size = 16
@@ -2513,7 +2513,7 @@ def test_prefill_hybrid_model_mamba_align():
     all_token_ids = [i for i in range(3) for _ in range(block_size)] + [3] * 7
 
     # First request: allocate_slots should not crash with the assertion error
-    # in MambaManager.cache_blocks() when null blocks are present.
+    # in MambaPrefixCacheManager.cache_blocks() when null blocks are present.
     req0 = make_request("0", all_token_ids, block_size, hash_fn)
     computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
     assert num_computed_tokens == 0
@@ -5782,7 +5782,7 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
     the manager keeps one cached state per interval-sized segment (plus the
     latest replay boundary) instead of a snapshot per block, which is what
     lets a small attention block_size avoid Mamba dominating the KV pool."""
-    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    from vllm.v1.core.single_type_kv_cache_manager import MambaPrefixCacheManager
 
     block_size = 16
     spec = MambaSpec(
@@ -5793,7 +5793,7 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
     )
 
     def retained(retention_interval, num_prompt_tokens=256, end_block=16):
-        m = MambaManager.reachable_block_mask(
+        m = MambaPrefixCacheManager.reachable_block_mask(
             start_block=0,
             end_block=end_block,
             alignment_tokens=block_size,
@@ -5820,7 +5820,7 @@ def test_mamba_reachable_block_mask_pins_shared_prefix():
     ``num_prompt`` so the replay-boundary rule alone would drop it. The mask must
     pin the single state block ending on that boundary so sparse retention does
     not defeat cross-request shared-prefix reuse."""
-    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    from vllm.v1.core.single_type_kv_cache_manager import MambaPrefixCacheManager
 
     block_size = 16
     spec = MambaSpec(
@@ -5834,7 +5834,7 @@ def test_mamba_reachable_block_mask_pins_shared_prefix():
         boundaries = [255]  # replay boundary (num_prompt 256 - 1)
         if shared_prefix_boundary:
             boundaries.append(shared_prefix_boundary)
-        m = MambaManager.reachable_block_mask(
+        m = MambaPrefixCacheManager.reachable_block_mask(
             start_block=0,
             end_block=end_block,
             alignment_tokens=block_size,
@@ -6082,7 +6082,7 @@ def test_mamba_reachable_block_mask_ignores_dcp():
     state block spans kv_cache_spec.block_size tokens regardless of DCP. The
     mask must not scale by dcp_world_size, so retention granularity is
     identical for any DCP world size."""
-    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    from vllm.v1.core.single_type_kv_cache_manager import MambaPrefixCacheManager
 
     spec = MambaSpec(
         block_size=16,
@@ -6092,7 +6092,7 @@ def test_mamba_reachable_block_mask_ignores_dcp():
     )
 
     def get_mask(dcp_world_size):
-        m = MambaManager.reachable_block_mask(
+        m = MambaPrefixCacheManager.reachable_block_mask(
             start_block=0,
             end_block=16,
             alignment_tokens=64,
@@ -6116,7 +6116,7 @@ def test_mamba_reachable_block_mask_ignores_dcp():
 def test_mamba_reachable_block_mask_large_dcp_stays_sparse():
     """A large DCP world size must not scale the Mamba block size, so it can
     never collapse sparse retention into dense caching."""
-    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    from vllm.v1.core.single_type_kv_cache_manager import MambaPrefixCacheManager
 
     spec = MambaSpec(
         block_size=8,
@@ -6126,7 +6126,7 @@ def test_mamba_reachable_block_mask_large_dcp_stays_sparse():
     )
 
     def get_mask(dcp_world_size):
-        return MambaManager.reachable_block_mask(
+        return MambaPrefixCacheManager.reachable_block_mask(
             start_block=0,
             end_block=16,
             alignment_tokens=64,

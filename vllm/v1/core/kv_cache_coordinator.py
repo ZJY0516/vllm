@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     MambaManager,
+    MambaPrefixCacheManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -147,10 +148,18 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        # The Mamba manager is picked by mamba_cache_mode, which the config
+        # ties to prefix caching.
+        for manager in self.single_type_managers:
+            if isinstance(manager, MambaManager):
+                assert isinstance(manager, MambaPrefixCacheManager) == enable_caching, (
+                    f"{type(manager).__name__} cannot be used with "
+                    f"enable_caching={enable_caching}"
+                )
         # Match Mamba checkpoints to Eagle's attention replay boundary.
         if use_eagle:
             for manager in self.single_type_managers:
-                if isinstance(manager, MambaManager):
+                if isinstance(manager, MambaPrefixCacheManager):
                     manager.drop_eagle_checkpoint_block = True
         self.group_block_sizes = tuple(
             manager.block_size for manager in self.single_type_managers

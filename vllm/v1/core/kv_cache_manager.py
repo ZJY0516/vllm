@@ -15,7 +15,7 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import MambaPrefixCacheManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -191,7 +191,7 @@ class KVCacheManager:
         )
         if self.mamba_shared_prefix_checkpoint:
             for manager in self.coordinator.single_type_managers:
-                if isinstance(manager, MambaManager):
+                if isinstance(manager, MambaPrefixCacheManager):
                     manager.shared_prefix_checkpoint = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool

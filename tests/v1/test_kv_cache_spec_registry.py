@@ -18,6 +18,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     HiSparseSourceManager,
     MambaManager,
+    MambaPrefixCacheManager,
     SingleTypeKVCacheManager,
     SinkFullAttentionManager,
     SlidingWindowManager,
@@ -90,7 +91,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     SlidingWindowSpec: SlidingWindowManager,
     SlidingWindowMLASpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
-    MambaSpec: MambaManager,
+    MambaSpec: MambaPrefixCacheManager,
     CrossAttentionSpec: CrossAttentionManager,
     SinkFullAttentionSpec: SinkFullAttentionManager,
 }
@@ -176,6 +177,16 @@ class TestKVCacheSpecRegistry:
                 KVCacheSpecRegistry.get_uniform_type_base_spec(spec)
                 is spec_uniform_base_map[spec_cls]
             )
+
+    @pytest.mark.parametrize(
+        ("mamba_cache_mode", "manager"),
+        [("none", MambaManager), ("align", MambaPrefixCacheManager)],
+    )
+    def test_mamba_manager_follows_prefix_caching(self, mamba_cache_mode, manager):
+        """Only "align" mode Mamba groups take the prefix-caching manager."""
+        spec_args = {**spec_args_map[MambaSpec], "mamba_cache_mode": mamba_cache_mode}
+        spec = MambaSpec(**spec_args)
+        assert KVCacheSpecRegistry.get_manager_class(spec) is manager
 
     @pytest.mark.parametrize("role", list(KVCacheGroupRole))
     def test_mla_manager_selection_by_role(self, role):
