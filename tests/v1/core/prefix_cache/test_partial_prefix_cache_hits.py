@@ -765,6 +765,32 @@ def test_intermediate_chunk_checkpoint_reserved_only_under_dense_retention(
     assert manager.block_pool.get_cached_block(end_hash, [1]) is not None
 
 
+def test_async_caching_after_refused_allocation():
+    """Under async scheduling, the previous chunk's output is cached after the
+    next chunk's allocation was refused. That must not act on a checkpoint
+    plan for the refused chunk.
+    """
+    hash_block_size = 16
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=32,
+        num_prefill_checkpoint_blocks=1,
+    )
+    request = make_request("producer", list(range(240)), hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
+    assert manager.allocate_slots(request, 128, num_computed, computed_blocks)
+    request.num_computed_tokens = 128
+
+    free_blocks = manager.block_pool.get_num_free_blocks()
+    assert manager.allocate_slots(request, 112, reserved_blocks=free_blocks) is None
+    manager.cache_blocks(request, 128)
+
+    refused_checkpoint_hash = request.block_hashes[224 // hash_block_size - 1]
+    assert manager.block_pool.get_cached_block(refused_checkpoint_hash, [1]) is None
+
+
 def test_eagle_block_aligned_checkpoint_replaces_newer_hash():
     hash_block_size = mamba_block_size = 32
     manager = make_full_mamba_manager(

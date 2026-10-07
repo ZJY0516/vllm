@@ -408,6 +408,21 @@ class SingleTypeKVCacheManager(ABC):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return cow_blocks + new_blocks
 
+    def commit_allocation_plan(
+        self,
+        request_id: str,
+        num_tokens_main_model: int,
+        total_computed_tokens: int,
+        prefill_end: int = 0,
+    ) -> None:
+        """Record what an allocation that passed the free-block check needs.
+
+        `KVCacheManager.allocate_slots` calls this after a successful
+        `get_num_blocks_to_allocate`, with the same arguments and before any
+        block is added, so the manager is in the state the count saw.
+        """
+        return None
+
     @property
     def records_new_block_ids(self) -> bool:
         """Whether this manager's new blocks are zeroed by the worker."""
@@ -1820,6 +1835,51 @@ class MambaPrefixCacheManager(MambaManager):
             )
         )
 
+    def _plan_checkpoint(
+        self,
+        request_id: str,
+        num_tokens: int,
+        total_computed_tokens: int,
+        prefill_end: int,
+    ) -> tuple[int, int] | None:
+        """The (position, block index) of the internal checkpoint the chunk
+        ending at `num_tokens` reserves a block for, or None. Read-only.
+        """
+        # Keyed on the chunk end like the worker's
+        # `compute_mamba_prefill_checkpoints`, which writes the state there.
+        # The helper returns a boundary strictly below its input, so every
+        # chunk has one; under sparse retention only the prefill-end chunk's
+        # is kept, so `prefill_end` skips reserving blocks for the others.
+        checkpoint_position = get_mamba_prefill_checkpoint_position(
+            num_tokens,
+            self.block_pool.hash_block_size,
+            self.drop_eagle_checkpoint_block,
+        )
+        if checkpoint_position <= 0 or not self._needs_internal_checkpoint(
+            request_id,
+            total_computed_tokens,
+            num_tokens,
+            checkpoint_position,
+            prefill_end,
+        ):
+            return None
+        return checkpoint_position, cdiv(num_tokens, self.block_size) - 2
+
+    def commit_allocation_plan(
+        self,
+        request_id: str,
+        num_tokens_main_model: int,
+        total_computed_tokens: int,
+        prefill_end: int = 0,
+    ) -> None:
+        checkpoint = self._plan_checkpoint(
+            request_id, num_tokens_main_model, total_computed_tokens, prefill_end
+        )
+        if checkpoint is None:
+            self._checkpoints.pop(request_id, None)
+        else:
+            self._checkpoints[request_id] = checkpoint
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
@@ -1864,34 +1924,10 @@ class MambaPrefixCacheManager(MambaManager):
         )
         if has_partial_hit:
             num_new_blocks = max(num_new_blocks, 0) + 1
-        # Keyed on the chunk end like the worker's
-        # `compute_mamba_prefill_checkpoints`, which writes the state there.
-        # The helper returns a boundary strictly below its input, so every
-        # chunk has one; under sparse retention only the prefill-end chunk's
-        # is kept, so `prefill_end` skips reserving blocks for the others.
-        checkpoint_position = get_mamba_prefill_checkpoint_position(
-            num_tokens,
-            self.block_pool.hash_block_size,
-            self.drop_eagle_checkpoint_block,
+        checkpoint = self._plan_checkpoint(
+            request_id, num_tokens, total_computed_tokens, prefill_end
         )
-        if not self._needs_internal_checkpoint(
-            request_id,
-            total_computed_tokens,
-            num_tokens,
-            checkpoint_position,
-            prefill_end,
-        ):
-            checkpoint_position = 0
-        checkpoint_block = int(checkpoint_position > 0)
-        if not apply_admission_cap:
-            if checkpoint_position > 0:
-                checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
-                self._checkpoints[request_id] = (
-                    checkpoint_position,
-                    checkpoint_idx,
-                )
-            else:
-                self._checkpoints.pop(request_id, None)
+        checkpoint_block = int(checkpoint is not None)
         if num_new_blocks > 0:
             blocks_allocated = request_id in self._allocated_block_reqs
             physical_block_cap = 1 + int(has_partial_hit) + checkpoint_block

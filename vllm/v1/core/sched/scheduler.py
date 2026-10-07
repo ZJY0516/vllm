@@ -3024,17 +3024,8 @@ class Scheduler(SchedulerInterface):
 
     def _request_remaining_blocks(self, request: Request) -> int:
         """Blocks `request` still needs to hold its full sequence and be promoted."""
-        full_num_tokens = min(request.num_tokens, self.max_model_len)
-        num_blocks = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
-            request_id=request.request_id,
-            num_tokens=full_num_tokens,
-            new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
-            num_encoder_tokens=0,
-            total_computed_tokens=request.num_computed_tokens,
-            num_local_computed_tokens=request.num_computed_tokens,
-            num_tokens_main_model=full_num_tokens,
-            apply_admission_cap=True,
-            prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+        num_blocks = self.kv_cache_manager.get_num_blocks_for_full_sequence(
+            request, request.num_computed_tokens
         )
         return num_blocks + self._spec_decode_step_blocks()
 

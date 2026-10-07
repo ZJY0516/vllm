@@ -515,24 +515,16 @@ class KVCacheManager:
         ):
             watermark_blocks = self.watermark_blocks
 
-        # Matches the scheduler's own prefill boundary: `num_tokens - 1`
-        # extends it to resumed requests replaying their output tokens.
-        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        prefill_end = self._prefill_end(request)
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
-            full_num_tokens = min(request.num_tokens, self.max_model_len)
-
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=full_num_tokens,
+            num_blocks_to_allocate = self.get_num_blocks_for_full_sequence(
+                request,
+                num_local_computed_tokens,
+                total_computed_tokens,
                 new_computed_blocks=new_computed_block_list,
                 num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=total_computed_tokens,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_tokens_main_model=full_num_tokens,
-                apply_admission_cap=True,
-                prefill_end=prefill_end,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
@@ -558,13 +550,16 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
+        # The count and the plan commit below must see the same token counts.
+        num_computed_with_external = (
+            num_local_computed_tokens + num_external_computed_tokens
+        )
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=num_local_computed_tokens
-            + num_external_computed_tokens,
+            total_computed_tokens=num_computed_with_external,
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
             prefill_end=prefill_end,
@@ -577,6 +572,13 @@ class KVCacheManager:
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
             return None
+
+        self.coordinator.commit_allocation_plan(
+            request.request_id,
+            num_tokens_main_model,
+            total_computed_tokens=num_computed_with_external,
+            prefill_end=prefill_end,
+        )
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
@@ -616,6 +618,42 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    @staticmethod
+    def _prefill_end(request: Request) -> int:
+        # Matches the scheduler's own prefill boundary: `num_tokens - 1`
+        # extends it to resumed requests replaying their output tokens.
+        return max(request.num_prompt_tokens, request.num_tokens - 1)
+
+    def get_num_blocks_for_full_sequence(
+        self,
+        request: Request,
+        num_local_computed_tokens: int,
+        total_computed_tokens: int | None = None,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...] = (),
+        num_encoder_tokens: int = 0,
+    ) -> int:
+        """Blocks the request still needs to hold its full sequence, under the
+        recycling-aware admission cap. Does not change any state.
+
+        `total_computed_tokens` (local plus external) defaults to
+        `num_local_computed_tokens`.
+        """
+        if total_computed_tokens is None:
+            total_computed_tokens = num_local_computed_tokens
+        full_num_tokens = min(request.num_tokens, self.max_model_len)
+        return self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=full_num_tokens,
+            new_computed_blocks=new_computed_blocks
+            or self.empty_kv_cache_blocks.blocks,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=total_computed_tokens,
+            num_local_computed_tokens=num_local_computed_tokens,
+            num_tokens_main_model=full_num_tokens,
+            apply_admission_cap=True,
+            prefill_end=self._prefill_end(request),
+        )
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
