@@ -145,16 +145,6 @@ class SingleTypeKVCacheManager(ABC):
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
-        # Boundary-state offload hand-off for external KV connectors. A mamba
-        # "align" block table is not append-only (interior states are
-        # nulled/freed and speculative blocks relocate in place), so a
-        # connector cannot resolve its state blocks positionally. Record
-        # (request, group, block, exact token boundary) for each committed
-        # boundary state so a connector can offload the right block under the
-        # right hash. Populated only by mamba "align".
-        self._pending_boundary_state_offloads: list[
-            tuple[str, int, KVCacheBlock, int]
-        ] = []
 
     @classmethod
     def manager_class_for_spec(
@@ -459,13 +449,11 @@ class SingleTypeKVCacheManager(ABC):
 
         Entries are ``(req_id, group_id, block, boundary_tokens)``.
 
-        Only mamba "align" populates this. The blocks are not kept alive by
-        the request block table for the whole request, so a caller that reads
-        them asynchronously must pin them first.
+        Only `MambaPrefixCacheManager` populates this. The blocks are not kept
+        alive by the request block table for the whole request, so a caller
+        that reads them asynchronously must pin them first.
         """
-        pending = self._pending_boundary_state_offloads
-        self._pending_boundary_state_offloads = []
-        return pending
+        return []
 
     def finalize_partial_tail_offload(
         self,
@@ -1620,6 +1608,14 @@ class MambaPrefixCacheManager(MambaManager):
         # connector; a request that finishes first hands off this table
         # source directly.
         self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+        # Boundary-state offload hand-off for external KV connectors. The
+        # block table is not append-only, so a connector cannot resolve state
+        # blocks positionally. Record (request, group, block, exact token
+        # boundary) for each committed boundary state so a connector can
+        # offload the right block under the right hash.
+        self._pending_boundary_state_offloads: list[
+            tuple[str, int, KVCacheBlock, int]
+        ] = []
 
     @classmethod
     def find_longest_cache_hit(
@@ -2069,6 +2065,13 @@ class MambaPrefixCacheManager(MambaManager):
         )
         req_blocks.append(block)
         req_blocks[block_idx] = self._null_block
+
+    def take_pending_boundary_state_offloads(
+        self,
+    ) -> list[tuple[str, int, KVCacheBlock, int]]:
+        pending = self._pending_boundary_state_offloads
+        self._pending_boundary_state_offloads = []
+        return pending
 
     def finalize_partial_tail_offload(
         self,
