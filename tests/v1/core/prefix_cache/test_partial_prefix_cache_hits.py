@@ -765,9 +765,10 @@ def test_intermediate_chunk_checkpoint_reserved_only_under_dense_retention(
     assert manager.block_pool.get_cached_block(end_hash, [1]) is not None
 
 
-def test_failed_allocation_leaves_no_checkpoint_plan():
-    """A chunk that does not fit must not leave a checkpoint plan behind;
-    only an allocation that is actually made records one.
+def test_failed_allocation_keeps_in_flight_checkpoint():
+    """Under async scheduling, the previous chunk's output is cached after the
+    next chunk's allocation was refused. That must publish only the previous
+    chunk's checkpoint, not a plan for the refused chunk.
     """
     hash_block_size = 16
     manager = make_full_mamba_manager(
@@ -777,21 +778,22 @@ def test_failed_allocation_leaves_no_checkpoint_plan():
         mamba_block_size=32,
         num_prefill_checkpoint_blocks=1,
     )
-    mamba_manager = manager.coordinator.single_type_managers[1]
     request = make_request("producer", list(range(240)), hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
+    assert manager.allocate_slots(request, 128, num_computed, computed_blocks)
+    request.num_computed_tokens = 128
 
     free_blocks = manager.block_pool.get_num_free_blocks()
-    assert (
-        manager.allocate_slots(
-            request, 128, num_computed, computed_blocks, reserved_blocks=free_blocks
-        )
-        is None
-    )
-    assert request.request_id not in mamba_manager._checkpoints
+    assert manager.allocate_slots(request, 112, reserved_blocks=free_blocks) is None
+    manager.cache_blocks(request, 128)
 
-    assert manager.allocate_slots(request, 128, num_computed, computed_blocks)
-    assert request.request_id in mamba_manager._checkpoints
+    def cached_state(num_tokens: int):
+        block_hash = request.block_hashes[num_tokens // hash_block_size - 1]
+        hit = manager.block_pool.get_cached_block(block_hash, [1])
+        return None if hit is None else hit[0].block_hash_num_tokens
+
+    assert cached_state(112) == 112
+    assert cached_state(224) is None
 
 
 def test_eagle_block_aligned_checkpoint_replaces_newer_hash():
