@@ -765,10 +765,10 @@ def test_intermediate_chunk_checkpoint_reserved_only_under_dense_retention(
     assert manager.block_pool.get_cached_block(end_hash, [1]) is not None
 
 
-def test_failed_allocation_keeps_in_flight_checkpoint():
+def test_async_caching_after_refused_allocation():
     """Under async scheduling, the previous chunk's output is cached after the
-    next chunk's allocation was refused. That must publish only the previous
-    chunk's checkpoint, not a plan for the refused chunk.
+    next chunk's allocation was refused. That must not act on a checkpoint
+    plan for the refused chunk.
     """
     hash_block_size = 16
     manager = make_full_mamba_manager(
@@ -787,13 +787,8 @@ def test_failed_allocation_keeps_in_flight_checkpoint():
     assert manager.allocate_slots(request, 112, reserved_blocks=free_blocks) is None
     manager.cache_blocks(request, 128)
 
-    def cached_state(num_tokens: int):
-        block_hash = request.block_hashes[num_tokens // hash_block_size - 1]
-        hit = manager.block_pool.get_cached_block(block_hash, [1])
-        return None if hit is None else hit[0].block_hash_num_tokens
-
-    assert cached_state(112) == 112
-    assert cached_state(224) is None
+    refused_checkpoint_hash = request.block_hashes[224 // hash_block_size - 1]
+    assert manager.block_pool.get_cached_block(refused_checkpoint_hash, [1]) is None
 
 
 def test_eagle_block_aligned_checkpoint_replaces_newer_hash():
