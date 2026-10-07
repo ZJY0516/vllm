@@ -21,7 +21,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     CircularBufferManager,
     FullAttentionManager,
     KpoolTailManager,
-    MambaManager,
+    MambaPrefixCacheManager,
     RSWAManager,
     SlidingWindowManager,
 )
@@ -89,7 +89,7 @@ def test_mamba_speculative_block_relocation_requires_exclusive_ownership():
         num_speculative_blocks=1,
     )
     block_pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=4)
-    manager = MambaManager(
+    manager = MambaPrefixCacheManager(
         spec,
         block_pool=block_pool,
         enable_caching=True,
@@ -118,7 +118,7 @@ def test_mamba_retirement_crosses_null_gaps():
         mamba_cache_mode="align",
     )
     pool = BlockPool(num_gpu_blocks=8, enable_caching=False, hash_block_size=4)
-    manager = MambaManager(
+    manager = MambaPrefixCacheManager(
         spec,
         block_pool=pool,
         enable_caching=False,
@@ -159,7 +159,7 @@ def test_mamba_retirement_bounds_prefill_states(block_size, in_flight_chunks):
         num_speculative_blocks=5,
     )
     pool = BlockPool(num_gpu_blocks=1000, enable_caching=True, hash_block_size=256)
-    manager = MambaManager(
+    manager = MambaPrefixCacheManager(
         spec,
         block_pool=pool,
         enable_caching=True,
@@ -207,7 +207,7 @@ def test_mamba_checkpoint_admission_matches_allocation(
         enable_caching=True,
         hash_block_size=128,
     )
-    manager = MambaManager(
+    manager = MambaPrefixCacheManager(
         spec,
         block_pool=pool,
         enable_caching=True,
@@ -262,7 +262,7 @@ def test_mamba_checkpoint_hash_maps_only_to_checkpoint_block(
         prefill_checkpoint_alignment=16,
     )
     pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=128)
-    manager = MambaManager(
+    manager = MambaPrefixCacheManager(
         spec,
         block_pool=pool,
         enable_caching=True,

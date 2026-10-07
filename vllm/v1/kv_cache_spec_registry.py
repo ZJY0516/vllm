@@ -133,7 +133,8 @@ class KVCacheSpecRegistry:
         # Walk up the MRO to find a registered base class
         for base in kvcache_spec_cls.__mro__:
             if base in _REGISTRY_KVCACHESPEC_LIST:
-                return _REGISTRY_KVCACHESPEC_LIST[base].manager_class
+                manager_class = _REGISTRY_KVCACHESPEC_LIST[base].manager_class
+                return manager_class.manager_class_for_spec(kvcache_spec)
 
         return None
 

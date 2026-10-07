@@ -233,7 +233,7 @@ def test_warmup_reserves_mamba_speculative_blocks(mamba_cache_mode):
         )
 
 
-def _hybrid_kv_cache_config(num_blocks: int) -> KVCacheConfig:
+def _hybrid_kv_cache_config(num_blocks: int, mamba_cache_mode: str) -> KVCacheConfig:
     """Attention, circular, and Mamba groups exercise every reservation branch."""
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -241,13 +241,14 @@ def _hybrid_kv_cache_config(num_blocks: int) -> KVCacheConfig:
         kv_cache_groups=[
             _attention_group(),
             _circular_group(),
-            _mamba_group("none"),
-            _mamba_group("align"),
+            _mamba_group(mamba_cache_mode),
         ],
     )
 
 
-def test_reserved_block_count_matches_real_kv_cache_manager():
+# "align" is Mamba's prefix-caching mode, so it only runs with caching enabled.
+@pytest.mark.parametrize("mamba_cache_mode", ["none", "align"])
+def test_reserved_block_count_matches_real_kv_cache_manager(mamba_cache_mode):
     """`_reserved_block_count` must predict exactly what the real
     `KVCacheManager.allocate_slots` consumes, for every group, at every step
     of a warmup-realistic trajectory: a prefill followed by decode steps that
@@ -269,20 +270,23 @@ def test_reserved_block_count_matches_real_kv_cache_manager():
     num_lookahead_tokens = NUM_SPEC_STEPS + 1
     decode_query_len = NUM_SPEC_STEPS + 1
 
-    kv_cache_config = _hybrid_kv_cache_config(num_blocks=256)
+    kv_cache_config = _hybrid_kv_cache_config(256, mamba_cache_mode)
     specs = [g.kv_cache_spec for g in kv_cache_config.kv_cache_groups]
     manager = make_kv_cache_manager(
         kv_cache_config,
         max_model_len=MAX_MODEL_LEN,
         hash_block_size=BLOCK_SIZE,
-        enable_caching=False,
+        enable_caching=mamba_cache_mode == "align",
     )
     (request,) = create_requests(
         num_requests=1, num_tokens=decode_query_len + 1, block_size=BLOCK_SIZE
     )
 
     def _step(num_new_tokens: int) -> None:
-        computed_blocks, num_new_computed, _ = manager.get_computed_blocks(request)
+        # Like the scheduler, only look up the prefix cache on admission.
+        computed_blocks, num_new_computed = None, 0
+        if request.num_computed_tokens == 0:
+            computed_blocks, num_new_computed, _ = manager.get_computed_blocks(request)
         blocks = manager.allocate_slots(
             request,
             num_new_tokens,

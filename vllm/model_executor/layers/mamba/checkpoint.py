@@ -29,9 +29,9 @@ def compute_mamba_prefill_checkpoints(
     """Per-row internal prefill checkpoint offsets and cache block columns.
 
     Backends call this instead of re-deriving the rules, so they decline in
-    lockstep with the scheduler and ``MambaManager``: allocating a checkpoint
-    block without writing it leaves the prefix cache serving uninitialized
-    state.
+    lockstep with the scheduler and ``MambaPrefixCacheManager``: allocating a
+    checkpoint block without writing it leaves the prefix cache serving
+    uninitialized state.
 
     Returns:
         ``(offsets, cols)``: the checkpoint's offset into each row's query and
