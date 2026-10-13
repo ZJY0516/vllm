@@ -133,6 +133,9 @@ class DeepseekV41ForCausalLM(
     """
 
     supports_encoder_tp_data = True
+    kv_cache_config_builder_cls = (
+        "vllm.models.deepseek_v4.common.kv_cache_config.DeepseekV4KVCacheConfigBuilder"
+    )
 
     # Both of these are read off the *class* by
     # ``configure_quant_config``/``SupportsQuant``, before ``__init__`` runs,

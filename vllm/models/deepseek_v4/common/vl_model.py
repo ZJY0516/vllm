@@ -105,6 +105,9 @@ class DeepseekV4ForConditionalGeneration(
     # (borrowed reserved ids, see common/mm_preprocess.py) and apply bias_vl.
     requires_raw_input_tokens = True
     supports_tower_connector_lora = True
+    kv_cache_config_builder_cls = (
+        "vllm.models.deepseek_v4.common.kv_cache_config.DeepseekV4KVCacheConfigBuilder"
+    )
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:

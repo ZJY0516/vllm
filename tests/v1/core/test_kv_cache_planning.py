@@ -1958,7 +1958,7 @@ def test_check_enough_kv_cache_memory_reserves_null_block():
     )
 
 
-def _spec_decode_grouping_config(method="dspark", model_type=None):
+def _spec_decode_grouping_config(method="dspark"):
     """Grouping config with an EAGLE-family speculative method enabled."""
     return SimpleNamespace(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
@@ -1967,7 +1967,6 @@ def _spec_decode_grouping_config(method="dspark", model_type=None):
                 is_block_outermost=True
             )
         ),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type)),
         speculative_config=SimpleNamespace(
             method=method,
             use_eagle=lambda: True,
@@ -2093,19 +2092,23 @@ def _deepseek_v4_specs(model_version="deepseek_v4"):
     }
 
 
-@pytest.mark.parametrize(
-    ("method", "model_type"),
-    [("mtp", "deepseek_v4"), ("dspark", "deepseek_v4"), ("dspark", "deepseek_v41")],
-)
-def test_deepseek_v4_draft_group_annotated_on_packed_path(method, model_type):
-    # DeepseekV4's MTP block reuses the target's decoder layer, so its spec
-    # carries no draft marker and only the positional rule can find it. This
-    # pins the pre-existing behaviour that the unified annotator must preserve.
-    groups = default_builder.get_kv_cache_groups(
-        _spec_decode_grouping_config(method=method, model_type=model_type),
-        _deepseek_v4_specs(model_version=None),
+def test_deepseek_v4_builder_annotates_dspark_draft_group():
+    # DeepseekV4's DSpark drafter reuses the target's decoder layer, so its
+    # spec carries no draft marker. Only the model's own builder applies the
+    # positional rule to it; the default builder keeps it MTP-only.
+    from vllm.models.deepseek_v4.common.kv_cache_config import (
+        DeepseekV4KVCacheConfigBuilder,
     )
 
+    config = _spec_decode_grouping_config(method="dspark")
+    default_groups = default_builder.get_kv_cache_groups(
+        config, _deepseek_v4_specs(model_version=None)
+    )
+    assert not any(g.is_eagle_group for g in default_groups)
+
+    groups = DeepseekV4KVCacheConfigBuilder().get_kv_cache_groups(
+        config, _deepseek_v4_specs(model_version=None)
+    )
     flagged = [g for g in groups if g.is_eagle_group]
     assert len(flagged) == 1
     assert "model.layers.3.self_attn.attn" in flagged[0].layer_names
@@ -2114,9 +2117,9 @@ def test_deepseek_v4_draft_group_annotated_on_packed_path(method, model_type):
 def test_trailing_layer_fallback_applies_to_any_mtp_model():
     # The positional rule is sound for every MTP drafter, not just DeepseekV4:
     # MTP blocks reuse the target's decoder layer (no spec marker) and always
-    # register after every target layer. The model_type must not gate it.
+    # register after every target layer.
     groups = default_builder.get_kv_cache_groups(
-        _spec_decode_grouping_config(method="mtp", model_type="other"),
+        _spec_decode_grouping_config(method="mtp"),
         _deepseek_v4_specs(),
     )
 
@@ -2150,7 +2153,7 @@ def test_qwen3_5_mtp_draft_group_annotated_on_hybrid_path(caplog_vllm):
     # path. The trailing-layer rule must locate the draft group there so the
     # Mamba groups are not swept up by the flag-all consumer fallback.
     groups = default_builder.get_kv_cache_groups(
-        _spec_decode_grouping_config(method="mtp", model_type="qwen3_5"),
+        _spec_decode_grouping_config(method="mtp"),
         _qwen3_5_hybrid_specs(with_mtp_layer=True),
     )
 
@@ -2171,7 +2174,7 @@ def test_non_mtp_eagle_hybrid_still_warns(caplog_vllm, method):
     # Other drafters are not covered by the trailing-layer rule, so an
     # unidentifiable hybrid draft must still warn.
     groups = default_builder.get_kv_cache_groups(
-        _spec_decode_grouping_config(method=method, model_type="qwen3_5"),
+        _spec_decode_grouping_config(method=method),
         _qwen3_5_hybrid_specs(with_mtp_layer=True),
     )
 
@@ -2186,7 +2189,7 @@ def test_trailing_layer_fallback_requires_exact_partition():
     from vllm.v1.core.kv_cache_planning import _annotate_eagle_groups
 
     specs = _qwen3_5_hybrid_specs(with_mtp_layer=True)
-    config = _spec_decode_grouping_config(method="mtp", model_type="qwen3_5")
+    config = _spec_decode_grouping_config(method="mtp")
     groups = default_builder.get_kv_cache_groups(config, specs)
     for g in groups:
         g.is_eagle_group = False
