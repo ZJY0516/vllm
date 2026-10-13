@@ -1800,6 +1800,9 @@ class DeepseekV4ForCausalLM(
 ):
     finalizes_weights_during_load = True
     model_cls = DeepseekV4Model
+    kv_cache_config_builder_cls = (
+        "vllm.models.deepseek_v4.common.kv_cache_config.DeepseekV4KVCacheConfigBuilder"
+    )
 
     # Default mapper assumes the original FP4-expert checkpoint layout.
     # Overridden per-instance in __init__ when expert_dtype != "fp4".

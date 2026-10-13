@@ -131,6 +131,9 @@ class DeepseekV41ForCausalLM(
     """
 
     supports_encoder_tp_data = True
+    kv_cache_config_builder_cls = (
+        "vllm.models.deepseek_v4.common.kv_cache_config.DeepseekV4KVCacheConfigBuilder"
+    )
 
     # The MoE router needs raw token ids to detect image-span tokens
     # (all carrying image_token_id, see common/mm_preprocess.py) and apply

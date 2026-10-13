@@ -849,19 +849,12 @@ def _uses_trailing_mtp_layers(vllm_config: VllmConfig) -> bool:
     """Whether the drafter's KV layers can be located positionally.
 
     MTP drafters register their KV layers after the target layers, without a
-    distinguishing spec marker. DeepseekV4/V4.1 do this with ``dspark`` too.
-    The annotator separately checks that the groups partition the layers exactly.
+    distinguishing spec marker. Models whose other drafters do the same flag
+    them from their own KV cache config builder. The annotator separately
+    checks that the groups partition the layers exactly.
     """
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
-        return False
-    if spec_config.method == "mtp":
-        return True
-    model_config = vllm_config.model_config
-    return model_config is not None and model_config.hf_config.model_type in (
-        "deepseek_v4",
-        "deepseek_v41",
-    )
+    return spec_config is not None and spec_config.method == "mtp"
 
 
 def _groups_partition_layers_exactly(
@@ -894,10 +887,11 @@ def _annotate_eagle_groups(
        spec merging, wherever grouping happens to land. It is sufficient but
        not necessary: a drafter whose spec is indistinguishable from the
        target's cannot be found this way.
-    2. Positional fallback for MTP drafters (including DeepseekV4/V4.1 DSpark), whose
-       MTP block reuses the target's own decoder layer and so carries no spec
-       marker. Their draft attention layers always register after every
-       target layer, so flag whichever group holds the last registered layer.
+    2. Positional fallback for MTP drafters (and DeepseekV4/V4.1 DSpark, via
+       its builder), whose MTP block reuses the target's own decoder layer and
+       so carries no spec marker. Their draft attention layers always register
+       after every target layer, so flag whichever group holds the last
+       registered layer.
        This rule is only valid where the groups partition exactly the layers
        of ``kv_cache_spec``, which is re-checked here before applying it.
        When a drafter's trailing caches span several groups, this rule flags
