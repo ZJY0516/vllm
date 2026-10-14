@@ -47,8 +47,10 @@ def _make_bare_scheduler(
     scheduler.kv_role = kv_role
     scheduler.save_decode_cache = save_decode_cache
     scheduler.enable_kv_events = False
+    scheduler.use_lookahead_block_hashes = False
     scheduler.lookup_async = False
     scheduler.enable_lookup = True
+    scheduler.client = SimpleNamespace(discard=lambda req_id: None)
     scheduler._block_size = 16
     scheduler._hash_block_size = hash_block_size
     scheduler.enable_partial_hash_hits = enable_partial_hash_hits
@@ -60,6 +62,7 @@ def _make_bare_scheduler(
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
     scheduler._finished_partial_tail_metas = {}
+    scheduler._finished_lookahead_save_metas = {}
     scheduler._gpu_block_pool = BlockPool(
         num_gpu_blocks=64, enable_caching=True, hash_block_size=hash_block_size
     )
@@ -922,6 +925,34 @@ def test_partial_tail_is_resolved_once_on_the_prompt_completing_save():
     assert req_meta.boundary_puts is None
 
 
+def test_from_request_tracker_caps_save_at_max_save_tokens():
+    tracker = RequestTracker(
+        req_id="req-0",
+        token_len=48,
+        allocated_block_ids=([0, 1, 2],),
+        num_saved_tokens=0,
+    )
+
+    pending = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=16,
+        block_hashes=[b"h0", b"h1", b"h2"],
+        max_save_tokens=0,
+    )
+    assert pending is None
+    assert tracker.num_saved_tokens == 0
+
+    ready = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=16,
+        block_hashes=[b"h0", b"h1", b"h2"],
+        max_save_tokens=48,
+    )
+    assert ready is not None
+    assert ready.can_save is True
+    assert tracker.num_saved_tokens == 48
+
+
 class _StubLookupClient:
     def __init__(self, hit_tokens: int) -> None:
         self._hit_tokens = hit_tokens
@@ -1326,9 +1357,56 @@ def test_partial_tail_boundary_follows_eagle_block_drop_not_group_flags():
         boundary_puts=[BoundaryPut(1, 50, 44)],
     )
 
-    assert _partial_tail_non_mamba_puts(coord, req_meta, [16, 16]) == [
-        BoundaryPut(0, 3, 44)
+    assert _partial_tail_non_mamba_puts(
+        coord, req_meta, [16, 16], apply_eagle=True
+    ) == [BoundaryPut(0, 3, 44)]
+
+
+@pytest.mark.parametrize(
+    "apply_eagle, mamba_tail, expected",
+    [
+        # Legacy: checkpoint 72 - 4 = 68; the 8-token proof (76) is not computed.
+        (True, 68, []),
+        # Lookahead: core keeps the checkpoint at 72 and needs no proof block.
+        (False, 72, [BoundaryPut(0, 9, 72)]),
+    ],
+)
+def test_partial_tail_follows_lookahead_checkpoint(apply_eagle, mamba_tail, expected):
+    """Lookahead hashes move the prompt checkpoint and drop the proof margin."""
+    groups = [
+        KVCacheGroupSpec(
+            ["attention"],
+            FullAttentionSpec(
+                block_size=8, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+            is_eagle_group=True,
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=16,
+                shapes=((1,),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
     ]
+    coord = MooncakeStoreCoordinator(groups, 16, 4, use_eagle=True)
+    req_meta = ReqMeta(
+        req_id="req-0",
+        token_len_chunk=0,
+        block_ids=(list(range(1, 11)), [50, 51, 52, 53, 54]),
+        block_hashes=[bytes([i]) for i in range(18)],
+        num_prompt_tokens=75,
+        completed_token_len=75,
+        boundary_puts=[BoundaryPut(1, 60, mamba_tail)],
+        publish_partial_tail=True,
+    )
+
+    assert (
+        _partial_tail_non_mamba_puts(coord, req_meta, [8, 16], apply_eagle=apply_eagle)
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -1382,7 +1460,10 @@ def test_shared_prefix_junction_handoff_adds_no_attention_tail(
         publish_partial_tail=publish,
     )
 
-    assert _partial_tail_non_mamba_puts(coord, req_meta, [4, 16]) == expected
+    assert (
+        _partial_tail_non_mamba_puts(coord, req_meta, [4, 16], apply_eagle=True)
+        == expected
+    )
 
 
 def test_decode_boundary_state_offload_dropped_unclaimed():
@@ -1764,3 +1845,98 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+def test_lookahead_hashed_prefix_is_retried_without_new_blocks():
+    scheduler = _make_bare_scheduler()
+    scheduler.use_lookahead_block_hashes = True
+    token_ids = list(range(32))
+    request = SimpleNamespace(
+        all_token_ids=token_ids,
+        block_hashes=[b"eagle-0"],
+        num_prompt_tokens=32,
+        num_output_placeholders=0,
+    )
+    scheduler._unfinished_requests["req-0"] = (request, ([1, 2],))
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=16,
+        allocated_block_ids=([1, 2],),
+        num_saved_tokens=0,
+        token_ids=token_ids[:16],
+        prefill_end_tokens=32,
+    )
+    out = SimpleNamespace(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["req-0"],
+            new_block_ids=[None],
+            num_computed_tokens=[16],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={"req-0": 1},
+        scheduled_spec_decode_tokens={},
+        kv_connector_block_state=_make_connector_block_state(block_ids=([1, 2],)),
+    )
+
+    meta = scheduler.build_connector_meta(out)
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].block_hashes == [b"eagle-0"]
+    assert meta.requests[0].token_len_chunk == 16
+    assert scheduler._request_trackers["req-0"].num_saved_tokens == 16
+
+
+def test_lookahead_finished_request_flushes_last_hashed_block():
+    # The last lookahead hash exists only once the request has finished, so
+    # its save is pinned at finish and emitted on the next step.
+    scheduler = _make_bare_scheduler()
+    scheduler.use_lookahead_block_hashes = True
+    token_ids = list(range(32))
+    request = SimpleNamespace(
+        request_id="req-0",
+        all_token_ids=token_ids,
+        block_hashes=[b"eagle-0"],
+        num_prompt_tokens=32,
+        num_tokens=32,
+    )
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=32,
+        allocated_block_ids=([1, 2],),
+        num_saved_tokens=0,
+        token_ids=token_ids,
+        prefill_end_tokens=32,
+    )
+    scheduler._unfinished_requests["req-0"] = (request, ([1, 2],))
+    pool = scheduler._gpu_block_pool
+
+    scheduler.register_finished_lookahead_save(request, ([1, 2],))
+
+    assert pool.blocks[1].ref_cnt == pool.blocks[2].ref_cnt == 1
+    out = SimpleNamespace(
+        finished_req_ids={"req-0"},
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[],
+            new_block_ids=[],
+            num_computed_tokens=[],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+        kv_connector_block_state=_make_connector_block_state(),
+    )
+    meta = scheduler.build_connector_meta(out)
+
+    assert len(meta.requests) == 1
+    req_meta = meta.requests[0]
+    assert req_meta.block_hashes == [b"eagle-0"]
+    assert req_meta.token_len_chunk == 16
+    assert req_meta.store_job_id is not None
+
+    scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
+    assert pool.blocks[1].ref_cnt == pool.blocks[2].ref_cnt == 0

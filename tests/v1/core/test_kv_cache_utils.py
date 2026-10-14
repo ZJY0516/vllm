@@ -1096,7 +1096,12 @@ def test_request_block_hasher_incremental_append_with_multiple_mm_features(
         pytest.param(
             {"disable_lookahead_block_hashes": True}, False, id="disabled-by-config"
         ),
-        pytest.param({"kv_connector": True}, False, id="kv-connector"),
+        pytest.param(
+            {"enable_prefix_caching": False, "connector_support": True},
+            True,
+            id="supporting-connector",
+        ),
+        pytest.param({"connector_support": False}, False, id="unsupported-connector"),
         pytest.param({"hisparse": True}, False, id="hisparse"),
     ],
 )
@@ -1108,6 +1113,7 @@ def test_lookahead_block_hashing_enabled(overrides: dict[str, Any], expected: bo
         "disable_lookahead_block_hashes",
         overrides.get("disable_lookahead_block_hashes", False),
     )
+    connector_support = overrides.get("connector_support")
     vllm_config = cast(
         VllmConfig,
         SimpleNamespace(
@@ -1118,14 +1124,19 @@ def test_lookahead_block_hashing_enabled(overrides: dict[str, Any], expected: bo
             num_prefill_lookahead_tokens=overrides.get(
                 "num_prefill_lookahead_tokens", 1
             ),
-            kv_transfer_config=object() if overrides.get("kv_connector") else None,
+            kv_transfer_config=None if connector_support is None else object(),
             attention_config=SimpleNamespace(
                 hisparse_config=object() if overrides.get("hisparse") else None
             ),
         ),
     )
+    connector = (
+        None
+        if connector_support is None
+        else SimpleNamespace(supports_lookahead_block_hashes=connector_support)
+    )
 
-    assert is_lookahead_block_hashing_enabled(vllm_config) == expected
+    assert is_lookahead_block_hashing_enabled(vllm_config, connector) == expected
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])

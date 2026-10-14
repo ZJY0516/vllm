@@ -950,7 +950,10 @@ def _resolve_partial_tail(thread, req: ReqMeta) -> ReqMeta:
     """Add the tail's non-Mamba puts as the scheduler does before the worker."""
     req.boundary_puts = [BoundaryPut(*put) for put in req.boundary_puts or []]
     req.boundary_puts[:0] = _partial_tail_non_mamba_puts(
-        thread.coord, req, [db.block_size for db in thread.token_databases]
+        thread.coord,
+        req,
+        [db.block_size for db in thread.token_databases],
+        apply_eagle=True,
     )
     return req
 
@@ -1589,7 +1592,7 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
     )
     coord = SimpleNamespace(
         lcm_block_size=16,
-        store_mask=lambda token_len, start_token, num_prompt_tokens=None: (
+        store_mask=lambda token_len, start_token, num_prompt_tokens=None, **kwargs: (
             None,
             [True, False],
         ),
@@ -1635,7 +1638,9 @@ def test_store_sending_thread_delta_saves_only_new_masked_chunks():
 
     assert full_hashes == [b"a2".hex(), b"a3".hex()]
     assert masked_hashes == [b"a2".hex()]
-    coord.store_mask.assert_called_once_with(64, 32, num_prompt_tokens=64)
+    coord.store_mask.assert_called_once_with(
+        64, 32, num_prompt_tokens=64, apply_eagle=True
+    )
 
 
 def test_store_sending_thread_prepares_missing_chunks_once_per_group():
@@ -1644,7 +1649,7 @@ def test_store_sending_thread_prepares_missing_chunks_once_per_group():
     store.batch_put_from_multi_buffers.return_value = [256, 256, 512, 512]
     coord = SimpleNamespace(
         lcm_block_size=16,
-        store_mask=lambda token_len, start_token, num_prompt_tokens=None: (
+        store_mask=lambda token_len, start_token, num_prompt_tokens=None, **kwargs: (
             None,
             None,
         ),
@@ -3711,6 +3716,7 @@ def _make_bare_worker(
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
     worker._capacity_only = False
+    worker.use_lookahead_block_hashes = False
     worker.block_size = block_size
     worker._is_hma_required = False
     worker.tp_rank = 0

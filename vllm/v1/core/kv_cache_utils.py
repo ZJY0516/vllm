@@ -29,6 +29,7 @@ from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 
@@ -936,7 +937,10 @@ def resolve_cache_hit_alignment_tokens(
     return scheduler_block_size
 
 
-def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
+def is_lookahead_block_hashing_enabled(
+    vllm_config: VllmConfig,
+    kv_connector: "KVConnectorBase_V1 | None" = None,
+) -> bool:
     speculative_config = vllm_config.speculative_config
     if (
         speculative_config is None
@@ -950,9 +954,10 @@ def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
     # HiSparse is not validated with lookahead hashes.
     if vllm_config.attention_config.hisparse_config is not None:
         return False
-    # KV connectors keep the legacy hashes.
     if vllm_config.kv_transfer_config is not None:
-        return False
+        return bool(
+            kv_connector is not None and kv_connector.supports_lookahead_block_hashes
+        )
     return vllm_config.cache_config.enable_prefix_caching
 
 
