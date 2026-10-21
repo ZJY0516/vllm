@@ -83,7 +83,6 @@ pytestmark = pytest.mark.cpu_test
 
 def _enable_lookahead_block_hashes(scheduler: Scheduler) -> None:
     scheduler.use_lookahead_block_hashes = True
-    scheduler.kv_cache_manager.block_pool.num_hash_lookahead_tokens = 1
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
@@ -417,55 +416,6 @@ def test_scheduler_publishes_lookahead_blocks_at_allocation():
     scheduler.schedule()
     assert num_cached_tokens([0, 1, 2, 3, 5, 7]) == 2 * block_size
     assert num_cached_tokens([0, 1, 2, 3, 6, 7]) == block_size
-
-
-@pytest.mark.parametrize("abort", [False, True])
-def test_finished_request_publishes_block_ending_at_last_sampled_token(abort: bool):
-    """The last sampled token is never computed, but it is the lookahead token
-    of the block ending right before it, whose draft KV the finishing step
-    wrote. That block must be published before the request is freed."""
-    block_size = 2
-    init_none_hash(sha256)
-    scheduler = create_scheduler(
-        enable_prefix_caching=True,
-        block_size=block_size,
-        max_num_batched_tokens=16,
-    )
-    _enable_lookahead_block_hashes(scheduler)
-    request = Request(
-        request_id="request",
-        prompt_token_ids=[0, 1, 2],
-        sampling_params=SamplingParams(max_tokens=3 if abort else 2, ignore_eos=True),
-        pooling_params=None,
-        block_hasher=get_request_block_hasher(block_size, sha256, True),
-    )
-    scheduler.add_request(request)
-
-    for token_id in (3, 4):
-        scheduler_output = scheduler.schedule()
-        scheduler.update_from_output(
-            scheduler_output,
-            ModelRunnerOutput(
-                req_ids=[request.request_id],
-                req_id_to_index={request.request_id: 0},
-                sampled_token_ids=[[token_id]],
-            ),
-        )
-    if abort:
-        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
-    assert request.is_finished()
-    # Tokens 0-3 were computed; token 4 is the lookahead of block [2, 4).
-    assert request.num_computed_tokens == 4
-
-    probe = Request(
-        request_id="probe",
-        prompt_token_ids=[0, 1, 2, 3, 4, 5],
-        sampling_params=SamplingParams(max_tokens=1),
-        pooling_params=None,
-        block_hasher=get_request_block_hasher(block_size, sha256, True),
-    )
-    _, num_tokens, _ = scheduler.kv_cache_manager.get_computed_blocks(probe)
-    assert num_tokens == 4
 
 
 def test_schedule_multimodal_requests():

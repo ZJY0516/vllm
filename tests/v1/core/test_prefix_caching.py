@@ -4217,7 +4217,6 @@ def test_eagle_identical_prompt_hit(
         max_model_len=8192,
         enable_caching=True,
         use_eagle=not lookahead,
-        num_hash_lookahead_tokens=int(lookahead),
         hash_block_size=block_size,
     )
     token_ids = [0] * num_prompt_tokens
@@ -4249,7 +4248,6 @@ def test_lookahead_token_controls_last_block_hit():
         max_model_len=8192,
         enable_caching=True,
         use_eagle=False,
-        num_hash_lookahead_tokens=1,
         hash_block_size=block_size,
     )
 
@@ -4285,53 +4283,6 @@ def test_lookahead_token_controls_last_block_hit():
     assert num_tokens == block_size
 
 
-def test_kv_events_reconstruct_lookahead_block_hashes():
-    block_size = 2
-    manager = make_kv_cache_manager(
-        make_kv_cache_config(block_size, num_blocks=20),
-        max_model_len=8192,
-        enable_caching=True,
-        use_eagle=False,
-        num_hash_lookahead_tokens=1,
-        hash_block_size=block_size,
-        enable_kv_cache_events=True,
-    )
-    request = make_request(
-        "request",
-        [0, 1, 2, 3, 4],
-        block_size,
-        sha256,
-        use_lookahead_hashes=True,
-    )
-    computed_blocks, _, _ = manager.get_computed_blocks(request)
-    manager.allocate_slots(request, request.num_tokens, 0, computed_blocks)
-
-    events = manager.take_events()
-
-    assert len(events) == 1
-    assert isinstance(events[0], BlockStored)
-    assert events[0].block_hashes == [
-        kv_cache_utils.maybe_convert_block_hash(block_hash)
-        for block_hash in request.block_hashes
-    ]
-    reconstructed_hashes = []
-    parent_hash = events[0].parent_block_hash
-    assert events[0].extra_keys == [None, None]
-    for block_start, lookahead_token_ids in zip(
-        range(0, len(events[0].token_ids), block_size),
-        events[0].lookahead_token_ids,
-        strict=True,
-    ):
-        parent_hash = kv_cache_utils.hash_block_tokens(
-            sha256,
-            parent_hash,
-            events[0].token_ids[block_start : block_start + block_size],
-            (None, tuple(lookahead_token_ids), None),
-        )
-        reconstructed_hashes.append(parent_hash)
-    assert reconstructed_hashes == request.block_hashes
-
-
 def test_eagle_hybrid_mamba_hits_partial_prompt_boundary():
     hash_block_size = 16
     mamba_block_size = 544
@@ -4365,7 +4316,6 @@ def test_eagle_hybrid_mamba_hits_partial_prompt_boundary():
         max_model_len=8192,
         enable_caching=True,
         use_eagle=False,
-        num_hash_lookahead_tokens=1,
         hash_block_size=hash_block_size,
     )
 
@@ -4430,7 +4380,6 @@ def test_lookahead_per_group_hits_stay_within_max_length():
         max_model_len=8192,
         enable_caching=True,
         use_eagle=False,
-        num_hash_lookahead_tokens=1,
         hash_block_size=block_size,
     )
     token_ids = list(range(5 * block_size + 1))
@@ -5413,7 +5362,6 @@ def test_hybrid_mamba_retention_lookahead_keeps_last_prompt_boundary():
         hash_block_size=block_size,
         retention_interval=0,
         use_eagle=False,
-        num_hash_lookahead_tokens=1,
     )
 
     # 129 tokens: the last boundary below the logits token is 128.

@@ -463,8 +463,7 @@ class SpeculativeConfig:
     disable_lookahead_block_hashes: bool = False
     """Disable lookahead block hashes for EAGLE-like speculative methods and
     fall back to dropping the trailing prefix-cache block. Lookahead hashes
-    also cover the token after each block, so engines sharing a KV store and
-    external consumers of KV cache events must use the same setting."""
+    also cover tokens after each block."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to

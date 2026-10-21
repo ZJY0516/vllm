@@ -19,13 +19,13 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
-    generate_request_block_hash_extra_keys,
+    generate_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
     resolve_block_hashes,
-    to_request_event_extra_keys,
+    to_event_extra_keys,
 )
 from vllm.v1.request import Request
 
@@ -161,7 +161,6 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        num_hash_lookahead_tokens: int = 0,
         medium: str = MEDIUM_GPU,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
@@ -169,7 +168,6 @@ class BlockPool:
         self.medium = medium
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
-        self.num_hash_lookahead_tokens = num_hash_lookahead_tokens
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
@@ -327,12 +325,8 @@ class BlockPool:
                     continue
                 block_start = i * block_size
                 block_end = block_start + block_size
-                extra_keys, curr_mm_idx = generate_request_block_hash_extra_keys(
-                    request,
-                    block_start,
-                    block_end,
-                    curr_mm_idx,
-                    self.num_hash_lookahead_tokens,
+                extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                    request, block_start, block_end, curr_mm_idx
                 )
                 extra_keys_list.append(extra_keys)
 
@@ -362,13 +356,10 @@ class BlockPool:
     ) -> BlockStored:
         """Build a ``BlockStored`` KV event for ``request``.
 
-        Shared by ``cache_full_blocks`` (newly cached blocks),
-        ``emit_cached_block_events`` (prefix-cache-reused blocks) and partial
-        entries so all emit identical event shapes for downstream consumers.
+        Shared by ``cache_full_blocks`` (newly cached blocks) and
+        ``emit_cached_block_events`` (prefix-cache-reused blocks) so both emit
+        identical event shapes for downstream consumers.
         """
-        extra_keys, lookahead_token_ids, lookahead_extra_keys = (
-            to_request_event_extra_keys(extra_keys_list, self.num_hash_lookahead_tokens)
-        )
         return BlockStored(
             block_hashes=block_hashes,
             parent_block_hash=parent_block_hash,
@@ -377,11 +368,9 @@ class BlockPool:
             lora_id=request.lora_request.adapter_id if request.lora_request else None,
             medium=self.medium,
             lora_name=request.lora_request.name if request.lora_request else None,
-            extra_keys=extra_keys,
+            extra_keys=to_event_extra_keys(extra_keys_list),
             group_idx=kv_cache_group_id,
             session_id=request.session_id,
-            lookahead_token_ids=lookahead_token_ids,
-            lookahead_extra_keys=lookahead_extra_keys,
         )
 
     def emit_cached_block_events(
@@ -419,12 +408,8 @@ class BlockPool:
             block_start = i * block_size
             block_end = block_start + block_size
             cached_hashes.append(maybe_convert_block_hash(block_hashes[i]))
-            extra_keys, curr_mm_idx = generate_request_block_hash_extra_keys(
-                request,
-                block_start,
-                block_end,
-                curr_mm_idx,
-                self.num_hash_lookahead_tokens,
+            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
+                request, block_start, block_end, curr_mm_idx
             )
             extra_keys_list.append(extra_keys)
 
@@ -558,23 +543,25 @@ class BlockPool:
                     curr_mm_idx, _ = get_mm_features_in_window(
                         mm_features, block_start, block_end
                     )
-            extra_keys, _ = generate_request_block_hash_extra_keys(
-                request,
-                block_start,
-                block_end,
-                curr_mm_idx,
-                self.num_hash_lookahead_tokens,
+            extra_keys, _ = generate_block_hash_extra_keys(
+                request, block_start, block_end, curr_mm_idx
             )
             self.kv_event_queue.append(
-                self._build_block_stored_event(
-                    request,
+                BlockStored(
                     block_hashes=[maybe_convert_block_hash(block_hash)],
                     parent_block_hash=parent_block_hash,
-                    start_token_idx=block_start,
-                    end_token_idx=block_end,
+                    token_ids=request.all_token_ids[block_start:block_end],
                     block_size=block_end - block_start,
-                    kv_cache_group_id=kv_cache_group_id,
-                    extra_keys_list=[extra_keys],
+                    lora_id=request.lora_request.adapter_id
+                    if request.lora_request
+                    else None,
+                    medium=self.medium,
+                    lora_name=request.lora_request.name
+                    if request.lora_request
+                    else None,
+                    extra_keys=to_event_extra_keys([extra_keys]),
+                    group_idx=kv_cache_group_id,
+                    session_id=request.session_id,
                 )
             )
         return block_hash_with_group_id

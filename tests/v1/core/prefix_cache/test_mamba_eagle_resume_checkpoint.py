@@ -53,7 +53,6 @@ def _manager(
         enable_caching=True,
         hash_block_size=hash_block_size,
         use_eagle=not lookahead,
-        num_hash_lookahead_tokens=int(lookahead),
         num_prefill_lookahead=num_prefill_lookahead,
         enable_mamba_shared_prefix_checkpoint=shared_prefix_checkpoint,
     )
@@ -76,10 +75,8 @@ def _stub(manager, block_size, hash_block_size, *, block_drop=True):
         # The EAGLE adjustments key on the block-drop bit, not plain use_eagle:
         # they exist only to compensate for the drop, which lookahead hashes
         # make unnecessary.
-        use_eagle_block_drop=(
-            block_drop and not manager.block_pool.num_hash_lookahead_tokens
-        ),
-        use_lookahead_block_hashes=bool(manager.block_pool.num_hash_lookahead_tokens),
+        use_eagle_block_drop=(block_drop and manager.use_eagle),
+        use_lookahead_block_hashes=not manager.use_eagle,
         hash_block_size=hash_block_size,
         mamba_has_prefill_checkpoint_blocks=False,  # forced False under eagle
         mamba_partial_cache_hit=partial_hit,

@@ -695,33 +695,13 @@ def to_event_extra_keys(
     """
     if not extra_keys:
         return None
-    event_keys = [_untag_extra_keys(keys) for keys in extra_keys]
+    event_keys = [
+        None
+        if keys is None
+        else tuple(key[1:] if key[0] == "mm" else key[1] for key in keys)
+        for keys in extra_keys
+    ]
     return event_keys or None
-
-
-def to_request_event_extra_keys(
-    extra_keys: list[Any], num_hash_lookahead_tokens: int
-) -> tuple[
-    list[tuple[Any, ...] | None] | None,
-    list[list[int]] | None,
-    list[tuple[Any, ...] | None] | None,
-]:
-    """Split keys from `generate_request_block_hash_extra_keys` into the
-    `extra_keys`, `lookahead_token_ids` and `lookahead_extra_keys` fields of
-    `BlockStored`."""
-    if not num_hash_lookahead_tokens:
-        return to_event_extra_keys(extra_keys), None, None
-    return (
-        to_event_extra_keys([keys[0] for keys in extra_keys]),
-        [list(keys[1]) for keys in extra_keys],
-        to_event_extra_keys([keys[2] for keys in extra_keys]),
-    )
-
-
-def _untag_extra_keys(keys: tuple[Any, ...] | None) -> tuple[Any, ...] | None:
-    if keys is None:
-        return None
-    return tuple(key[1:] if key[0] == "mm" else key[1] for key in keys)
 
 
 def hash_block_tokens(
@@ -984,23 +964,13 @@ def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
     # KV connectors keep the legacy hashes.
     if vllm_config.kv_transfer_config is not None:
         return False
-    return vllm_config.cache_config.enable_prefix_caching
-
-
-def get_num_hash_lookahead_tokens(vllm_config: VllmConfig) -> int:
-    """Tokens after each block that its hash also covers (0 for plain hashes)."""
-    if not is_lookahead_block_hashing_enabled(vllm_config):
-        return 0
-    spec_config = vllm_config.speculative_config
-    assert spec_config is not None
-    # DFlash/DSpark cache KV from target hidden states; Gemma4 MTP caches none.
+    # KV events retain their existing hash format.
     if (
-        spec_config.use_dflash()
-        or spec_config.use_dspark()
-        or spec_config.use_gemma4_mtp()
+        vllm_config.kv_events_config is not None
+        and vllm_config.kv_events_config.enable_kv_cache_events
     ):
-        return 0
-    return vllm_config.num_prefill_lookahead_tokens
+        return False
+    return vllm_config.cache_config.enable_prefix_caching
 
 
 def get_request_block_hasher(
@@ -1051,16 +1021,23 @@ def get_request_block_hasher(
                 break
 
             # MM and LoRA requests need extra keys for block-hash computation.
-            extra_keys, curr_mm_idx = generate_request_block_hash_extra_keys(
+            hash_end_token_idx = end_token_idx + num_hash_lookahead_tokens
+            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
                 request,
                 start_token_idx,
-                end_token_idx,
+                hash_end_token_idx,
                 curr_mm_idx,
-                num_hash_lookahead_tokens,
             )
 
-            # Compute the hash of the current block
-            block_tokens = request.all_token_ids[start_token_idx:end_token_idx]
+            if num_hash_lookahead_tokens:
+                # Retain MM features that overlap the next block.
+                while curr_mm_idx > 0:
+                    mm_position = mm_features[curr_mm_idx - 1].mm_position
+                    if mm_position.offset + mm_position.length <= end_token_idx:
+                        break
+                    curr_mm_idx -= 1
+
+            block_tokens = request.all_token_ids[start_token_idx:hash_end_token_idx]
             block_hash = hash_block_tokens(
                 caching_hash_fn, prev_block_hash_value, block_tokens, extra_keys
             )
@@ -1072,59 +1049,6 @@ def get_request_block_hasher(
         return new_block_hashes
 
     return request_block_hasher
-
-
-def generate_lookahead_block_hash_extra_keys(
-    request: Request,
-    start_token_idx: int,
-    end_token_idx: int,
-    start_mm_idx: int,
-    num_hash_lookahead_tokens: int,
-) -> tuple[tuple[Any, ...], int]:
-    block_extra_keys, next_block_mm_idx = generate_block_hash_extra_keys(
-        request,
-        start_token_idx,
-        end_token_idx,
-        start_mm_idx,
-    )
-    lookahead_end_idx = end_token_idx + num_hash_lookahead_tokens
-    lookahead_extra_keys, _ = generate_block_hash_extra_keys(
-        request,
-        end_token_idx,
-        lookahead_end_idx,
-        next_block_mm_idx,
-    )
-    return (
-        (
-            block_extra_keys,
-            tuple(request.all_token_ids[end_token_idx:lookahead_end_idx]),
-            lookahead_extra_keys,
-        ),
-        next_block_mm_idx,
-    )
-
-
-def generate_request_block_hash_extra_keys(
-    request: Request,
-    start_token_idx: int,
-    end_token_idx: int,
-    start_mm_idx: int,
-    num_hash_lookahead_tokens: int,
-) -> tuple[tuple[Any, ...] | None, int]:
-    if num_hash_lookahead_tokens:
-        return generate_lookahead_block_hash_extra_keys(
-            request,
-            start_token_idx,
-            end_token_idx,
-            start_mm_idx,
-            num_hash_lookahead_tokens,
-        )
-    return generate_block_hash_extra_keys(
-        request,
-        start_token_idx,
-        end_token_idx,
-        start_mm_idx,
-    )
 
 
 def get_max_concurrency_for_kv_cache_config(

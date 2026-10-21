@@ -39,7 +39,6 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
-    get_num_hash_lookahead_tokens,
     is_lookahead_block_hashing_enabled,
 )
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -331,7 +330,9 @@ class Scheduler(SchedulerInterface):
         if self.use_lookahead_block_hashes:
             # Lookahead hashes prove the boundary token, so EAGLE needs no drop.
             self.use_eagle_block_drop = False
-        self.num_hash_lookahead_tokens = get_num_hash_lookahead_tokens(vllm_config)
+        self.num_hash_lookahead_tokens = (
+            self.num_prefill_lookahead if self.use_lookahead_block_hashes else 0
+        )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -343,7 +344,6 @@ class Scheduler(SchedulerInterface):
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle_block_drop,
-            num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
             num_prefill_lookahead=self.num_prefill_lookahead,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
@@ -2283,18 +2283,6 @@ class Scheduler(SchedulerInterface):
                 # a consumed prompt also means every item in it was encoded.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
-
-            if (
-                self.use_lookahead_block_hashes
-                and new_token_ids
-                and status_before_stop == RequestStatus.RUNNING
-                and not output_is_stale
-            ):
-                # Publish blocks the new tokens complete before a stop or abort.
-                self.kv_cache_manager.cache_blocks(
-                    request,
-                    request.num_computed_tokens - request.num_in_flight_tokens,
-                )
 
             if new_token_ids and not self.structured_output_manager.accept_tokens(
                 request, new_token_ids
