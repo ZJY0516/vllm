@@ -806,6 +806,7 @@ def test_lookahead_hash_preserves_mm_identity(mm_offset):
             block_size=4,
             mm_positions=[PlaceholderRange(offset=mm_offset, length=5 - mm_offset)],
             mm_hashes=[image],
+            hash_fn=sha256,
             num_hash_lookahead_tokens=1,
         )
         for image in ("image_a", "image_b")
@@ -1103,7 +1104,11 @@ def test_request_block_hasher_incremental_append_with_multiple_mm_features(
 
 def test_lookahead_hash_covers_each_module_lookahead():
     request = make_request(
-        "request", list(range(9)), block_size=4, num_hash_lookahead_tokens=2
+        "request",
+        list(range(9)),
+        block_size=4,
+        hash_fn=sha256,
+        num_hash_lookahead_tokens=2,
     )
     # The second block's hash waits for both tokens after it.
     assert len(request.block_hashes) == 1
