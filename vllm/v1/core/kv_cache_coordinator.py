@@ -124,7 +124,7 @@ class KVCacheCoordinator(ABC):
             metrics_collector=metrics_collector,
         )
 
-        # KV cache group indices that get the EAGLE last-block drop.
+        # KV cache group indices belonging to the EAGLE drafter.
         self.eagle_group_ids: set[int] = {
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
         }

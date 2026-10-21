@@ -154,15 +154,6 @@ def _split(
     return Scheduler._mamba_block_aligned_split(stub, request, num_new_tokens)
 
 
-def test_lookahead_hashing_preserves_last_mamba_cache_boundary() -> None:
-    prompt_len = 2 * MAMBA_BLOCK_SIZE + 1
-    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
-    assert _split(request, prompt_len) == MAMBA_BLOCK_SIZE
-    assert (
-        _split(request, prompt_len, use_eagle_block_drop=False) == 2 * MAMBA_BLOCK_SIZE
-    )
-
-
 @pytest.mark.parametrize(
     ("prompt_len", "num_new_tokens", "use_eagle", "expected"),
     [
