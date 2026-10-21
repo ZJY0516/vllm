@@ -97,10 +97,16 @@ async def _wait_for_counters(
 @pytest.fixture(scope="module")
 def server(request):
     args = ["--enable-prompt-tokens-details"]
-    if request.param:
+    if request.param is not None:
         args += [
             "--speculative-config",
-            json.dumps({"method": "mtp", "num_speculative_tokens": 1}),
+            json.dumps(
+                {
+                    "method": "mtp",
+                    "num_speculative_tokens": 1,
+                    "disable_lookahead_block_hashes": request.param,
+                }
+            ),
         ]
     with RemoteOpenAIServer(MODEL, args) as remote_server:
         yield remote_server
@@ -109,8 +115,11 @@ def server(request):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "server, dropped_blocks",
-    # MTP's prefill lookahead pollutes the tail block, so EAGLE drops one.
-    [pytest.param(False, 0, id="base"), pytest.param(True, 1, id="mtp")],
+    [
+        pytest.param(None, 0, id="base"),
+        pytest.param(True, 1, id="mtp-legacy"),
+        pytest.param(False, 0, id="mtp-lookahead"),
+    ],
     indirect=["server"],
 )
 async def test_prefix_cache_hit_rate(
