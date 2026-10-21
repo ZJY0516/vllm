@@ -37,10 +37,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import (
-    KVCacheBlock,
-    is_lookahead_block_hashing_enabled,
-)
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -324,9 +321,7 @@ class Scheduler(SchedulerInterface):
                     "acceptance rates."
                 )
 
-        self.use_lookahead_block_hashes = is_lookahead_block_hashing_enabled(
-            vllm_config
-        )
+        self.use_lookahead_block_hashes = vllm_config.use_lookahead_block_hashes
         if self.use_lookahead_block_hashes:
             # Lookahead hashes prove the boundary token, so EAGLE needs no drop.
             self.use_eagle_block_drop = False

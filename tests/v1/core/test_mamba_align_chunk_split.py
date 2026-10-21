@@ -128,7 +128,6 @@ def _split(
     request: Request,
     num_new_tokens: int,
     use_eagle: bool = True,
-    use_lookahead_block_hashes: bool = False,
     use_eagle_block_drop: bool | None = None,
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
@@ -136,13 +135,11 @@ def _split(
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     if use_eagle_block_drop is None:
-        # The scheduler clears the drop once lookahead hashes are enabled.
-        use_eagle_block_drop = use_eagle and not use_lookahead_block_hashes
+        use_eagle_block_drop = use_eagle
     stub = SimpleNamespace(
         block_size=MAMBA_BLOCK_SIZE,
         cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
         use_eagle_block_drop=use_eagle_block_drop,
-        use_lookahead_block_hashes=use_lookahead_block_hashes,
         max_num_scheduled_tokens=max_num_scheduled_tokens,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         # `prefix_match_unit` finer than the block size (#46384).
@@ -160,11 +157,9 @@ def _split(
 def test_lookahead_hashing_preserves_last_mamba_cache_boundary() -> None:
     prompt_len = 2 * MAMBA_BLOCK_SIZE + 1
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
-
     assert _split(request, prompt_len) == MAMBA_BLOCK_SIZE
     assert (
-        _split(request, prompt_len, use_lookahead_block_hashes=True)
-        == 2 * MAMBA_BLOCK_SIZE
+        _split(request, prompt_len, use_eagle_block_drop=False) == 2 * MAMBA_BLOCK_SIZE
     )
 
 

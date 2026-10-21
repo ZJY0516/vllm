@@ -668,6 +668,30 @@ class VllmConfig:
         return 1
 
     @property
+    def use_lookahead_block_hashes(self) -> bool:
+        """Whether prefix-cache hashes include lookahead tokens."""
+        speculative_config = self.speculative_config
+        if (
+            speculative_config is None
+            or not speculative_config.use_eagle_block_drop()
+            or speculative_config.disable_lookahead_block_hashes
+        ):
+            return False
+        # HiSparse is not validated with lookahead hashes.
+        if self.attention_config.hisparse_config is not None:
+            return False
+        # KV connectors keep the legacy hashes.
+        if self.kv_transfer_config is not None:
+            return False
+        # KV events retain their existing hash format.
+        if (
+            self.kv_events_config is not None
+            and self.kv_events_config.enable_kv_cache_events
+        ):
+            return False
+        return self.cache_config.enable_prefix_caching
+
+    @property
     def uniform_decode_query_len(self) -> int:
         """Query length of every request in a uniform decode batch.
 

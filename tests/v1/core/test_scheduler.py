@@ -41,10 +41,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import (
-    get_request_block_hasher,
-    init_none_hash,
-)
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.diffusion_scheduler import (
     DiffusionAsyncScheduler,
     DiffusionScheduler,
@@ -79,10 +76,6 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
-
-
-def _enable_lookahead_block_hashes(scheduler: Scheduler) -> None:
-    scheduler.use_lookahead_block_hashes = True
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
@@ -384,7 +377,6 @@ def test_scheduler_publishes_lookahead_blocks_at_allocation():
         block_size=block_size,
         max_num_batched_tokens=16,
     )
-    _enable_lookahead_block_hashes(scheduler)
 
     def make_request(request_id: str, prompt_token_ids: list[int]) -> Request:
         return Request(
@@ -4636,7 +4628,6 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.return_sampling_mask = False
     scheduler.recompute_kv_load_failures = False
     scheduler.defer_block_free = False
-    scheduler.use_lookahead_block_hashes = False
     scheduler.make_stats = Mock(return_value=None)
     scheduler.max_model_len = 128
 

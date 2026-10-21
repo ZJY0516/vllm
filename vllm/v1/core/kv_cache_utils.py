@@ -950,29 +950,6 @@ def resolve_cache_hit_alignment_tokens(
     return scheduler_block_size
 
 
-def is_lookahead_block_hashing_enabled(vllm_config: VllmConfig) -> bool:
-    speculative_config = vllm_config.speculative_config
-    if (
-        speculative_config is None
-        or not speculative_config.use_eagle_block_drop()
-        or speculative_config.disable_lookahead_block_hashes
-    ):
-        return False
-    # HiSparse is not validated with lookahead hashes.
-    if vllm_config.attention_config.hisparse_config is not None:
-        return False
-    # KV connectors keep the legacy hashes.
-    if vllm_config.kv_transfer_config is not None:
-        return False
-    # KV events retain their existing hash format.
-    if (
-        vllm_config.kv_events_config is not None
-        and vllm_config.kv_events_config.enable_kv_cache_events
-    ):
-        return False
-    return vllm_config.cache_config.enable_prefix_caching
-
-
 def get_request_block_hasher(
     hash_block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
@@ -986,9 +963,9 @@ def get_request_block_hasher(
     boundary. Coarser group block sizes and partial-cache boundaries reuse
     these hashes directly (see ``BlockHashListWithBlockSize``).
 
-    With ``num_hash_lookahead_tokens``, each hash also covers that many tokens
-    after its block, which the EAGLE draft KV at the block's last positions
-    depends on, so it is emitted only once those tokens exist.
+    Each hash includes ``num_hash_lookahead_tokens`` beyond its block to
+    capture the trailing draft KV's token dependencies. The hash is computed
+    only when those tokens are known.
     """
 
     def request_block_hasher(request: Request) -> list[BlockHash]:

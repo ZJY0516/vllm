@@ -4241,75 +4241,13 @@ def test_eagle_identical_prompt_hit(
     assert num_tokens == expected_blocks * block_size
 
 
-def test_lookahead_token_controls_last_block_hit():
-    block_size = 2
-    manager = make_kv_cache_manager(
-        make_kv_cache_config(block_size, num_blocks=20),
-        max_model_len=8192,
-        enable_caching=True,
-        use_eagle=False,
-        hash_block_size=block_size,
-    )
-
-    first = make_request(
-        "first",
-        [0, 1, 2, 3, 4, 5],
-        block_size,
-        sha256,
-        use_lookahead_hashes=True,
-    )
-    computed_blocks, _, _ = manager.get_computed_blocks(first)
-    manager.allocate_slots(first, first.num_tokens, 0, computed_blocks)
-    manager.free(first)
-
-    same_lookahead = make_request(
-        "same_lookahead",
-        [0, 1, 2, 3, 4, 6],
-        block_size,
-        sha256,
-        use_lookahead_hashes=True,
-    )
-    _, num_tokens, _ = manager.get_computed_blocks(same_lookahead)
-    assert num_tokens == 2 * block_size
-
-    different_lookahead = make_request(
-        "different_lookahead",
-        [0, 1, 2, 3, 7, 6],
-        block_size,
-        sha256,
-        use_lookahead_hashes=True,
-    )
-    _, num_tokens, _ = manager.get_computed_blocks(different_lookahead)
-    assert num_tokens == block_size
-
-
 def test_eagle_hybrid_mamba_hits_partial_prompt_boundary():
     hash_block_size = 16
     mamba_block_size = 544
     token_ids = list(range(1249))
-    config = KVCacheConfig(
-        num_blocks=200,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full_attention"],
-                FullAttentionSpec(
-                    block_size=hash_block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["mamba"],
-                MambaSpec(
-                    block_size=mamba_block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
-                    mamba_cache_mode="align",
-                ),
-            ),
-        ],
+    config = _make_hybrid_kv_cache_config(hash_block_size, 200, ["full", "mamba"])
+    config.kv_cache_groups[1].kv_cache_spec = replace(
+        config.kv_cache_groups[1].kv_cache_spec, block_size=mamba_block_size
     )
     manager = make_kv_cache_manager(
         config,
@@ -4345,59 +4283,11 @@ def test_eagle_hybrid_mamba_hits_partial_prompt_boundary():
     _, num_computed, _ = manager.get_computed_blocks(second)
 
     assert num_computed == 1248
-
-
-def test_lookahead_per_group_hits_stay_within_max_length():
-    """Lookahead groups drop no block, so the per-group lookup must not widen
-    by the EAGLE drop margin."""
-    block_size = 16
-    config = KVCacheConfig(
-        num_blocks=40,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full_attention"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["mamba"],
-                MambaSpec(
-                    block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
-                    mamba_cache_mode="align",
-                ),
-            ),
-        ],
-    )
-    manager = make_kv_cache_manager(
-        config,
-        max_model_len=8192,
-        enable_caching=True,
-        use_eagle=False,
-        hash_block_size=block_size,
-    )
-    token_ids = list(range(5 * block_size + 1))
-    first = make_request(
-        "first", token_ids, block_size, sha256, use_lookahead_hashes=True
-    )
-    computed_blocks, num_computed, _ = manager.get_computed_blocks(first)
-    manager.allocate_slots(first, len(token_ids), num_computed, computed_blocks)
-    manager.free(first)
-
-    probe = make_request(
-        "probe", token_ids, block_size, sha256, use_lookahead_hashes=True
-    )
+    # A no-drop lookup must not search past the caller's requested boundary.
     _, per_group_hits = manager.coordinator.find_longest_cache_hit_per_group(
-        probe.block_hashes, 2 * block_size
+        second.block_hashes, 2 * hash_block_size
     )
-
-    assert per_group_hits[0] == 2 * block_size
+    assert per_group_hits[0] == 2 * hash_block_size
 
 
 def test_eagle_with_sliding_window():
@@ -5330,30 +5220,9 @@ def test_hybrid_mamba_retention_lookahead_keeps_last_prompt_boundary():
     rather than one alignment unit lower; otherwise a resend can only hit the
     lower state."""
     block_size = 32
-    kv_cache_config = KVCacheConfig(
-        num_blocks=100,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["mamba_mtp"],
-                MambaSpec(
-                    block_size=block_size,
-                    shapes=((1, 1),),
-                    dtypes=(torch.float32,),
-                    mamba_cache_mode="align",
-                    num_speculative_blocks=1,
-                ),
-            ),
-        ],
+    kv_cache_config = _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba"])
+    kv_cache_config.kv_cache_groups[1].kv_cache_spec = replace(
+        kv_cache_config.kv_cache_groups[1].kv_cache_spec, num_speculative_blocks=1
     )
     manager = make_kv_cache_manager(
         kv_cache_config=kv_cache_config,

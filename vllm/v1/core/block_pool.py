@@ -491,7 +491,6 @@ class BlockPool:
             computed.
 
         """
-        # Lookahead hashes lag their blocks.
         if block.is_null or num_tokens // self.hash_block_size > len(
             request.block_hashes
         ):

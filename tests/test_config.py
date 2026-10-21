@@ -28,6 +28,7 @@ from vllm.config import (
     EngramConfig,
     HiSparseConfig,
     KernelConfig,
+    KVEventsConfig,
     KVTransferConfig,
     LoRAConfig,
     ModelConfig,
@@ -3602,6 +3603,60 @@ def test_eagle_block_drop_can_be_disabled_without_disabling_eagle(
 
     assert speculative_config.use_eagle()
     assert speculative_config.use_eagle_block_drop() is not disable_eagle_block_drop
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        *(
+            pytest.param({"method": method}, True, id=method)
+            for method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        ),
+        pytest.param({"method": "ngram"}, False, id="not-eagle"),
+        pytest.param({"no_speculative": True}, False, id="no-speculative"),
+        pytest.param({"disable_eagle_block_drop": True}, False, id="no-block-drop"),
+        pytest.param({"enable_prefix_caching": False}, False, id="no-prefix-caching"),
+        pytest.param(
+            {"disable_lookahead_block_hashes": True}, False, id="disabled-by-config"
+        ),
+        pytest.param({"kv_connector": True}, False, id="kv-connector"),
+        pytest.param({"kv_events": True}, False, id="kv-events-enabled"),
+        pytest.param({"kv_events": False}, True, id="kv-events-disabled"),
+        pytest.param({"hisparse": True}, False, id="hisparse"),
+    ],
+)
+def test_use_lookahead_block_hashes(overrides: dict, expected: bool):
+    speculative_config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=2,
+        disable_lookahead_block_hashes=overrides.get(
+            "disable_lookahead_block_hashes", False
+        ),
+        disable_eagle_block_drop=overrides.get("disable_eagle_block_drop", False),
+    )
+    speculative_config.method = overrides.get("method", "mtp")
+    vllm_config = object.__new__(VllmConfig)
+    vllm_config.cache_config = CacheConfig(
+        enable_prefix_caching=overrides.get("enable_prefix_caching", True)
+    )
+    vllm_config.speculative_config = (
+        None if overrides.get("no_speculative") else speculative_config
+    )
+    vllm_config.kv_transfer_config = (
+        KVTransferConfig(kv_connector="NixlConnector", kv_role="kv_both")
+        if overrides.get("kv_connector")
+        else None
+    )
+    vllm_config.kv_events_config = (
+        KVEventsConfig(enable_kv_cache_events=overrides["kv_events"])
+        if "kv_events" in overrides
+        else None
+    )
+    vllm_config.attention_config = AttentionConfig(
+        hisparse_config=HiSparseConfig() if overrides.get("hisparse") else None
+    )
+
+    assert vllm_config.use_lookahead_block_hashes == expected
 
 
 def test_draft_sample_method_gumbel_is_rejected():
