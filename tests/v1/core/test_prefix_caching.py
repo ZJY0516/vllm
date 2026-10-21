@@ -5221,6 +5221,7 @@ def test_hybrid_mamba_retention_lookahead_keeps_last_prompt_boundary():
     lower state."""
     block_size = 32
     kv_cache_config = _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba"])
+    kv_cache_config.kv_cache_groups[1].is_eagle_group = True
     kv_cache_config.kv_cache_groups[1].kv_cache_spec = replace(
         kv_cache_config.kv_cache_groups[1].kv_cache_spec, num_speculative_blocks=1
     )
