@@ -105,7 +105,7 @@ class KVCacheCoordinator(ABC):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         num_prefill_lookahead: int = 0,
-        use_lookahead_block_hashes: bool = False,
+        num_hash_lookahead_tokens: int = 0,
     ):
         self.kv_cache_config = kv_cache_config
         # The scheduling granularity (LCM of all group block sizes), must be a multiple
@@ -123,17 +123,17 @@ class KVCacheCoordinator(ABC):
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
-            use_lookahead_block_hashes=use_lookahead_block_hashes,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
 
-        # KV cache group indices that get the EAGLE last-block drop.
+        # KV cache group indices belonging to the EAGLE drafter.
         self.eagle_group_ids: set[int] = {
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
         }
         # Conservatively fall back to flag all groups when no group is flagged.
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
-        # Lookahead hashes clear ``use_eagle``: groups stay flagged, none drops.
+        # Lookahead hashing leaves drop_eagle_group_ids empty (no last-block drop).
         self.drop_eagle_group_ids = self.eagle_group_ids if use_eagle else set()
 
         # During chunked prefill with EAGLE, the single next prefill lookahead
@@ -496,8 +496,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        use_lookahead_block_hashes: bool = False,
         num_prefill_lookahead: int = 0,
+        num_hash_lookahead_tokens: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -511,8 +511,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
-            use_lookahead_block_hashes=use_lookahead_block_hashes,
             num_prefill_lookahead=num_prefill_lookahead,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -546,8 +546,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        use_lookahead_block_hashes: bool = False,
         num_prefill_lookahead: int = 0,
+        num_hash_lookahead_tokens: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -561,8 +561,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
-            use_lookahead_block_hashes=use_lookahead_block_hashes,
             num_prefill_lookahead=num_prefill_lookahead,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.dcp_world_size = self.single_type_managers[0].dcp_world_size
@@ -632,9 +632,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         scheduler_block_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        use_lookahead_block_hashes: bool = False,
         num_prefill_lookahead: int = 0,
         allow_partial_hash_hits: bool = True,
+        num_hash_lookahead_tokens: int = 0,
     ):
         super().__init__(
             kv_cache_config,
@@ -648,8 +648,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
-            use_lookahead_block_hashes=use_lookahead_block_hashes,
             num_prefill_lookahead=num_prefill_lookahead,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -999,9 +999,9 @@ def get_kv_cache_coordinator(
     scheduler_block_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
-    use_lookahead_block_hashes: bool = False,
     num_prefill_lookahead: int = 0,
     allow_partial_hash_hits: bool = True,
+    num_hash_lookahead_tokens: int = 0,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -1015,8 +1015,8 @@ def get_kv_cache_coordinator(
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
-            use_lookahead_block_hashes=use_lookahead_block_hashes,
             num_prefill_lookahead=num_prefill_lookahead,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -1031,8 +1031,8 @@ def get_kv_cache_coordinator(
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
-            use_lookahead_block_hashes=use_lookahead_block_hashes,
             num_prefill_lookahead=num_prefill_lookahead,
+            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -1046,7 +1046,7 @@ def get_kv_cache_coordinator(
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
-        use_lookahead_block_hashes=use_lookahead_block_hashes,
         num_prefill_lookahead=num_prefill_lookahead,
+        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         allow_partial_hash_hits=allow_partial_hash_hits,
     )

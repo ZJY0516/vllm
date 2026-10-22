@@ -92,7 +92,7 @@ def make_request(
     prompt_logprobs: int | None = None,
     cache_salt: str | None = None,
     lora_request: LoRARequest | None = None,
-    use_lookahead_hashes: bool = False,
+    use_lookahead_hashes: int = 0,
     session_id: str | None = None,
 ):
     mm_features = []
@@ -2582,6 +2582,61 @@ def test_prefill_hybrid_model_mamba_align():
     manager.free(req0)
 
 
+@pytest.mark.parametrize("lookahead", [False, True])
+def test_mamba_ready_prefix_allows_same_step_siblings(lookahead: bool):
+    """Re-registering a ready Mamba hit must not defer the next sibling."""
+    block_size = 16
+    config = _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba", "full"])
+    config.kv_cache_groups[2].is_eagle_group = True
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=256,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=not lookahead,
+        num_prefill_lookahead=1,
+        num_hash_lookahead_tokens=int(lookahead),
+    )
+    tokens = list(range(55))
+    producer = make_request(
+        "producer", tokens, block_size, sha256, use_lookahead_hashes=lookahead
+    )
+    for end in (16, 32, 48, 55):
+        manager.new_step_starts()
+        assert (
+            manager.allocate_slots(producer, end - producer.num_computed_tokens)
+            is not None
+        )
+        if lookahead and end == 48:
+            pending = make_request(
+                "pending", tokens, block_size, sha256, use_lookahead_hashes=True
+            )
+            blocks, num_computed, _ = manager.get_computed_blocks(pending)
+            assert num_computed == end
+            assert (
+                manager.allocate_slots(
+                    pending, len(tokens) - num_computed, num_computed, blocks
+                )
+                is None
+            )
+        producer.num_computed_tokens = end
+    manager.free(producer)
+    manager.new_step_starts()
+
+    for name in ("first", "second"):
+        request = make_request(
+            name, tokens, block_size, sha256, use_lookahead_hashes=lookahead
+        )
+        blocks, num_computed, _ = manager.get_computed_blocks(request)
+        assert num_computed == (48 if lookahead else 32)
+        assert (
+            manager.allocate_slots(
+                request, len(tokens) - num_computed, num_computed, blocks
+            )
+            is not None
+        )
+
+
 def test_hybrid_cache_mamba_align_shared_prefix_detection():
     """Test shared prefix detection heuristic for mamba align cache mode
 
@@ -4217,7 +4272,6 @@ def test_eagle_identical_prompt_hit(
         max_model_len=8192,
         enable_caching=True,
         use_eagle=not lookahead,
-        use_lookahead_block_hashes=lookahead,
         hash_block_size=block_size,
     )
     token_ids = [0] * num_prompt_tokens
@@ -4242,130 +4296,19 @@ def test_eagle_identical_prompt_hit(
     assert num_tokens == expected_blocks * block_size
 
 
-def test_lookahead_token_controls_last_block_hit():
-    block_size = 2
-    manager = make_kv_cache_manager(
-        make_kv_cache_config(block_size, num_blocks=20),
-        max_model_len=8192,
-        enable_caching=True,
-        use_eagle=False,
-        use_lookahead_block_hashes=True,
-        hash_block_size=block_size,
-    )
-
-    first = make_request(
-        "first",
-        [0, 1, 2, 3, 4, 5],
-        block_size,
-        sha256,
-        use_lookahead_hashes=True,
-    )
-    computed_blocks, _, _ = manager.get_computed_blocks(first)
-    manager.allocate_slots(first, first.num_tokens, 0, computed_blocks)
-    manager.free(first)
-
-    same_lookahead = make_request(
-        "same_lookahead",
-        [0, 1, 2, 3, 4, 6],
-        block_size,
-        sha256,
-        use_lookahead_hashes=True,
-    )
-    _, num_tokens, _ = manager.get_computed_blocks(same_lookahead)
-    assert num_tokens == 2 * block_size
-
-    different_lookahead = make_request(
-        "different_lookahead",
-        [0, 1, 2, 3, 7, 6],
-        block_size,
-        sha256,
-        use_lookahead_hashes=True,
-    )
-    _, num_tokens, _ = manager.get_computed_blocks(different_lookahead)
-    assert num_tokens == block_size
-
-
-def test_kv_events_reconstruct_lookahead_block_hashes():
-    block_size = 2
-    manager = make_kv_cache_manager(
-        make_kv_cache_config(block_size, num_blocks=20),
-        max_model_len=8192,
-        enable_caching=True,
-        use_eagle=False,
-        use_lookahead_block_hashes=True,
-        hash_block_size=block_size,
-        enable_kv_cache_events=True,
-    )
-    request = make_request(
-        "request",
-        [0, 1, 2, 3, 4],
-        block_size,
-        sha256,
-        use_lookahead_hashes=True,
-    )
-    computed_blocks, _, _ = manager.get_computed_blocks(request)
-    manager.allocate_slots(request, request.num_tokens, 0, computed_blocks)
-
-    events = manager.take_events()
-
-    assert len(events) == 1
-    assert isinstance(events[0], BlockStored)
-    assert events[0].block_hashes == [
-        kv_cache_utils.maybe_convert_block_hash(block_hash)
-        for block_hash in request.block_hashes
-    ]
-    reconstructed_hashes = []
-    parent_hash = events[0].parent_block_hash
-    assert events[0].extra_keys is not None
-    for block_start, extra_keys in zip(
-        range(0, len(events[0].token_ids), block_size),
-        events[0].extra_keys,
-        strict=True,
-    ):
-        parent_hash = kv_cache_utils.hash_block_tokens(
-            sha256,
-            parent_hash,
-            events[0].token_ids[block_start : block_start + block_size],
-            extra_keys,
-        )
-        reconstructed_hashes.append(parent_hash)
-    assert reconstructed_hashes == request.block_hashes
-
-
 def test_eagle_hybrid_mamba_hits_partial_prompt_boundary():
     hash_block_size = 16
     mamba_block_size = 544
     token_ids = list(range(1249))
-    config = KVCacheConfig(
-        num_blocks=200,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full_attention"],
-                FullAttentionSpec(
-                    block_size=hash_block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["mamba"],
-                MambaSpec(
-                    block_size=mamba_block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
-                    mamba_cache_mode="align",
-                ),
-            ),
-        ],
+    config = _make_hybrid_kv_cache_config(hash_block_size, 200, ["full", "mamba"])
+    config.kv_cache_groups[1].kv_cache_spec = replace(
+        config.kv_cache_groups[1].kv_cache_spec, block_size=mamba_block_size
     )
     manager = make_kv_cache_manager(
         config,
         max_model_len=8192,
         enable_caching=True,
         use_eagle=False,
-        use_lookahead_block_hashes=True,
         hash_block_size=hash_block_size,
     )
 
@@ -4395,60 +4338,11 @@ def test_eagle_hybrid_mamba_hits_partial_prompt_boundary():
     _, num_computed, _ = manager.get_computed_blocks(second)
 
     assert num_computed == 1248
-
-
-def test_lookahead_per_group_hits_stay_within_max_length():
-    """Lookahead groups drop no block, so the per-group lookup must not widen
-    by the EAGLE drop margin."""
-    block_size = 16
-    config = KVCacheConfig(
-        num_blocks=40,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full_attention"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["mamba"],
-                MambaSpec(
-                    block_size=block_size,
-                    shapes=(1, 1),
-                    dtypes=(torch.float32,),
-                    mamba_cache_mode="align",
-                ),
-            ),
-        ],
-    )
-    manager = make_kv_cache_manager(
-        config,
-        max_model_len=8192,
-        enable_caching=True,
-        use_eagle=False,
-        use_lookahead_block_hashes=True,
-        hash_block_size=block_size,
-    )
-    token_ids = list(range(5 * block_size + 1))
-    first = make_request(
-        "first", token_ids, block_size, sha256, use_lookahead_hashes=True
-    )
-    computed_blocks, num_computed, _ = manager.get_computed_blocks(first)
-    manager.allocate_slots(first, len(token_ids), num_computed, computed_blocks)
-    manager.free(first)
-
-    probe = make_request(
-        "probe", token_ids, block_size, sha256, use_lookahead_hashes=True
-    )
+    # A no-drop lookup must not search past the caller's requested boundary.
     _, per_group_hits = manager.coordinator.find_longest_cache_hit_per_group(
-        probe.block_hashes, 2 * block_size
+        second.block_hashes, 2 * hash_block_size
     )
-
-    assert per_group_hits[0] == 2 * block_size
+    assert per_group_hits[0] == 2 * hash_block_size
 
 
 def test_eagle_with_sliding_window():
@@ -5381,30 +5275,10 @@ def test_hybrid_mamba_retention_lookahead_keeps_last_prompt_boundary():
     rather than one alignment unit lower; otherwise a resend can only hit the
     lower state."""
     block_size = 32
-    kv_cache_config = KVCacheConfig(
-        num_blocks=100,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["full"],
-                FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["mamba_mtp"],
-                MambaSpec(
-                    block_size=block_size,
-                    shapes=((1, 1),),
-                    dtypes=(torch.float32,),
-                    mamba_cache_mode="align",
-                    num_speculative_blocks=1,
-                ),
-            ),
-        ],
+    kv_cache_config = _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba"])
+    kv_cache_config.kv_cache_groups[1].is_eagle_group = True
+    kv_cache_config.kv_cache_groups[1].kv_cache_spec = replace(
+        kv_cache_config.kv_cache_groups[1].kv_cache_spec, num_speculative_blocks=1
     )
     manager = make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
@@ -5413,7 +5287,6 @@ def test_hybrid_mamba_retention_lookahead_keeps_last_prompt_boundary():
         hash_block_size=block_size,
         retention_interval=0,
         use_eagle=False,
-        use_lookahead_block_hashes=True,
     )
 
     # 129 tokens: the last boundary below the logits token is 128.
@@ -6446,25 +6319,34 @@ def test_mamba_reachable_block_mask_large_dcp_stays_sparse():
     assert mask_no_dcp == mask_large_dcp, "DCP must not change Mamba retention"
 
 
-def test_swa_shared_prefix_reuse_under_zero_retention():
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_swa_shared_prefix_reuse_under_zero_retention(use_eagle):
     """SWA cross-request analog: a partial shared prefix's sliding-window tail
     must stay reusable under ``prefix_cache_retention_interval=0``. Without
     the pin the junction window is masked out and a later request misses; with
-    it (and under dense) reuse is preserved."""
+    it (and under dense) reuse is preserved. With only the SWA group drafting
+    under EAGLE, the full group reports the junction at the shared prefix, but
+    the SWA hit lands one block below it: the block past the junction is not
+    shared and cannot serve as the EAGLE peek."""
     block_size = 16
 
     def last_req_hit(retention, pin):
+        config = _make_hybrid_kv_cache_config(
+            block_size, 200, ["full", "sliding_window"]
+        )
+        config.kv_cache_groups[1].is_eagle_group = use_eagle
         manager = make_kv_cache_manager(
-            _make_hybrid_kv_cache_config(block_size, 200, ["full", "sliding_window"]),
+            config,
             max_model_len=8192,
             enable_caching=True,
+            use_eagle=use_eagle,
             hash_block_size=block_size,
             retention_interval=retention,
         )
         shared = [7 for _ in range(4 * block_size)]  # 4-block shared prefix
 
         def distinct(v):
-            return [v for _ in range(2 * block_size)]
+            return [v for _ in range(4 * block_size)]
 
         # req0 primes the (dense) full-attention cache; SWA under RET=0 keeps
         # only its own replay window, not the shared-prefix boundary.
@@ -6487,12 +6369,13 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
         _, nc2, _ = manager.get_computed_blocks(req2)
         return nc2
 
+    expected = (3 if use_eagle else 4) * block_size
     # Dense keeps every SWA tail -> reuse works (ceiling).
-    assert last_req_hit(retention=None, pin=False) == 4 * block_size
+    assert last_req_hit(retention=None, pin=False) == expected
     # retention=0 without the pin drops the junction window -> reuse lost (bug).
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
-    assert last_req_hit(retention=0, pin=True) == 4 * block_size
+    assert last_req_hit(retention=0, pin=True) == expected
 
 
 def test_device_eviction_keeps_host_prefix():
@@ -6540,3 +6423,92 @@ def test_get_unhashed_block_ids_all_groups():
     )
 
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 4], []]
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 5])
+@pytest.mark.parametrize("block_size", [4, 8])
+def test_lookahead_block_events_match_cached_dependencies(lookahead, block_size):
+    """KV coverage stays fixed; hash dependencies include overlapping MM tokens."""
+    config = make_kv_cache_config(block_size, num_blocks=20)
+    if block_size != 4:
+        config.kv_cache_groups.append(
+            KVCacheGroupSpec(
+                ["small_blocks"],
+                replace(config.kv_cache_groups[0].kv_cache_spec, block_size=4),
+            )
+        )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=128,
+        hash_block_size=4,
+        enable_kv_cache_events=True,
+        num_hash_lookahead_tokens=lookahead,
+    )
+    tokens = list(range(2 * block_size + lookahead))
+    request = make_request(
+        "events",
+        tokens,
+        4,
+        sha256,
+        mm_positions=[PlaceholderRange(offset=block_size, length=1)],
+        mm_hashes=["image"],
+        use_lookahead_hashes=lookahead,
+    )
+    blocks = manager.allocate_slots(request, len(tokens))
+    assert blocks is not None
+    # Fine-grained aliases may also emit events; compare the full-block report.
+    events = [
+        event
+        for event in manager.take_events()
+        if isinstance(event, BlockStored)
+        and event.group_idx == 0
+        and event.block_size == block_size
+    ]
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, BlockStored)
+    assert event.token_ids == tokens[: 2 * block_size]
+    assert event.block_size == block_size
+    assert event.lookahead_token_ids == (
+        [tokens[end : end + lookahead] for end in (block_size, 2 * block_size)]
+        if lookahead
+        else None
+    )
+    assert event.extra_keys == [
+        (("image", block_size),) if lookahead else None,
+        (("image", 0),),
+    ]
+    assert event.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(request.block_hashes[i])
+        for i in (block_size // 4 - 1, 2 * block_size // 4 - 1)
+    ]
+    # Reused reports describe the same registered blocks without changing them.
+    manager.coordinator.emit_cached_block_events(request, (blocks.blocks[0][:2],))
+    reused = manager.take_events()
+    assert reused == events
+
+
+def test_lookahead_partial_event_promotion():
+    pool = BlockPool(4, True, 4, True, num_hash_lookahead_tokens=2)
+    request = make_request("partial", list(range(6)), 4, sha256, use_lookahead_hashes=2)
+    blocks = pool.get_new_blocks(1)
+    pool.cache_partial_block(request, blocks[0], 4, 0, 8)
+    (partial,) = pool.take_events()
+    assert partial.block_size == 4
+    assert partial.token_ids == [0, 1, 2, 3]
+    assert partial.lookahead_token_ids == [[4, 5]]
+    assert partial.parent_block_hash is None
+    # The physical block has no full-block hash yet; reuse reporting must not index it.
+    pool.emit_cached_block_events(request, 1, 8, 0)
+    assert pool.take_events() == []
+    request.append_output_token_ids([6, 7, 8, 9])
+    pool.cache_full_blocks(request, blocks, 0, 1, 8, 0)
+    removed, full = pool.take_events()
+    assert isinstance(removed, BlockRemoved)
+    assert removed.block_hashes == partial.block_hashes
+    assert full.token_ids == list(range(8))
+    assert full.block_size == 8
+    assert full.lookahead_token_ids == [[8, 9]]
+    assert full.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(request.block_hashes[1])
+    ]

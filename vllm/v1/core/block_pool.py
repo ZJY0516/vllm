@@ -19,13 +19,13 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
-    generate_request_block_hash_extra_keys,
+    generate_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
     resolve_block_hashes,
-    to_request_event_extra_keys,
+    to_event_extra_keys,
 )
 from vllm.v1.request import Request
 
@@ -151,6 +151,7 @@ class BlockPool:
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
         medium: Storage medium reported in KV cache events.
+        num_hash_lookahead_tokens: Tokens after each block covered by its hash.
 
     """
 
@@ -161,15 +162,15 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        use_lookahead_block_hashes: bool = False,
         medium: str = MEDIUM_GPU,
+        num_hash_lookahead_tokens: int = 0,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.medium = medium
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
-        self.use_lookahead_block_hashes = use_lookahead_block_hashes
+        self.num_hash_lookahead_tokens = num_hash_lookahead_tokens
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
@@ -319,6 +320,10 @@ class BlockPool:
             # features, or cache_salt only for the first block).
             # Skip null/masked-out blocks to match the length of new_hashes.
             extra_keys_list: list[tuple[Any, ...] | None] = []
+            num_hash_lookahead_tokens = self.num_hash_lookahead_tokens
+            lookahead_token_ids: list[list[int]] | None = (
+                [] if num_hash_lookahead_tokens else None
+            )
             curr_mm_idx = 0
             for i in range(num_cached_blocks, num_full_blocks):
                 if blocks[i].is_null:
@@ -327,14 +332,16 @@ class BlockPool:
                     continue
                 block_start = i * block_size
                 block_end = block_start + block_size
-                extra_keys, curr_mm_idx = generate_request_block_hash_extra_keys(
-                    request,
-                    block_start,
-                    block_end,
-                    curr_mm_idx,
-                    self.use_lookahead_block_hashes,
+                extra_keys, curr_mm_idx = self._get_block_event_extra_keys(
+                    request, block_start, block_end, curr_mm_idx
                 )
                 extra_keys_list.append(extra_keys)
+                if lookahead_token_ids is not None:
+                    lookahead_token_ids.append(
+                        request.all_token_ids[
+                            block_end : block_end + num_hash_lookahead_tokens
+                        ]
+                    )
 
             self.kv_event_queue.append(
                 self._build_block_stored_event(
@@ -346,8 +353,18 @@ class BlockPool:
                     block_size=block_size,
                     kv_cache_group_id=kv_cache_group_id,
                     extra_keys_list=extra_keys_list,
+                    lookahead_token_ids=lookahead_token_ids,
                 )
             )
+
+    def _get_block_event_extra_keys(
+        self, request: Request, start: int, end: int, start_mm_idx: int
+    ) -> tuple[tuple[Any, ...] | None, int]:
+        end += self.num_hash_lookahead_tokens
+        if self.num_hash_lookahead_tokens and request.mm_features:
+            # Overlapping windows must revisit MM features past the previous end.
+            start_mm_idx, _ = get_mm_features_in_window(request.mm_features, start, end)
+        return generate_block_hash_extra_keys(request, start, end, start_mm_idx)
 
     def _build_block_stored_event(
         self,
@@ -359,6 +376,7 @@ class BlockPool:
         block_size: int,
         kv_cache_group_id: int,
         extra_keys_list: list[tuple[Any, ...] | None],
+        lookahead_token_ids: list[list[int]] | None = None,
     ) -> BlockStored:
         """Build a ``BlockStored`` KV event for ``request``.
 
@@ -374,11 +392,10 @@ class BlockPool:
             lora_id=request.lora_request.adapter_id if request.lora_request else None,
             medium=self.medium,
             lora_name=request.lora_request.name if request.lora_request else None,
-            extra_keys=to_request_event_extra_keys(
-                extra_keys_list, self.use_lookahead_block_hashes
-            ),
+            extra_keys=to_event_extra_keys(extra_keys_list),
             group_idx=kv_cache_group_id,
             session_id=request.session_id,
+            lookahead_token_ids=lookahead_token_ids,
         )
 
     def emit_cached_block_events(
@@ -408,22 +425,29 @@ class BlockPool:
             request.block_hashes, self.hash_block_size, block_size
         )
 
+        num_cached_blocks = min(num_cached_blocks, len(block_hashes))
         # Collect external hashes and extra_keys for cached blocks.
         cached_hashes: list[ExternalBlockHash] = []
         extra_keys_list: list[tuple[Any, ...] | None] = []
+        num_hash_lookahead_tokens = self.num_hash_lookahead_tokens
+        lookahead_token_ids: list[list[int]] | None = (
+            [] if num_hash_lookahead_tokens else None
+        )
         curr_mm_idx = 0
         for i in range(num_cached_blocks):
             block_start = i * block_size
             block_end = block_start + block_size
             cached_hashes.append(maybe_convert_block_hash(block_hashes[i]))
-            extra_keys, curr_mm_idx = generate_request_block_hash_extra_keys(
-                request,
-                block_start,
-                block_end,
-                curr_mm_idx,
-                self.use_lookahead_block_hashes,
+            extra_keys, curr_mm_idx = self._get_block_event_extra_keys(
+                request, block_start, block_end, curr_mm_idx
             )
             extra_keys_list.append(extra_keys)
+            if lookahead_token_ids is not None:
+                lookahead_token_ids.append(
+                    request.all_token_ids[
+                        block_end : block_end + num_hash_lookahead_tokens
+                    ]
+                )
 
         if not cached_hashes:
             return
@@ -455,6 +479,7 @@ class BlockPool:
                 block_size=block_size,
                 kv_cache_group_id=kv_cache_group_id,
                 extra_keys_list=extra_keys_list,
+                lookahead_token_ids=lookahead_token_ids,
             )
         )
 
@@ -499,10 +524,13 @@ class BlockPool:
 
         Returns:
             The hash key with group ID if a partial entry can be registered;
-            otherwise ``None`` for null blocks.
+            otherwise ``None`` for null blocks and lookahead hashes not yet
+            computed.
 
         """
-        if block.is_null:
+        if block.is_null or num_tokens // self.hash_block_size > len(
+            request.block_hashes
+        ):
             return None
 
         assert block_size % self.hash_block_size == 0
@@ -551,13 +579,16 @@ class BlockPool:
                     curr_mm_idx, _ = get_mm_features_in_window(
                         mm_features, block_start, block_end
                     )
-            extra_keys, _ = generate_request_block_hash_extra_keys(
-                request,
-                block_start,
-                block_end,
-                curr_mm_idx,
-                self.use_lookahead_block_hashes,
+            extra_keys, _ = self._get_block_event_extra_keys(
+                request, block_start, block_end, curr_mm_idx
             )
+            lookahead_token_ids = None
+            if self.num_hash_lookahead_tokens:
+                lookahead_token_ids = [
+                    request.all_token_ids[
+                        block_end : block_end + self.num_hash_lookahead_tokens
+                    ]
+                ]
             self.kv_event_queue.append(
                 BlockStored(
                     block_hashes=[maybe_convert_block_hash(block_hash)],
@@ -571,11 +602,10 @@ class BlockPool:
                     lora_name=request.lora_request.name
                     if request.lora_request
                     else None,
-                    extra_keys=to_request_event_extra_keys(
-                        [extra_keys], self.use_lookahead_block_hashes
-                    ),
+                    extra_keys=to_event_extra_keys([extra_keys]),
                     group_idx=kv_cache_group_id,
                     session_id=request.session_id,
+                    lookahead_token_ids=lookahead_token_ids,
                 )
             )
         return block_hash_with_group_id
@@ -777,9 +807,11 @@ class BlockPool:
 
         """
         for block in blocks:
+            if block.is_null:
+                continue
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
-            if block.ref_cnt == 0 and not block.is_null:
+            if block.ref_cnt == 0:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
@@ -803,11 +835,13 @@ class BlockPool:
         blocks_to_evict_first = []
         other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
         for block in ordered_blocks:
+            if block.is_null:  # never pooled; its ref_cnt is not maintained
+                continue
             if block.pool is not None and block.pool is not self:
                 other_pools.setdefault(block.pool, []).append(block)
                 continue
             block.ref_cnt -= 1
-            if block.ref_cnt == 0 and not block.is_null:
+            if block.ref_cnt == 0:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)

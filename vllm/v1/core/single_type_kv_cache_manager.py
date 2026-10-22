@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashWithGroupId,
     KVCacheBlock,
     resolve_block_hashes,
+    trim_null_head,
 )
 from vllm.v1.hisparse.block_pool import SharedEventQueueBlockPool
 from vllm.v1.kv_cache_interface import (
@@ -498,12 +499,8 @@ class SingleTypeKVCacheManager(ABC):
         if not self.kv_cache_spec.prefix_cacheable:
             return
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
-        resolved_block_hashes = resolve_block_hashes(
-            request.block_hashes,
-            self.block_pool.hash_block_size,
-            self.block_size,
-        )
-        num_full_blocks = min(num_tokens // self.block_size, len(resolved_block_hashes))
+        num_hashed_tokens = len(request.block_hashes) * self.block_pool.hash_block_size
+        num_full_blocks = min(num_tokens, num_hashed_tokens) // self.block_size
 
         if num_cached_blocks >= num_full_blocks:
             return
@@ -514,6 +511,13 @@ class SingleTypeKVCacheManager(ABC):
         reachable_boundaries = [*replay_boundaries]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
+            if self.use_eagle:
+                # A sibling that diverges right after the junction cannot use
+                # the block past it as the EAGLE peek, so its hit lands one
+                # block lower.
+                reachable_boundaries.append(
+                    request.shared_prefix_boundary - self.block_size
+                )
 
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
@@ -574,14 +578,15 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
 
         Returns:
-            The request's blocks in allocation order.
+            The request's blocks in allocation order, without the leading
+            null blocks (e.g. a sliding-window table's skipped prefix).
 
         """
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
-        return req_blocks
+        return trim_null_head(req_blocks)
 
     def free(self, request_id: str) -> None:
         """Free the blocks for the request.
@@ -2098,6 +2103,8 @@ class MambaManager(SingleTypeKVCacheManager):
         source_block = blocks[block_idx]
         if source_block.is_null:
             return None
+        if source_block.block_hash_num_tokens == num_tokens:
+            return None
 
         partial_hash = self.block_pool.cache_partial_block(
             request=request,
@@ -2543,7 +2550,7 @@ class HiSparseResidentManager(_HiSparseAuxiliaryManager):
         blocks = self.get_residency_row(request_id)
         self.residency_changes.pop(request_id, None)
         super().pop_blocks_for_free(request_id)
-        return blocks
+        return trim_null_head(blocks)
 
     def adopt_resident_page(
         self, request_id: str, block_idx: int, block: KVCacheBlock
