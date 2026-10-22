@@ -3622,6 +3622,11 @@ def test_eagle_block_drop_can_be_disabled_without_disabling_eagle(
         pytest.param({"kv_connector": True}, False, id="kv-connector"),
         pytest.param({"kv_events": True}, False, id="kv-events-enabled"),
         pytest.param({"kv_events": False}, True, id="kv-events-disabled"),
+        pytest.param(
+            {"kv_events": True, "event_lookahead": True},
+            True,
+            id="kv-events-lookahead",
+        ),
         pytest.param({"hisparse": True}, False, id="hisparse"),
     ],
 )
@@ -3648,7 +3653,10 @@ def test_use_lookahead_block_hashes(overrides: dict, expected: bool):
         else None
     )
     vllm_config.kv_events_config = (
-        KVEventsConfig(enable_kv_cache_events=overrides["kv_events"])
+        KVEventsConfig(
+            enable_kv_cache_events=overrides["kv_events"],
+            enable_lookahead_block_hashes=overrides.get("event_lookahead", False),
+        )
         if "kv_events" in overrides
         else None
     )

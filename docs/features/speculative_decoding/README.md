@@ -108,19 +108,6 @@ only apply to model-based methods such as `draft_model`, `mtp`, `eagle3`, and
     Gemma 4 MTP support instead of forcing the assistant checkpoint through
     generic draft-model speculative decoding.
 
-### Prefix caching
-
-With prefix caching enabled, EAGLE-like methods use hashes that also cover the
-prefill lookahead tokens after each block. This lets matching requests reuse the
-trailing block without the legacy EAGLE block drop. A block becomes hashable only
-after its lookahead tokens are available.
-
-Lookahead hashing is currently disabled when using KV connectors, KV cache events,
-or HiSparse. Set `"disable_lookahead_block_hashes": true` in
-`--speculative-config` to select the legacy behavior explicitly. Synchronous
-scheduling can still miss caching a final block whose hash becomes available only
-with the last output; output-time cache registration is unchanged.
-
 ### Method-specific keys
 
 #### N-gram

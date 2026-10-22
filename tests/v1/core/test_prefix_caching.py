@@ -92,7 +92,7 @@ def make_request(
     prompt_logprobs: int | None = None,
     cache_salt: str | None = None,
     lora_request: LoRARequest | None = None,
-    use_lookahead_hashes: bool = False,
+    use_lookahead_hashes: int = 0,
     session_id: str | None = None,
 ):
     mm_features = []
@@ -6368,3 +6368,92 @@ def test_get_unhashed_block_ids_all_groups():
     )
 
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 4], []]
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 5])
+@pytest.mark.parametrize("block_size", [4, 8])
+def test_lookahead_block_events_match_cached_dependencies(lookahead, block_size):
+    """KV coverage stays fixed; hash dependencies include overlapping MM tokens."""
+    config = make_kv_cache_config(block_size, num_blocks=20)
+    if block_size != 4:
+        config.kv_cache_groups.append(
+            KVCacheGroupSpec(
+                ["small_blocks"],
+                replace(config.kv_cache_groups[0].kv_cache_spec, block_size=4),
+            )
+        )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=128,
+        hash_block_size=4,
+        enable_kv_cache_events=True,
+        num_hash_lookahead_tokens=lookahead,
+    )
+    tokens = list(range(2 * block_size + lookahead))
+    request = make_request(
+        "events",
+        tokens,
+        4,
+        sha256,
+        mm_positions=[PlaceholderRange(offset=block_size, length=1)],
+        mm_hashes=["image"],
+        use_lookahead_hashes=lookahead,
+    )
+    blocks = manager.allocate_slots(request, len(tokens))
+    assert blocks is not None
+    # Fine-grained aliases may also emit events; compare the full-block report.
+    events = [
+        event
+        for event in manager.take_events()
+        if isinstance(event, BlockStored)
+        and event.group_idx == 0
+        and event.block_size == block_size
+    ]
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, BlockStored)
+    assert event.token_ids == tokens[: 2 * block_size]
+    assert event.block_size == block_size
+    assert event.lookahead_token_ids == (
+        [tokens[end : end + lookahead] for end in (block_size, 2 * block_size)]
+        if lookahead
+        else None
+    )
+    assert event.extra_keys == [
+        (("image", block_size),) if lookahead else None,
+        (("image", 0),),
+    ]
+    assert event.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(request.block_hashes[i])
+        for i in (block_size // 4 - 1, 2 * block_size // 4 - 1)
+    ]
+    # Reused reports describe the same registered blocks without changing them.
+    manager.coordinator.emit_cached_block_events(request, (blocks.blocks[0][:2],))
+    reused = manager.take_events()
+    assert reused == events
+
+
+def test_lookahead_partial_event_promotion():
+    pool = BlockPool(4, True, 4, True, num_hash_lookahead_tokens=2)
+    request = make_request("partial", list(range(6)), 4, sha256, use_lookahead_hashes=2)
+    blocks = pool.get_new_blocks(1)
+    pool.cache_partial_block(request, blocks[0], 4, 0, 8)
+    (partial,) = pool.take_events()
+    assert partial.block_size == 4
+    assert partial.token_ids == [0, 1, 2, 3]
+    assert partial.lookahead_token_ids == [[4, 5]]
+    assert partial.parent_block_hash is None
+    # The physical block has no full-block hash yet; reuse reporting must not index it.
+    pool.emit_cached_block_events(request, 1, 8, 0)
+    assert pool.take_events() == []
+    request.append_output_token_ids([6, 7, 8, 9])
+    pool.cache_full_blocks(request, blocks, 0, 1, 8, 0)
+    removed, full = pool.take_events()
+    assert isinstance(removed, BlockRemoved)
+    assert removed.block_hashes == partial.block_hashes
+    assert full.token_ids == list(range(8))
+    assert full.block_size == 8
+    assert full.lookahead_token_ids == [[8, 9]]
+    assert full.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(request.block_hashes[1])
+    ]

@@ -3,9 +3,12 @@
 
 import pytest
 
+from tests.distributed.conftest import MockSubscriber
 from tests.utils import single_gpu_only
 from vllm import SamplingParams
+from vllm.distributed.kv_events import BlockStored, KVEventBatch
 from vllm.platforms import current_platform
+from vllm.utils.network_utils import get_open_port
 
 from ...utils import (
     assert_request_outputs_match,
@@ -147,3 +150,54 @@ def test_mtp_draft_lm_head_quantization_survives_sleep_and_reload(
             context="after weight reload",
         )
         assert al == pytest.approx(ref_al, rel=0.03)
+
+
+@single_gpu_only
+def test_mtp_lookahead_kv_events(vllm_runner):
+    """The public LLM path publishes dependencies separately from cached KV."""
+    endpoint = f"tcp://127.0.0.1:{get_open_port()}"
+    subscriber = MockSubscriber(endpoint, topic="", decode_type=KVEventBatch)
+    tokens = list(range(1025))
+    try:
+        with vllm_runner(
+            "Qwen/Qwen3.5-0.8B-Base",
+            block_size=None,
+            max_model_len=2048,
+            max_num_batched_tokens=2048,
+            enable_prefix_caching=True,
+            prefix_cache_retention_interval=None,
+            limit_mm_per_prompt={"image": 0, "video": 0},
+            speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+            kv_events_config={
+                "enable_kv_cache_events": True,
+                "enable_lookahead_block_hashes": True,
+                "endpoint": endpoint,
+            },
+        ) as runner:
+            runner.llm.generate(
+                {"prompt_token_ids": tokens},
+                SamplingParams(temperature=0, max_tokens=1),
+            )
+            events: list[BlockStored] = []
+            while (message := subscriber.receive_one(timeout=1000)) is not None:
+                events.extend(
+                    e for e in message[1].events if isinstance(e, BlockStored)
+                )
+            assert events
+            for event in events:
+                start = event.token_ids[0]
+                assert event.token_ids == tokens[start : start + len(event.token_ids)]
+                assert (
+                    len(event.token_ids) == len(event.block_hashes) * event.block_size
+                )
+                assert event.lookahead_token_ids == [
+                    tokens[end : end + 1]
+                    for end in range(
+                        start + event.block_size,
+                        start + len(event.token_ids) + 1,
+                        event.block_size,
+                    )
+                ]
+                assert all(len(ids) == 1 for ids in event.lookahead_token_ids)
+    finally:
+        subscriber.close()

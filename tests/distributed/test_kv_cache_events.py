@@ -6,7 +6,7 @@ from typing import Any
 import msgspec
 import pytest
 
-from vllm.distributed.kv_events import BlockRemoved, BlockStored
+from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVEventAggregator
 
 # Minimal ExternalBlockHash for testing (bytes are a valid ExternalBlockHash).
 _FAKE_HASH: bytes = b"\xab" * 32
@@ -190,15 +190,15 @@ def test_block_stored_locality_is_wire_compatible():
         kv_cache_spec_sliding_window=128,
     )
     legacy_payload = msgspec.msgpack.encode(legacy)
-    assert (
+    # Optional fields can change MessagePack's map header size, not its contents.
+    assert msgspec.msgpack.decode(
         msgspec.msgpack.encode(
             _make_block_stored(
                 group_idx=2,
                 kv_cache_spec_sliding_window=128,
             )
         )
-        == legacy_payload
-    )
+    ) == msgspec.msgpack.decode(legacy_payload)
     assert msgspec.msgpack.decode(legacy_payload, type=BlockStored).locality is None
     new_payload = msgspec.msgpack.encode(_make_block_stored(locality="LOCAL"))
     assert msgspec.msgpack.decode(new_payload)["locality"] == "LOCAL"
@@ -229,7 +229,7 @@ def test_block_stored_session_id_is_wire_compatible():
         locality="LOCAL",
     )
     pre_session_payload = msgspec.msgpack.encode(pre_session)
-    assert (
+    assert msgspec.msgpack.decode(
         msgspec.msgpack.encode(
             _make_block_stored(
                 group_idx=2,
@@ -237,8 +237,7 @@ def test_block_stored_session_id_is_wire_compatible():
                 locality="LOCAL",
             )
         )
-        == pre_session_payload
-    )
+    ) == msgspec.msgpack.decode(pre_session_payload)
     assert (
         msgspec.msgpack.decode(pre_session_payload, type=BlockStored).session_id is None
     )
@@ -248,3 +247,24 @@ def test_block_stored_session_id_is_wire_compatible():
     assert (
         msgspec.msgpack.decode(new_payload, type=_PreSessionBlockStored).medium == "GPU"
     )
+
+
+def test_block_stored_lookahead_wire_compatibility():
+    legacy = _make_block_stored()
+    payload = msgspec.msgpack.encode(legacy)
+    assert "lookahead_token_ids" not in msgspec.msgpack.decode(payload)
+    assert msgspec.msgpack.decode(payload, type=BlockStored).lookahead_token_ids is None
+    event = msgspec.structs.replace(legacy, lookahead_token_ids=[[5, 6]])
+    payload = msgspec.msgpack.encode(event)
+    assert msgspec.msgpack.decode(payload, type=BlockStored) == event
+    # Old consumers can decode the schema, but must opt in to its semantics.
+    assert msgspec.msgpack.decode(payload, type=_LegacyBlockStored).token_ids == [
+        1,
+        2,
+        3,
+        4,
+    ]
+    aggregator = KVEventAggregator(2)
+    aggregator.add_events([event, legacy])
+    aggregator.add_events([msgspec.msgpack.decode(payload, type=BlockStored)])
+    assert aggregator.get_common_events() == [event]

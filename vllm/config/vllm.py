@@ -687,10 +687,11 @@ class VllmConfig:
         # KV connectors keep the legacy hashes.
         if self.kv_transfer_config is not None:
             return False
-        # KV events retain their existing hash format.
+        # Keep legacy hashes unless event consumers support lookahead dependencies.
         if (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
+            and not self.kv_events_config.enable_lookahead_block_hashes
         ):
             return False
         return self.cache_config.enable_prefix_caching
