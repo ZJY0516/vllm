@@ -2103,6 +2103,8 @@ class MambaManager(SingleTypeKVCacheManager):
         source_block = blocks[block_idx]
         if source_block.is_null:
             return None
+        if source_block.block_hash_num_tokens == num_tokens:
+            return None
 
         partial_hash = self.block_pool.cache_partial_block(
             request=request,

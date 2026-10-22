@@ -2582,6 +2582,61 @@ def test_prefill_hybrid_model_mamba_align():
     manager.free(req0)
 
 
+@pytest.mark.parametrize("lookahead", [False, True])
+def test_mamba_ready_prefix_allows_same_step_siblings(lookahead: bool):
+    """Re-registering a ready Mamba hit must not defer the next sibling."""
+    block_size = 16
+    config = _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba", "full"])
+    config.kv_cache_groups[2].is_eagle_group = True
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=256,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=not lookahead,
+        num_prefill_lookahead=1,
+        num_hash_lookahead_tokens=int(lookahead),
+    )
+    tokens = list(range(55))
+    producer = make_request(
+        "producer", tokens, block_size, sha256, use_lookahead_hashes=lookahead
+    )
+    for end in (16, 32, 48, 55):
+        manager.new_step_starts()
+        assert (
+            manager.allocate_slots(producer, end - producer.num_computed_tokens)
+            is not None
+        )
+        if lookahead and end == 48:
+            pending = make_request(
+                "pending", tokens, block_size, sha256, use_lookahead_hashes=True
+            )
+            blocks, num_computed, _ = manager.get_computed_blocks(pending)
+            assert num_computed == end
+            assert (
+                manager.allocate_slots(
+                    pending, len(tokens) - num_computed, num_computed, blocks
+                )
+                is None
+            )
+        producer.num_computed_tokens = end
+    manager.free(producer)
+    manager.new_step_starts()
+
+    for name in ("first", "second"):
+        request = make_request(
+            name, tokens, block_size, sha256, use_lookahead_hashes=lookahead
+        )
+        blocks, num_computed, _ = manager.get_computed_blocks(request)
+        assert num_computed == (48 if lookahead else 32)
+        assert (
+            manager.allocate_slots(
+                request, len(tokens) - num_computed, num_computed, blocks
+            )
+            is not None
+        )
+
+
 def test_hybrid_cache_mamba_align_shared_prefix_detection():
     """Test shared prefix detection heuristic for mamba align cache mode
 
