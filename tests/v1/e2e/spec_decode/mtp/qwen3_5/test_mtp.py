@@ -170,7 +170,6 @@ def test_mtp_lookahead_kv_events(vllm_runner):
             speculative_config={"method": "mtp", "num_speculative_tokens": 1},
             kv_events_config={
                 "enable_kv_cache_events": True,
-                "enable_lookahead_block_hashes": True,
                 "endpoint": endpoint,
             },
         ) as runner:

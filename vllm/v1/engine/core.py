@@ -220,13 +220,8 @@ class EngineCore:
             )
             init_none_hash(caching_hash_fn)
 
-            num_hash_lookahead_tokens = (
-                vllm_config.num_prefill_lookahead_tokens
-                if vllm_config.use_lookahead_block_hashes
-                else 0
-            )
             self.request_block_hasher = get_request_block_hasher(
-                hash_block_size, caching_hash_fn, num_hash_lookahead_tokens
+                hash_block_size, caching_hash_fn, vllm_config.num_hash_lookahead_tokens
             )
 
         self.step_fn = (

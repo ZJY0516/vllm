@@ -3609,28 +3609,31 @@ def test_eagle_block_drop_can_be_disabled_without_disabling_eagle(
     ("overrides", "expected"),
     [
         *(
-            pytest.param({"method": method}, True, id=method)
-            for method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+            pytest.param({"method": method}, 1, id=method)
+            for method in ("eagle", "eagle3", "mtp")
         ),
-        pytest.param({"method": "ngram"}, False, id="not-eagle"),
-        pytest.param({"no_speculative": True}, False, id="no-speculative"),
-        pytest.param({"disable_eagle_block_drop": True}, False, id="no-block-drop"),
-        pytest.param({"enable_prefix_caching": False}, False, id="no-prefix-caching"),
+        pytest.param({"method": "dflash"}, 0, id="dflash"),
+        pytest.param({"method": "dspark"}, 0, id="dspark"),
+        pytest.param({"mtp_layers": 3}, 2, id="multi-module-mtp"),
+        pytest.param({"method": "ngram"}, 0, id="not-eagle"),
+        pytest.param({"no_speculative": True}, 0, id="no-speculative"),
+        pytest.param({"disable_eagle_block_drop": True}, 0, id="no-block-drop"),
+        pytest.param({"enable_prefix_caching": False}, 0, id="no-prefix-caching"),
         pytest.param(
-            {"disable_lookahead_block_hashes": True}, False, id="disabled-by-config"
+            {"disable_lookahead_block_hashes": True}, 0, id="disabled-by-config"
         ),
-        pytest.param({"kv_connector": True}, False, id="kv-connector"),
-        pytest.param({"kv_events": True}, False, id="kv-events-enabled"),
-        pytest.param({"kv_events": False}, True, id="kv-events-disabled"),
+        pytest.param({"kv_connector": True}, 0, id="kv-connector"),
+        pytest.param({"kv_events": True}, 1, id="kv-events-enabled"),
+        pytest.param({"kv_events": False}, 1, id="kv-events-disabled"),
         pytest.param(
-            {"kv_events": True, "event_lookahead": True},
-            True,
-            id="kv-events-lookahead",
+            {"kv_events": True, "disable_lookahead_block_hashes": True},
+            0,
+            id="kv-events-lookahead-disabled",
         ),
-        pytest.param({"hisparse": True}, False, id="hisparse"),
+        pytest.param({"hisparse": True}, 0, id="hisparse"),
     ],
 )
-def test_use_lookahead_block_hashes(overrides: dict, expected: bool):
+def test_num_hash_lookahead_tokens(tmp_path, overrides: dict, expected: int):
     speculative_config = SpeculativeConfig(
         method="ngram",
         num_speculative_tokens=2,
@@ -3640,7 +3643,20 @@ def test_use_lookahead_block_hashes(overrides: dict, expected: bool):
         disable_eagle_block_drop=overrides.get("disable_eagle_block_drop", False),
     )
     speculative_config.method = overrides.get("method", "mtp")
-    vllm_config = object.__new__(VllmConfig)
+    if "mtp_layers" in overrides:
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["OPTForCausalLM"],
+                    "model_type": "opt",
+                    "num_nextn_predict_layers": overrides["mtp_layers"],
+                }
+            )
+        )
+        speculative_config.draft_model_config = ModelConfig(
+            str(tmp_path), skip_tokenizer_init=True
+        )
+    vllm_config = VllmConfig(device_config=DeviceConfig("cpu"))
     vllm_config.cache_config = CacheConfig(
         enable_prefix_caching=overrides.get("enable_prefix_caching", True)
     )
@@ -3653,10 +3669,7 @@ def test_use_lookahead_block_hashes(overrides: dict, expected: bool):
         else None
     )
     vllm_config.kv_events_config = (
-        KVEventsConfig(
-            enable_kv_cache_events=overrides["kv_events"],
-            enable_lookahead_block_hashes=overrides.get("event_lookahead", False),
-        )
+        KVEventsConfig(enable_kv_cache_events=overrides["kv_events"])
         if "kv_events" in overrides
         else None
     )
@@ -3664,7 +3677,9 @@ def test_use_lookahead_block_hashes(overrides: dict, expected: bool):
         hisparse_config=HiSparseConfig() if overrides.get("hisparse") else None
     )
 
-    assert vllm_config.use_lookahead_block_hashes == expected
+    assert vllm_config.num_hash_lookahead_tokens == expected
+    if speculative_config.method in ("dflash", "dspark"):
+        assert vllm_config.num_prefill_lookahead_tokens == 1
 
 
 def test_draft_sample_method_gumbel_is_rejected():

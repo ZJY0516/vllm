@@ -13,7 +13,7 @@ from tests.v1.attention.utils import (
     create_common_attn_metadata,
     create_vllm_config,
 )
-from vllm.config import SpeculativeConfig, VllmConfig
+from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
@@ -377,7 +377,6 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary(
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
-    monkeypatch: pytest.MonkeyPatch,
     seq_len: int,
     disable_eagle_block_drop: bool,
     lookahead_hashing: bool,
@@ -385,11 +384,6 @@ def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
     expected_offset: int | None,
 ) -> None:
     """Lookahead hashes need no back-off from the replay boundary."""
-    monkeypatch.setattr(
-        VllmConfig,
-        "use_lookahead_block_hashes",
-        property(lambda _: lookahead_hashing),
-    )
     device = torch.device("cuda")
     batch = BatchSpec(seq_lens=[seq_len], query_lens=[seq_len])
     common_attn_metadata = create_common_attn_metadata(
@@ -412,6 +406,9 @@ def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
         device=device,
     )
     assert isinstance(builder, KimiK3KDAMetadataBuilder)
+    speculative_config = builder.vllm_config.speculative_config
+    assert speculative_config is not None
+    speculative_config.disable_lookahead_block_hashes = not lookahead_hashing
     builder.mamba_aligned_state_indices = mamba_get_block_table_tensor(
         common_attn_metadata.block_table_tensor,
         common_attn_metadata.seq_lens,

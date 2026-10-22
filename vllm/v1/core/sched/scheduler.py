@@ -321,13 +321,10 @@ class Scheduler(SchedulerInterface):
                     "acceptance rates."
                 )
 
-        self.use_lookahead_block_hashes = vllm_config.use_lookahead_block_hashes
-        if self.use_lookahead_block_hashes:
+        self.num_hash_lookahead_tokens = vllm_config.num_hash_lookahead_tokens
+        if self.num_hash_lookahead_tokens > 0:
             # Lookahead hashes prove the boundary token, so EAGLE needs no drop.
             self.use_eagle_block_drop = False
-        self.num_hash_lookahead_tokens = (
-            self.num_prefill_lookahead if self.use_lookahead_block_hashes else 0
-        )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -2593,6 +2590,8 @@ class Scheduler(SchedulerInterface):
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
+        status_before_update = request.status
+        num_new_tokens = len(new_token_ids)
         # Append generated tokens and check for stop. Note that if
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
@@ -2610,6 +2609,21 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens -= len(new_token_ids) - num_new
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
+
+        if is_stale:
+            return new_token_ids, stopped
+
+        has_output_placeholders = request.num_output_placeholders > 0
+        if has_output_placeholders:
+            # Resolve all returned tokens, including those trimmed at a stop.
+            request.num_output_placeholders -= num_new_tokens
+
+        if status_before_update == RequestStatus.RUNNING and (
+            has_output_placeholders or self.num_spec_tokens > 0
+        ):
+            self.kv_cache_manager.cache_blocks(
+                request, request.num_computed_tokens - request.num_in_flight_tokens
+            )
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:

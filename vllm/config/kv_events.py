@@ -16,11 +16,6 @@ class KVEventsConfig:
     Events can be published externally by zmq using the event publisher config.
     """
 
-    enable_lookahead_block_hashes: bool = False
-    """Allow lookahead hashes with KV events. Enable only when consumers support
-    ``BlockStored.lookahead_token_ids`` and its expanded ``extra_keys`` window.
-    """
-
     publisher: Literal["null", "zmq"] = None  # type: ignore[assignment]
     """The publisher to use for publishing kv events. Can be "null", "zmq".
     """
