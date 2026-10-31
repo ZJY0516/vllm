@@ -394,7 +394,6 @@ def sparse_attn_indexer(
     candidate_block_size: int = 0,
     candidate_write: bool = False,
     topk_backend: str = "auto",
-    shardq_layer_name: str = "",
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -550,12 +549,6 @@ def sparse_attn_indexer(
                 # unnecessary work.
                 return topk_indices_buffer
 
-    # The main MLA layer decides per step whether ShardQ applies (not under
-    # dense MHA); the builder already narrowed the chunks to this rank's rows.
-    mla_shardq = None
-    if shardq_layer_name:
-        mla_shardq = getattr(attn_metadata.get(shardq_layer_name), "shardq", None)
-
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
     # top-k kernels scatter valid indices into it. On the fused deepseek_v32
     # nvidia path, _fused_norm_rope_kernel already cleared the same
@@ -597,12 +590,13 @@ def sparse_attn_indexer(
             scales_spec,
             *gather_specs,
         )
-        if mla_shardq is not None:
+        # Under ShardQ the chunks number this rank's rows compactly.
+        prefill_q, prefill_q_scale, prefill_weights = q_quant, q_scale, weights
+        if (indices := prefill_metadata.shardq_gather_indices) is not None:
             assert candidate_blocks is None
-            assert (
-                prefill_metadata.shardq_num_decode_tokens
-                == mla_shardq.num_decode_tokens
-            )
+            prefill_q, prefill_weights = q_quant[indices], weights[indices]
+            if q_scale is not None:
+                prefill_q_scale = q_scale[indices]
         for chunk in prefill_metadata.chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
@@ -617,6 +611,8 @@ def sparse_attn_indexer(
                     chunk.block_table,
                     chunk.local_cu_seq_lens,
                 )
+
+            row_start, row_end = chunk.token_start, chunk.token_end
 
             # PCP + DCP KV all-gather.
             deinterleave_idx = chunk.pcp_deinterleave_idx
@@ -635,21 +631,13 @@ def sparse_attn_indexer(
                     out_scales,
                 )
 
-            q_rows: slice | torch.Tensor = slice(chunk.token_start, chunk.token_end)
-            topk_rows = q_rows
-            if mla_shardq is not None:
-                # KV gathers above stay unconditional for continuation chunks
-                # that reuse the workspace. The top-k is written compactly, in
-                # token order, for the token-sharded attention.
-                assert chunk.shardq is not None
-                q_rows = chunk.shardq.q_rows
-                topk_rows = chunk.shardq.topk_rows
-                cu_seqlen_ks = chunk.shardq.cu_seqlen_ks
-                cu_seqlen_ke = chunk.shardq.cu_seqlen_ke
-            q_slice = q_quant[q_rows]
-            q_scale_slice = q_scale[q_rows] if q_scale is not None else None
-            chunk_weights = weights[q_rows]
-            topk_indices = topk_indices_buffer[topk_rows, :topk_tokens]
+            q_slice = prefill_q[row_start:row_end]
+            q_scale_slice = (
+                prefill_q_scale[row_start:row_end]
+                if prefill_q_scale is not None
+                else None
+            )
+            topk_indices = topk_indices_buffer[row_start:row_end, :topk_tokens]
 
             # DeepGEMM returns compressed logits: row i starts at K position
             # cu_seqlen_ks[i]. None means every row starts at column zero.
@@ -678,7 +666,7 @@ def sparse_attn_indexer(
                         q_slice_cast,
                         k_quant_cast,
                         k_scale_cast,
-                        chunk_weights,
+                        prefill_weights[row_start:row_end],
                         cu_seqlen_ks,
                         cu_seqlen_ke,
                     )
@@ -686,7 +674,7 @@ def sparse_attn_indexer(
                     row_ends = cu_seqlen_ke
                 else:
                     q_scale_slice, chunk_weights = mqa_logits_mx_inputs(
-                        q_slice_cast, q_scale_slice, chunk_weights
+                        q_slice_cast, q_scale_slice, prefill_weights[row_start:row_end]
                     )
                     row_ends = cu_seqlen_ke - cu_seqlen_ks
                     logits = fp8_fp4_mqa_logits(
@@ -960,7 +948,6 @@ def sparse_attn_indexer_fake(
     candidate_block_size: int = 0,
     candidate_write: bool = False,
     topk_backend: str = "auto",
-    shardq_layer_name: str = "",
 ) -> torch.Tensor:
     return topk_indices_buffer
 

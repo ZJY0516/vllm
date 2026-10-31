@@ -38,7 +38,7 @@ from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
 )
-from vllm.v1.attention.ops.shardq import reserve_shardq_buffers
+from vllm.v1.attention.ops.shardq import shard_q, unshard_out
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
 if TYPE_CHECKING:
@@ -237,9 +237,9 @@ class DeepseekV32Attention(MLAAttention):
         )
         # MTP draft steps reuse top-k rows by token slot, which ShardQ's
         # compact per-rank rows would break.
-        self.use_shardq = not is_mtp_layer and getattr(self.impl, "use_shardq", False)
-        if self.use_shardq and indexer is not None:
-            indexer.k_cache.shardq_layer_name = self.layer_name
+        self.set_use_shardq(
+            not is_mtp_layer, indexer.k_cache if indexer is not None else None
+        )
 
         fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
         self._fp8_query = fp8_attention and self.impl.supports_quant_query_input
@@ -522,7 +522,6 @@ class DeepseekV32Attention(MLAAttention):
                 ),
                 skip_topk_buffer_clear=True,
                 topk_backend=self.indexer.indexer_op.topk_backend,
-                shardq_layer_name=self.indexer.k_cache.shardq_layer_name,
             )
         self.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
 
@@ -530,18 +529,6 @@ class DeepseekV32Attention(MLAAttention):
             self.layer_name
         )
         if attn_metadata is None:
-            if self.use_shardq:
-                scheduler_config = self._vllm_config.scheduler_config
-                reserve_shardq_buffers(
-                    scheduler_config.max_num_batched_tokens,
-                    scheduler_config.max_num_seqs,
-                    self.num_local_heads,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                    self.kv_lora_rank,
-                    current_platform.fp8_dtype() if self._fp8_query else output.dtype,
-                    output.dtype,
-                    output.device,
-                )
             output.zero_()
             return
         attn_metadata = cast("MLACommonMetadata", attn_metadata)
@@ -603,6 +590,8 @@ class DeepseekV32Attention(MLAAttention):
         else:
             mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
 
+        shardq = getattr(attn_metadata, "shardq", None)
+        mqa_metadata = attn_metadata
         if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
             if isinstance(mqa_q_arg, tuple):
                 mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
@@ -613,15 +602,20 @@ class DeepseekV32Attention(MLAAttention):
                 mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
             assert self.dcp_manager.query_gather is not None
             mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
-        if self.use_shardq and getattr(attn_metadata, "shardq", None) is not None:
-            attn_out = self.impl.forward_mqa_shardq(  # type: ignore[attr-defined]
-                mqa_q_arg, kv_cache, attn_metadata, self
-            )
-            lse = None
-        else:
-            attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
-                mqa_q_arg, kv_cache, attn_metadata, self
-            )
+        if shardq is not None:
+            decode_q, mqa_q_arg = shard_q(mqa_q_arg, shardq)
+            decode_out = None
+            if decode_q.shape[0]:
+                # Decode rows attend head-sharded.
+                decode_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                    decode_q, kv_cache, attn_metadata, self
+                )
+            mqa_metadata = shardq.attn_metadata
+        attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+            mqa_q_arg, kv_cache, mqa_metadata, self
+        )
+        if shardq is not None:
+            attn_out = unshard_out(attn_out, shardq, decode_out)
 
         if self.impl.dcp_world_size > 1:
             assert lse is not None and self.dcp_manager is not None
