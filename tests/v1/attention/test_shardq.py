@@ -20,21 +20,21 @@ from vllm.distributed.parallel_state import (
 from vllm.utils.network_utils import get_open_port
 from vllm.v1.attention.ops import shardq
 from vllm.v1.attention.ops.shardq import (
+    ShardQMetadata,
     allocate_shardq_buffers,
-    build_shardq_split,
-    fold_split,
-    indexer_rows,
-    make_shardq_split,
     shard_q,
+    shardq_shard,
     unshard_out,
+    zigzag_split,
 )
 
 
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize("lens", [[4096], [65, 300, 7000], [1000, 64, 64, 129]])
-def test_fold_split_partitions_tokens(world, lens):
+def test_zigzag_split_partitions_tokens(world, lens):
     qsl = np.r_[0, np.cumsum(lens)]
-    per_rank = fold_split(qsl, world)
+    token_ids, counts = zigzag_split(np.array(lens), world)
+    per_rank = np.split(token_ids, np.cumsum(counts)[:-1])
     merged = np.sort(np.concatenate(per_rank))
     np.testing.assert_array_equal(merged, np.arange(qsl[-1]))
     for idx in per_rank:
@@ -50,7 +50,7 @@ def test_fold_split_partitions_tokens(world, lens):
 
 
 @pytest.mark.parametrize("num_spec", [0, 2])
-def test_build_split_after_indexer_decodes(monkeypatch, num_spec):
+def test_shardq_shard_after_indexer_decodes(monkeypatch, num_spec):
     """The MLA and indexer builders derive the same split from the batch:
     requests of at most 1 + num_spec tokens stay head-sharded, and the tokens
     after them are split once they reach sparse_mla_shard_q_min_tokens and a
@@ -73,16 +73,16 @@ def test_build_split_after_indexer_decodes(monkeypatch, num_spec):
         attention_config=attention_config,
         model_config=SimpleNamespace(hf_text_config=hf_config),
     )
-    split = build_shardq_split(metadata, vllm_config, torch.device("cpu"))
-    assert split is not None
-    assert split.num_decode_tokens == 3 * (1 + num_spec)
-    assert sum(split.counts) == 9100
+    tokens = shardq_shard(metadata, vllm_config)
+    assert tokens is not None
+    assert tokens.num_decode_tokens == 3 * (1 + num_spec)
+    assert tokens.counts.sum() == 9100
     hf_config.index_topk = 5300
-    assert build_shardq_split(metadata, vllm_config, torch.device("cpu")) is None
+    assert shardq_shard(metadata, vllm_config) is None
     hf_config.index_topk = 5299
     attention_config.sparse_mla_shard_q_min_tokens = 9101
-    assert build_shardq_split(metadata, vllm_config, torch.device("cpu")) is None
-    # Five tokens fold into eight pieces, three of them empty, leaving rank 2
+    assert shardq_shard(metadata, vllm_config) is None
+    # Five tokens split into eight chunks, three of them empty, leaving rank 2
     # without tokens.
     attention_config.sparse_mla_shard_q_min_tokens = 1
     short = create_common_attn_metadata(
@@ -90,37 +90,7 @@ def test_build_split_after_indexer_decodes(monkeypatch, num_spec):
         block_size=16,
         device=torch.device("cpu"),
     )
-    assert build_shardq_split(short, vllm_config, torch.device("cpu")) is None
-
-
-@pytest.mark.parametrize("num_decode_tokens", [0, 1, 37])
-def test_indexer_rows_cover_decodes_then_local_prefill(num_decode_tokens):
-    """Mixed steps: every rank scores the decode rows in place, then its own
-    prefill tokens compactly; across ranks each prefill row is scored once."""
-    world, lens = 4, [700, 64, 3001]
-    qsl = np.r_[0, np.cumsum(lens)]
-    num_prefill = int(qsl[-1])
-    prefill_rows = []
-    for rank in range(world):
-        split = make_shardq_split(
-            qsl, world, rank, torch.device("cpu"), num_decode_tokens
-        )
-        host, rows = indexer_rows(split)
-        np.testing.assert_array_equal(host, rows.numpy())
-        assert np.all(np.diff(host) > 0)
-        np.testing.assert_array_equal(
-            host[:num_decode_tokens], np.arange(num_decode_tokens)
-        )
-        # Row p of the buffer holds the p-th scored row: this rank's prefill
-        # tokens follow the decode rows in the order the attention reads them.
-        np.testing.assert_array_equal(
-            host[num_decode_tokens:] - num_decode_tokens, split.local_idx_cpu
-        )
-        prefill_rows.append(host[num_decode_tokens:])
-    np.testing.assert_array_equal(
-        np.sort(np.concatenate(prefill_rows)),
-        np.arange(num_decode_tokens, num_decode_tokens + num_prefill),
-    )
+    assert shardq_shard(short, vllm_config) is None
 
 
 def _round_trip(rank, world, port, use_sm, q_dtype, num_decode_tokens):
@@ -145,30 +115,30 @@ def _round_trip(rank, world, port, use_sm, q_dtype, num_decode_tokens):
             )
         all_heads = world * heads
         full = torch.randn(num_tokens, all_heads, dim, device="cuda").to(q_dtype)
-        split = make_shardq_split(
-            np.r_[0, np.cumsum(lens)],
-            world,
-            rank,
-            torch.device("cuda"),
-            num_decode_tokens,
+        token_ids, counts = zigzag_split(np.array(lens), world)
+        shardq = ShardQMetadata(
+            num_decode_tokens=num_decode_tokens,
+            counts=counts.tolist(),
+            token_ids=torch.from_numpy(token_ids).cuda(),
+            offsets=torch.from_numpy(np.r_[0, np.cumsum(counts)]).cuda(),
         )
         local_heads = full[:, rank * heads : (rank + 1) * heads].contiguous()
         for _ in range(2):  # The second pass reuses the symmetric buffers.
-            decode_q, sharded = shard_q(local_heads, split)
+            decode_q, sharded = shard_q(local_heads, shardq)
             # Bitwise, as the exchanges only move bytes (and fp8 lacks
             # torch.equal).
             assert torch.equal(
                 decode_q.view(torch.uint8),
                 local_heads[:num_decode_tokens].view(torch.uint8),
             )
-            expected = full[num_decode_tokens:][split.local_idx]
+            expected = full[num_decode_tokens:][shardq.local_idx]
             assert torch.equal(sharded.view(torch.uint8), expected.view(torch.uint8))
             # Attention outputs are a head-padded slice; unshard reads its
             # strides.
             padded = torch.zeros(sharded.shape[0], all_heads + 8, 512, device="cuda")
             padded[:, :all_heads] = sharded[..., :512].float()
             out = padded.bfloat16()[:, :all_heads]
-            restored = unshard_out(out, split, decode_q[..., :512].bfloat16())
+            restored = unshard_out(out, shardq, decode_q[..., :512].bfloat16())
             assert torch.equal(restored, local_heads[..., :512].bfloat16())
         destroy_model_parallel()
         destroy_distributed_environment()

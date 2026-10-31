@@ -294,12 +294,12 @@ def sparse_attn_indexer_kpool(
         # Under ShardQ the chunks number this rank's rows compactly.
         prefill_q, prefill_q_scale = q_quant, q_scale
         prefill_weights, prefill_positions = weights, positions
-        if (shardq_rows := prefill_metadata.shardq_rows) is not None:
-            prefill_q, prefill_weights = q_quant[shardq_rows], weights[shardq_rows]
+        if (indices := prefill_metadata.shardq_gather_indices) is not None:
+            prefill_q, prefill_weights = q_quant[indices], weights[indices]
             if q_scale is not None:
-                prefill_q_scale = q_scale[shardq_rows]
+                prefill_q_scale = q_scale[indices]
             if positions is not None:
-                prefill_positions = positions[shardq_rows]
+                prefill_positions = positions[indices]
         # Get the full shared workspace buffers once (will allocate on first use).
         # Layout switches between FP8 (head_dim bytes + 4-byte fp32 scale) and
         # MXFP4 (head_dim/2 bytes packed + head_dim/MXFP4_BLOCK_SIZE ue8m0
@@ -329,9 +329,6 @@ def sparse_attn_indexer_kpool(
 
             row_start, row_end = chunk.token_start, chunk.token_end
             cu_seqlen_ks, cu_seqlen_ke = chunk.cu_seqlen_ks, chunk.cu_seqlen_ke
-            if row_start == row_end:
-                # This TP rank owns no rows of the chunk under ShardQ.
-                continue
 
             q_slice = prefill_q[row_start:row_end]
             q_scale_slice = (

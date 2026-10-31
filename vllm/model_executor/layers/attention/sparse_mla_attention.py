@@ -33,6 +33,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.torch_utils import (
     PIN_MEMORY,
+    async_tensor_h2d,
     np_to_pinned_tensor,
 )
 from vllm.v1.attention.backend import AttentionLayer, AttentionMetadataBuilder
@@ -50,7 +51,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-from vllm.v1.attention.ops.shardq import ShardQSplit, build_shardq_split
+from vllm.v1.attention.ops.shardq import ShardQMetadata, shardq_shard
 from vllm.v1.hisparse.runtime import (
     HiSparsePrefillStagingPlan,
     build_hisparse_prefill_staging_plan,
@@ -165,12 +166,43 @@ class SparseMLACommonMetadata(MLACommonMetadata[MLACommonDecodeMetadata]):
     prefill: SparseMLAPrefillMetadata | None = None
     cp_kv_cache_interleave_size: int = 1
     # Set on token-sharded TP prefill steps (see vllm.v1.attention.ops.shardq).
-    shardq: ShardQSplit | None = None
+    shardq: ShardQMetadata | None = None
     # Top-k buffer row of the first query row.
     topk_start: int = 0
 
 
 T = TypeVar("T", bound=SparseMLACommonMetadata)
+
+
+def build_shardq_metadata(
+    common_attn_metadata: "CommonAttentionMetadata",
+    vllm_config: "VllmConfig",
+    metadata: SparseMLACommonMetadata,
+    device: torch.device,
+) -> ShardQMetadata | None:
+    """This step's ShardQ, with ``metadata`` narrowed to this rank's tokens,
+    or None."""
+    shards = shardq_shard(common_attn_metadata, vllm_config)
+    if shards is None:
+        return None
+    num_decode_tokens = shards.num_decode_tokens
+    shardq = ShardQMetadata(
+        num_decode_tokens=num_decode_tokens,
+        counts=shards.counts.tolist(),
+        token_ids=async_tensor_h2d(shards.token_ids, device=device),
+        offsets=async_tensor_h2d(np.r_[0, np.cumsum(shards.counts)], device=device),
+    )
+    # The indexer wrote these tokens' top-k compactly after the decodes.
+    shardq.attn_metadata = replace(
+        metadata,
+        num_decodes=0,
+        num_decode_tokens=0,
+        req_id_per_token=metadata.req_id_per_token[
+            shardq.local_idx + num_decode_tokens
+        ],
+        topk_start=num_decode_tokens,
+    )
+    return shardq
 
 
 class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
@@ -446,23 +478,10 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             prefill=prefill,
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
         )
-        if self.use_shardq and (
-            shardq := build_shardq_split(
-                common_attn_metadata, self.vllm_config, self.device
+        if self.use_shardq:
+            metadata.shardq = build_shardq_metadata(
+                common_attn_metadata, self.vllm_config, metadata, self.device
             )
-        ):
-            # The indexer wrote these tokens' top-k compactly after the decodes.
-            shardq.metadata = replace(
-                metadata,
-                num_actual_tokens=shardq.num_local,
-                num_decodes=0,
-                num_decode_tokens=0,
-                req_id_per_token=metadata.req_id_per_token[
-                    shardq.local_idx + shardq.num_decode_tokens
-                ],
-                topk_start=shardq.num_decode_tokens,
-            )
-            metadata.shardq = shardq
         return metadata
 
     @staticmethod
@@ -666,7 +685,7 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
     # Reuse the index group's top-k conversion only for uniform decode batches
     # of multi-layer groups; other batches convert per layer.
     group_conversion_decode_only: ClassVar[bool] = False
-    # Whether forward_mqa runs ShardQ split metadata and is validated.
+    # Whether forward_mqa runs ShardQ metadata and is validated.
     supports_shardq: ClassVar[bool] = False
 
     def __init__(

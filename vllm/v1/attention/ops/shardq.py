@@ -7,16 +7,17 @@ sparse-MLA kernel pads its few local heads. ShardQ gives each TP rank a slice of
 the query tokens instead: the indexer scores only the rank's tokens, an
 all-to-all moves Q from [T, H / tp, D] to [T_rank, H, D], attention runs with
 all heads over the replicated KV cache, and a second all-to-all restores
-[T, H / tp, D_v]. Each request's tokens fold into ``2 * tp`` pieces; rank ``r``
-owns pieces ``r`` and ``2 * tp - 1 - r``, which balances the causal indexer.
+[T, H / tp, D_v]. Tokens split zigzag: each request cuts into ``2 * tp``
+chunks and rank ``r`` owns chunks ``r`` and ``2 * tp - 1 - r``, which balances
+the causal work.
 
 Both exchanges push rows straight into peers' symmetric-memory buffers with
 one Triton kernel, or fall back to NCCL when the TP group has no symmetric
 memory.
 """
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -41,100 +42,77 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class ShardQSplit:
-    """This step's token split over the TP group.
-
-    The split covers the tokens after ``num_decode_tokens`` head-sharded
-    decode tokens; its token ids are relative to the first of them.
+class ShardQMetadata:
+    """This step's ShardQ: which TP rank attends which of the tokens after
+    ``num_decode_tokens`` head-sharded decode tokens (ids relative to the first
+    of them), and the forward_mqa metadata of this rank's tokens.
     """
 
-    world: int
-    rank: int
     num_decode_tokens: int
     # Tokens per rank.
     counts: list[int]
-    # Every rank's tokens, concatenated in rank order: [num_tokens].
-    rank_order: torch.Tensor
-    # This rank's tokens (a view of ``rank_order``), ascending.
-    local_idx: torch.Tensor
-    local_idx_cpu: np.ndarray
-    # Destination rank and position there of each ``rank_order`` row.
-    row_peer: torch.Tensor
-    row_pos: torch.Tensor
+    # Every rank's tokens, grouped by rank, and where each group starts.
+    token_ids: torch.Tensor
+    offsets: torch.Tensor
     # forward_mqa metadata of this rank's tokens, which run with all heads.
-    metadata: "SparseMLACommonMetadata | None" = None
+    attn_metadata: "SparseMLACommonMetadata" = field(init=False)
 
     @property
-    def num_local(self) -> int:
-        return self.counts[self.rank]
+    def local_idx(self) -> torch.Tensor:
+        """This rank's tokens, ascending."""
+        rank = get_tp_group().rank_in_group
+        start = sum(self.counts[:rank])
+        return self.token_ids[start : start + self.counts[rank]]
 
 
-def fold_split(query_start_loc: np.ndarray, world: int) -> list[np.ndarray]:
-    """Each rank's token ids under the per-request two-piece fold."""
-    pieces = 2 * world
-    starts, lens = query_start_loc[:-1], np.diff(query_start_loc)
-    bounds = starts[:, None] + (np.arange(pieces + 1) * lens[:, None]) // pieces
-    out = []
-    for rank in range(world):
-        mirror = pieces - 1 - rank
-        # Ascending: a request's mirror piece follows its front piece.
-        piece_starts = bounds[:, [rank, mirror]].ravel()
-        piece_lens = bounds[:, [rank + 1, mirror + 1]].ravel() - piece_starts
-        offsets = np.repeat(
-            piece_starts - np.cumsum(piece_lens) + piece_lens, piece_lens
-        )
-        out.append((offsets + np.arange(offsets.size)).astype(np.int64))
-    return out
+def zigzag_split(query_lens: np.ndarray, world: int) -> tuple[np.ndarray, np.ndarray]:
+    """Token ids grouped by owning rank (ascending within a rank), and each
+    rank's token count.
+
+    world=4 splits each request into eight chunks, chunk ``i`` spanning
+    ``[floor(i * len / 8), floor((i + 1) * len / 8))``, and each rank gets an
+    early and a late chunk:
+
+        full:  | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+        rank 0:  0                           7
+        rank 1:      1                   6
+        rank 2:          2           5
+        rank 3:              3   4
+    """
+    num_chunks = 2 * world
+    starts = np.cumsum(query_lens) - query_lens
+    pos = np.arange(query_lens.sum()) - np.repeat(starts, query_lens)
+    # The last chunk i with floor(i * len / num_chunks) <= pos.
+    chunk = ((pos + 1) * num_chunks - 1) // np.repeat(query_lens, query_lens)
+    owner = np.minimum(chunk, num_chunks - 1 - chunk).astype(np.uint8)
+    # A stable sort of uint8 is a linear-time radix sort.
+    return np.argsort(owner, kind="stable"), np.bincount(owner, minlength=world)
 
 
-def make_shardq_split(
-    query_start_loc: np.ndarray,
-    world: int,
-    rank: int,
-    device: torch.device,
-    num_decode_tokens: int = 0,
-) -> ShardQSplit:
-    per_rank = fold_split(query_start_loc, world)
-    counts = [len(x) for x in per_rank]
-    host = torch.from_numpy(
-        np.stack(
-            (
-                np.concatenate(per_rank),
-                np.repeat(np.arange(world), counts),
-                np.concatenate([np.arange(n) for n in counts]),
-            )
-        )
-    )
-    if device.type == "cuda":
-        host = host.pin_memory()
-    rank_order, row_peer, row_pos = host.to(device, non_blocking=True)
-    start = sum(counts[:rank])
-    return ShardQSplit(
-        world=world,
-        rank=rank,
-        num_decode_tokens=num_decode_tokens,
-        counts=counts,
-        rank_order=rank_order,
-        local_idx=rank_order[start : start + counts[rank]],
-        local_idx_cpu=per_rank[rank],
-        row_peer=row_peer,
-        row_pos=row_pos,
-    )
+class ShardQTokens(NamedTuple):
+    """Which TP rank attends which of the tokens after ``num_decode_tokens``
+    head-sharded decode tokens (ids relative to the first of them)."""
+
+    num_decode_tokens: int
+    # Token ids grouped by rank, and tokens per rank.
+    token_ids: np.ndarray
+    counts: np.ndarray
+
+    @property
+    def local_ids(self) -> np.ndarray:
+        """This TP rank's tokens, ascending."""
+        rank = get_tp_group().rank_in_group
+        start = self.counts[:rank].sum()
+        return self.token_ids[start : start + self.counts[rank]]
 
 
-def build_shardq_split(
-    common_attn_metadata: "CommonAttentionMetadata",
-    vllm_config: "VllmConfig",
-    device: torch.device,
-) -> ShardQSplit | None:
-    """This step's split, or None when too few tokens follow the decodes, none
-    of their requests is longer than the top-k, or a rank would own no tokens.
-
-    Decodes are the indexer's: requests of at most 1 + num_speculative_tokens
-    tokens. The main MLA layer's builder and its indexer's builder each call
-    this and, like every TP rank, derive the same split from the same batch.
-    Without a long request, dense MHA or the indexer's causal fill serves the
-    prefill with its rows in place.
+def shardq_shard(
+    common_attn_metadata: "CommonAttentionMetadata", vllm_config: "VllmConfig"
+) -> ShardQTokens | None:
+    """This step's ``zigzag_split`` over the TP group of the tokens after the
+    decodes (requests of at most 1 + num_speculative_tokens tokens). None when
+    too few tokens follow the decodes, none of their requests is longer than
+    the top-k, or a rank would own no tokens.
     """
     spec_config = vllm_config.speculative_config
     num_spec = spec_config.num_speculative_tokens if spec_config else 0
@@ -150,69 +128,44 @@ def build_shardq_split(
     topk_tokens = vllm_config.model_config.hf_text_config.index_topk
     if int(seq_lens[num_decodes:num_reqs].max()) <= topk_tokens:
         return None
-    qsl = (
-        common_attn_metadata.query_start_loc_cpu[num_decodes : num_reqs + 1]
-        .numpy()
-        .astype(np.int64)
-        - num_decode_tokens
-    )
-    if qsl[-1] != num_prefill_tokens:
+    query_lens = common_attn_metadata.query_start_loc_cpu.diff()
+    prefill_lens = query_lens[num_decodes:num_reqs].numpy()
+    if prefill_lens.sum() != num_prefill_tokens:
         return None
-    group = get_tp_group()
-    split = make_shardq_split(
-        qsl, group.world_size, group.rank_in_group, device, num_decode_tokens
-    )
-    # Attention kernels reject empty batches.
-    return split if min(split.counts) > 0 else None
-
-
-def indexer_rows(split: ShardQSplit) -> tuple[np.ndarray, torch.Tensor]:
-    """Rows the indexer scores under ``split``, ascending, on the host and on
-    the split's device.
-
-    Every rank scores every decode row and its own split rows, and writes the
-    top-k of the p-th scored row to buffer row p: decode rows stay in place,
-    and this rank's split rows follow them compactly, in the order the
-    token-sharded attention reads them.
-    """
-    num_decode_tokens = split.num_decode_tokens
-    host = np.concatenate(
-        (np.arange(num_decode_tokens), split.local_idx_cpu + num_decode_tokens)
-    )
-    rows = torch.cat(
-        (
-            torch.arange(num_decode_tokens, device=split.local_idx.device),
-            split.local_idx + num_decode_tokens,
-        )
-    )
-    return host, rows
+    token_ids, counts = zigzag_split(prefill_lens, get_tp_group().world_size)
+    # A rank without tokens would run FlashMLA's kernel on an empty batch,
+    # which it rejects. That takes every request here being shorter than
+    # 2 * world tokens; steps large enough for sparse_mla_shard_q_min_tokens
+    # virtually never look like that.
+    if counts.min() == 0:
+        return None
+    return ShardQTokens(num_decode_tokens, token_ids, counts)
 
 
 @triton.jit
 def _shard_q_kernel(
     q,
     q_stride,
-    rank_order,
-    row_peer,
-    row_pos,
+    token_ids,
+    offsets,
     peer_ptrs,
     dst_stride,
     dst_col,
     width,
     BLOCK: tl.constexpr,
 ):
-    """Push q row ``rank_order[i]`` to rank ``row_peer[i]``, at row
-    ``row_pos[i]`` there and column ``dst_col``."""
-    i = tl.program_id(0)
-    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = col < width
-    src_row = tl.load(rank_order + i)
-    dst_row = tl.load(row_pos + i)
-    dst = tl.load(peer_ptrs + tl.load(row_peer + i)).to(
-        tl.pointer_type(q.dtype.element_ty)
-    )
+    """Push q row ``token_ids[offsets[peer] + i]`` to row ``i`` of rank
+    ``peer``, at column ``dst_col``."""
+    i = tl.program_id(0).to(tl.int64)
+    peer = tl.program_id(1)
+    start = tl.load(offsets + peer)
+    valid = start + i < tl.load(offsets + peer + 1)
+    col = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+    mask = valid & (col < width)
+    src_row = tl.load(token_ids + start + i, mask=valid, other=0)
+    dst = tl.load(peer_ptrs + peer).to(tl.pointer_type(q.dtype.element_ty))
     vals = tl.load(q + src_row * q_stride + col, mask=mask)
-    tl.store(dst + dst_row * dst_stride + dst_col + col, vals, mask=mask)
+    tl.store(dst + i * dst_stride + dst_col + col, vals, mask=mask)
 
 
 @triton.jit(do_not_specialize=["num_leading_rows"])
@@ -250,14 +203,13 @@ class ShardQWorkspace(DirectCPWorkspace):
         group: dist.ProcessGroup,
         device: torch.device,
         num_ubatches: int,
-        shapes: dict[str, tuple[tuple[int, ...], torch.dtype]],
+        q: tuple[tuple[int, ...], torch.dtype],
+        out: tuple[tuple[int, ...], torch.dtype],
     ) -> None:
         super().__init__(group, device, num_ubatches)
         # Each is its storage and every rank's address of each ubatch slot.
-        self.buffers = {
-            name: self._allocate((num_ubatches, *shape), dtype)
-            for name, (shape, dtype) in shapes.items()
-        }
+        self.q = self._allocate((num_ubatches, *q[0]), q[1])
+        self.out = self._allocate((num_ubatches, *out[0]), out[1])
         # Any allocation's handle synchronizes the whole group.
         self.handle = self._allocations[0][1]
 
@@ -295,11 +247,13 @@ def allocate_shardq_buffers(
     device = torch.device(
         current_platform.device_type, torch.accelerator.current_device_index()
     )
-    shapes: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
-        "q": ((q_rows, group.world_size * num_heads, query_head_dim), query_dtype),
-        "out": ((max_num_tokens, num_heads, output_head_dim), output_dtype),
-    }
-    _workspace = ShardQWorkspace(group.device_group, device, num_ubatches, shapes)
+    _workspace = ShardQWorkspace(
+        group.device_group,
+        device,
+        num_ubatches,
+        q=((q_rows, group.world_size * num_heads, query_head_dim), query_dtype),
+        out=((max_num_tokens, num_heads, output_head_dim), output_dtype),
+    )
 
 
 def _all_to_all(
@@ -319,73 +273,74 @@ def _all_to_all(
 
 
 def shard_q(
-    q: torch.Tensor | tuple[torch.Tensor, torch.Tensor], split: ShardQSplit
+    q: torch.Tensor | tuple[torch.Tensor, torch.Tensor], metadata: ShardQMetadata
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """[T, H, D] head shards -> the decode rows, still head-sharded, and this
     rank's token shard with every rank's heads, [T_rank, world * H, D]."""
     if isinstance(q, tuple):
         q = torch.cat(q, dim=-1)
-    decode_q, q = q[: split.num_decode_tokens], q[split.num_decode_tokens :]
+    decode_q, q = q[: metadata.num_decode_tokens], q[metadata.num_decode_tokens :]
     _, heads, dim = q.shape
     assert q[0].is_contiguous()
+    group = get_tp_group()
+    world = group.world_size
+    num_local = metadata.counts[group.rank_in_group]
     if _workspace is None:
         # Every rank sends this rank its num_local tokens, in rank order.
-        recv = q.new_empty((split.world, split.num_local, heads, dim))
-        _all_to_all(q.index_select(0, split.rank_order), recv, split.counts, None)
+        recv = q.new_empty((world, num_local, heads, dim))
+        _all_to_all(q.index_select(0, metadata.token_ids), recv, metadata.counts, None)
         return decode_q, torch.cat(list(recv), dim=1)
-    storage, peer_ptrs = _workspace.buffers["q"]
-    assert storage.shape[2:] == (split.world * heads, dim)
+    storage, peer_ptrs = _workspace.q
+    assert storage.shape[2:] == (world * heads, dim)
     ubatch = dbo_current_ubatch_id()
     width = heads * dim
     # Peers may still read the previous exchange from their buffers.
     _workspace.handle.barrier(channel=ubatch)
-    _shard_q_kernel[(split.rank_order.numel(), triton.cdiv(width, _PUSH_BLOCK))](
+    _shard_q_kernel[(max(metadata.counts), world, triton.cdiv(width, _PUSH_BLOCK))](
         q,
         q.stride(0),
-        split.rank_order,
-        split.row_peer,
-        split.row_pos,
+        metadata.token_ids,
+        metadata.offsets,
         peer_ptrs[ubatch],
-        split.world * width,
-        split.rank * width,
+        world * width,
+        group.rank_in_group * width,
         width,
         BLOCK=_PUSH_BLOCK,
     )
     _workspace.handle.barrier(channel=ubatch)
     # Views the buffer, which the next exchange reuses.
-    return decode_q, storage[ubatch, : split.num_local]
+    return decode_q, storage[ubatch, :num_local]
 
 
 def unshard_out(
-    out: torch.Tensor, split: ShardQSplit, decode_out: torch.Tensor | None
+    out: torch.Tensor, metadata: ShardQMetadata, decode_out: torch.Tensor | None
 ) -> torch.Tensor:
     """This rank's token shard of the attention output [T_rank, world * H, D]
     -> [T, H, D] head shards, after the head-sharded ``decode_out`` rows."""
     assert out[0].is_contiguous()
-    heads, dim = out.shape[1] // split.world, out.shape[2]
-    num_rows = split.num_decode_tokens + sum(split.counts)
+    world = get_tp_group().world_size
+    num_local, heads, dim = out.shape[0], out.shape[1] // world, out.shape[2]
+    num_rows = metadata.num_decode_tokens + sum(metadata.counts)
     if _workspace is None:
         # One block of heads per destination rank.
-        send = torch.stack(out.chunk(split.world, dim=1))
-        recv = out.new_empty((sum(split.counts), heads, dim))
-        _all_to_all(send, recv, None, split.counts)
+        send = torch.stack(out.chunk(world, dim=1))
+        recv = out.new_empty((sum(metadata.counts), heads, dim))
+        _all_to_all(send, recv, None, metadata.counts)
         restored = out.new_empty((num_rows, heads, dim))
-        restored[split.num_decode_tokens :].index_copy_(0, split.rank_order, recv)
+        restored[metadata.num_decode_tokens :].index_copy_(0, metadata.token_ids, recv)
     else:
-        storage, peer_ptrs = _workspace.buffers["out"]
+        storage, peer_ptrs = _workspace.out
         assert storage.shape[2:] == (heads, dim)
         ubatch = dbo_current_ubatch_id()
         width = heads * dim
         _workspace.handle.barrier(channel=ubatch)
-        _unshard_out_kernel[
-            (split.num_local * split.world, triton.cdiv(width, _PUSH_BLOCK))
-        ](
+        _unshard_out_kernel[(num_local * world, triton.cdiv(width, _PUSH_BLOCK))](
             out,
             out.stride(0),
-            split.local_idx,
+            metadata.local_idx,
             peer_ptrs[ubatch],
-            split.num_decode_tokens,
-            split.world,
+            metadata.num_decode_tokens,
+            world,
             width,
             BLOCK=_PUSH_BLOCK,
         )
@@ -393,5 +348,5 @@ def unshard_out(
         # Views the buffer, which the next exchange reuses.
         restored = storage[ubatch, :num_rows]
     if decode_out is not None:
-        restored[: split.num_decode_tokens] = decode_out
+        restored[: metadata.num_decode_tokens] = decode_out
     return restored

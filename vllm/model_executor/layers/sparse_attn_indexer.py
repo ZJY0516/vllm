@@ -592,11 +592,11 @@ def sparse_attn_indexer(
         )
         # Under ShardQ the chunks number this rank's rows compactly.
         prefill_q, prefill_q_scale, prefill_weights = q_quant, q_scale, weights
-        if (shardq_rows := prefill_metadata.shardq_rows) is not None:
+        if (indices := prefill_metadata.shardq_gather_indices) is not None:
             assert candidate_blocks is None
-            prefill_q, prefill_weights = q_quant[shardq_rows], weights[shardq_rows]
+            prefill_q, prefill_weights = q_quant[indices], weights[indices]
             if q_scale is not None:
-                prefill_q_scale = q_scale[shardq_rows]
+                prefill_q_scale = q_scale[indices]
         for chunk in prefill_metadata.chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
@@ -613,9 +613,6 @@ def sparse_attn_indexer(
                 )
 
             row_start, row_end = chunk.token_start, chunk.token_end
-            if row_start == row_end:
-                # This TP rank owns no rows of the chunk under ShardQ.
-                continue
 
             # PCP + DCP KV all-gather.
             deinterleave_idx = chunk.pcp_deinterleave_idx

@@ -1147,7 +1147,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     decode_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
                         decode_q, kv_cache, attn_metadata, self
                     )
-                mqa_metadata = shardq.metadata
+                mqa_metadata = shardq.attn_metadata
 
             # call decode attn
             if not self.impl.is_sparse:
