@@ -752,10 +752,8 @@ class SparseMLACommonImpl(MLACommonBaseImpl[T], SharedTopkIndicesBuffer, Generic
             self.supports_shardq
             and vllm_config.attention_config.sparse_mla_shard_q
             and vllm_config.attention_config.hisparse_config is None
-            # Under DCP, ShardQ splits tokens over the TP ranks sharing a KV
-            # shard.
-            and parallel_config.tensor_parallel_size
-            > parallel_config.decode_context_parallel_size
+            and parallel_config.tensor_parallel_size > 1
+            and parallel_config.decode_context_parallel_size == 1
             and parallel_config.prefill_context_parallel_size == 1
             and cudagraph_mode.mixed_mode() != CUDAGraphMode.FULL
         )

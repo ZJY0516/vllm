@@ -1141,10 +1141,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         mqa_q = self.dcp_manager.query_gather(mqa_q)
             if shardq is not None:
                 decode_q, mqa_q = shard_q(mqa_q, shardq)
-                decode_out = decode_lse = None
+                decode_out = None
                 if decode_q.shape[0]:
                     # Decode rows attend head-sharded.
-                    decode_out, decode_lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                    decode_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
                         decode_q, kv_cache, attn_metadata, self
                     )
                 mqa_metadata = shardq.metadata
@@ -1154,9 +1154,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata.decode is not None
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, mqa_metadata, self)  # type: ignore[attr-defined]
             if shardq is not None:
-                attn_out, lse = unshard_out(
-                    attn_out, lse, shardq, decode_out, decode_lse
-                )
+                attn_out = unshard_out(attn_out, shardq, decode_out)
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:

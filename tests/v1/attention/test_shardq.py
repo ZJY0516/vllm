@@ -26,7 +26,6 @@ from vllm.v1.attention.ops.shardq import (
     indexer_rows,
     make_shardq_split,
     shard_q,
-    shardq_group,
     unshard_out,
 )
 
@@ -57,7 +56,7 @@ def test_build_split_after_indexer_decodes(monkeypatch, num_spec):
     after them are split once they reach sparse_mla_shard_q_min_tokens and a
     request is longer than the top-k."""
     monkeypatch.setattr(
-        shardq, "shardq_group", lambda: SimpleNamespace(world_size=4, rank_in_group=1)
+        shardq, "get_tp_group", lambda: SimpleNamespace(world_size=4, rank_in_group=1)
     )
     query_lens = [1 + num_spec] * 3 + [100, 5000, 4000]
     metadata = create_common_attn_metadata(
@@ -124,7 +123,7 @@ def test_indexer_rows_cover_decodes_then_local_prefill(num_decode_tokens):
     )
 
 
-def _round_trip(rank, world, dcp, port, use_sm, q_dtype, num_decode_tokens):
+def _round_trip(rank, world, port, use_sm, q_dtype, num_decode_tokens):
     torch.accelerator.set_device_index(rank)
     vllm_config = VllmConfig()
     with set_current_vllm_config(vllm_config):
@@ -134,34 +133,26 @@ def _round_trip(rank, world, dcp, port, use_sm, q_dtype, num_decode_tokens):
             distributed_init_method=f"tcp://127.0.0.1:{port}",
             local_rank=rank,
         )
-        ensure_model_parallel_initialized(
-            world, 1, decode_context_model_parallel_size=dcp
-        )
+        ensure_model_parallel_initialized(world, 1)
         torch.manual_seed(0)
         lens = [700, 64, 3001]
-        # A rank's heads: under DCP, its DCP group's gathered heads.
         heads, dim = 4, 576
         num_tokens = num_decode_tokens + sum(lens)
         vllm_config.scheduler_config.max_num_batched_tokens = num_tokens
         if use_sm:
             allocate_shardq_buffers(
-                vllm_config, heads // dcp, dim, 512, q_dtype, torch.bfloat16
+                vllm_config, heads, dim, 512, q_dtype, torch.bfloat16
             )
-        group = shardq_group()
-        assert group.world_size == world // dcp
-        all_heads = group.world_size * heads
+        all_heads = world * heads
         full = torch.randn(num_tokens, all_heads, dim, device="cuda").to(q_dtype)
-        full_lse = torch.randn(num_tokens, all_heads, device="cuda")
         split = make_shardq_split(
             np.r_[0, np.cumsum(lens)],
-            group.world_size,
-            group.rank_in_group,
+            world,
+            rank,
             torch.device("cuda"),
             num_decode_tokens,
         )
-        local = slice(group.rank_in_group * heads, (group.rank_in_group + 1) * heads)
-        local_heads = full[:, local].contiguous()
-        local_lse = full_lse[:, local].contiguous()
+        local_heads = full[:, rank * heads : (rank + 1) * heads].contiguous()
         for _ in range(2):  # The second pass reuses the symmetric buffers.
             decode_q, sharded = shard_q(local_heads, split)
             # Bitwise, as the exchanges only move bytes (and fp8 lacks
@@ -177,18 +168,8 @@ def _round_trip(rank, world, dcp, port, use_sm, q_dtype, num_decode_tokens):
             padded = torch.zeros(sharded.shape[0], all_heads + 8, 512, device="cuda")
             padded[:, :all_heads] = sharded[..., :512].float()
             out = padded.bfloat16()[:, :all_heads]
-            # The LSE only moves under DCP, which merges outputs by it.
-            lse = full_lse[num_decode_tokens:][split.local_idx] if dcp > 1 else None
-            restored, restored_lse = unshard_out(
-                out,
-                lse,
-                split,
-                decode_q[..., :512].bfloat16(),
-                local_lse[:num_decode_tokens],
-            )
+            restored = unshard_out(out, split, decode_q[..., :512].bfloat16())
             assert torch.equal(restored, local_heads[..., :512].bfloat16())
-            if dcp > 1:
-                assert torch.equal(restored_lse, local_lse)
         destroy_model_parallel()
         destroy_distributed_environment()
 
@@ -196,17 +177,14 @@ def _round_trip(rank, world, dcp, port, use_sm, q_dtype, num_decode_tokens):
 @pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("use_sm", [False, True])
 @pytest.mark.parametrize("num_decode_tokens", [0, 33])
-@pytest.mark.parametrize("dcp", [1, 2])
-def test_shard_q_round_trip(use_sm, q_dtype, num_decode_tokens, dcp):
+def test_shard_q_round_trip(use_sm, q_dtype, num_decode_tokens):
     """The exchanges move each rank's tokens to it with all heads and back,
-    through symmetric memory or NCCL, leaving the decode rows head-sharded.
-    Under DCP they run over the TP ranks sharing a KV shard and move the
-    LSE too."""
-    world = 2 * dcp
+    through symmetric memory or NCCL, leaving the decode rows head-sharded."""
+    world = 2
     if torch.accelerator.device_count() < world:
         pytest.skip(f"needs {world} GPUs")
     mp.spawn(
         _round_trip,
-        args=(world, dcp, get_open_port(), use_sm, q_dtype, num_decode_tokens),
+        args=(world, get_open_port(), use_sm, q_dtype, num_decode_tokens),
         nprocs=world,
     )

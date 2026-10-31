@@ -604,10 +604,10 @@ class DeepseekV32Attention(MLAAttention):
             mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
         if shardq is not None:
             decode_q, mqa_q_arg = shard_q(mqa_q_arg, shardq)
-            decode_out = decode_lse = None
+            decode_out = None
             if decode_q.shape[0]:
                 # Decode rows attend head-sharded.
-                decode_out, decode_lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                decode_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
                     decode_q, kv_cache, attn_metadata, self
                 )
             mqa_metadata = shardq.metadata
@@ -615,7 +615,7 @@ class DeepseekV32Attention(MLAAttention):
             mqa_q_arg, kv_cache, mqa_metadata, self
         )
         if shardq is not None:
-            attn_out, lse = unshard_out(attn_out, lse, shardq, decode_out, decode_lse)
+            attn_out = unshard_out(attn_out, shardq, decode_out)
 
         if self.impl.dcp_world_size > 1:
             assert lse is not None and self.dcp_manager is not None
