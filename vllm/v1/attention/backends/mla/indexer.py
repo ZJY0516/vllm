@@ -43,12 +43,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.shardq import (
-    ShardQIndexerRows,
-    build_shardq_split,
-    chunk_indexer_rows,
-    indexer_rows,
-)
+from vllm.v1.attention.ops.shardq import build_shardq_split, indexer_rows
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheLayout,
@@ -425,7 +420,6 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     max_local_total_seq_lens: int = 0
 
     pcp_deinterleave_idx: torch.Tensor | None = None
-    shardq: ShardQIndexerRows | None = None
 
 
 class BuildPrefillChunkMetadataKernel(
@@ -662,9 +656,10 @@ class BuildPrefillChunkMetadataKernel(
 class DeepseekV32IndexerPrefillMetadata:
     chunks: list[DeepseekV32IndexerPrefillChunkMetadata]
     max_prefill_seq_len: int = -1
-    # The head-sharded leading tokens of this step's ShardQ split, which every
-    # chunk's ``shardq`` rows follow; None without a split.
-    shardq_num_decode_tokens: int | None = None
+    # Under ShardQ, the token scored by each chunk row: the chunks hold only
+    # this TP rank's rows, numbered as their top-k is written (see
+    # vllm.v1.attention.ops.shardq.indexer_rows).
+    shardq_rows: torch.Tensor | None = None
 
 
 @dataclass
@@ -961,12 +956,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.use_pcp = self.pcp_world_size > 1
         self.pcp_rank = get_pcp_group().rank_in_group if self.use_pcp else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
-        # Narrow prefill chunks to ShardQ rows only when a main MLA layer reads
-        # these indexers' top-k token-sharded.
+        # Whether a main MLA layer reads these indexers' top-k token-sharded.
         layers = self.vllm_config.compilation_config.static_forward_context
         self.use_shardq = any(
-            getattr(layers.get(name), "shardq_layer_name", "")
-            for name in self.layer_names
+            getattr(layers.get(name), "use_shardq", False) for name in self.layer_names
         )
         # KV compression (DeepseekV4). Default to 1 for no compression.
         self.compress_ratio = 1
@@ -1309,6 +1302,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             for request_slice, query_slice in chunk_specs
         ]
 
+    def _narrow_to_shardq(
+        self,
+        prefill: DeepseekV32IndexerPrefillMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_decode_tokens: int,
+    ) -> None:
+        """On a ShardQ step, narrow ``prefill``'s chunks to the rows this TP
+        rank scores, numbered as their top-k is written."""
+        split = build_shardq_split(common_attn_metadata, self.vllm_config, self.device)
+        if split is None:
+            return
+        # Rows this builder counts as decodes stay in place there.
+        assert num_decode_tokens <= split.num_decode_tokens
+        rows_cpu, prefill.shardq_rows = indexer_rows(split)
+        for chunk in prefill.chunks:
+            start, end = np.searchsorted(rows_cpu, (chunk.token_start, chunk.token_end))
+            rows = prefill.shardq_rows[start:end] - chunk.token_start
+            chunk.token_start, chunk.token_end = int(start), int(end)
+            chunk.cu_seqlen_ks = chunk.cu_seqlen_ks[rows]
+            chunk.cu_seqlen_ke = chunk.cu_seqlen_ke[rows]
+
     def _prefill_split_seq_lens(self, seq_lens_cpu: torch.Tensor) -> torch.Tensor:
         """Per-request KV lengths the prefill chunker budgets logits with;
         subclasses whose logits rows are wider than the context override."""
@@ -1534,26 +1548,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
                     chunks.append(metadata)
-            shardq_num_decode_tokens = None
-            built = (
-                build_shardq_split(common_attn_metadata, self.vllm_config, self.device)
-                if self.use_shardq
-                else None
-            )
-            if built is not None:
-                shardq_num_decode_tokens, split = built
-                # Rows this builder counts as decodes stay in place there.
-                assert num_decode_tokens <= shardq_num_decode_tokens
-                rows_cpu, rows = indexer_rows(split, shardq_num_decode_tokens)
-                for chunk in chunks:
-                    chunk.shardq = chunk_indexer_rows(
-                        rows_cpu,
-                        rows,
-                        chunk.token_start,
-                        chunk.token_end,
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
-                    )
             prefill_metadata = DeepseekV32IndexerPrefillMetadata(
                 chunks,
                 max_prefill_seq_len=(
@@ -1561,8 +1555,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     if num_prefills > 0
                     else 0
                 ),
-                shardq_num_decode_tokens=shardq_num_decode_tokens,
             )
+            if self.use_shardq:
+                self._narrow_to_shardq(
+                    prefill_metadata, common_attn_metadata, num_decode_tokens
+                )
 
         decode_metadata = None
         if num_decodes > 0:

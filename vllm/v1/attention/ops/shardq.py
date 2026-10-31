@@ -16,40 +16,86 @@ memory.
 """
 
 import functools
+import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import (
+    GroupCoordinator,
+    get_dcp_group,
+    get_tp_group,
+    get_world_group,
+    init_model_parallel_group,
+)
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.cp_common import direct_cp_enabled, symm_mem
+from vllm.v1.attention.ops.cp_common import DirectCPWorkspace, direct_cp_enabled
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.model_executor.layers.attention.sparse_mla_attention import (
+        SparseMLACommonMetadata,
+    )
     from vllm.v1.attention.backend import CommonAttentionMetadata
+
+
+@functools.cache
+def shardq_group() -> GroupCoordinator:
+    """The TP ranks ShardQ splits tokens over: those holding the same DCP KV
+    shard, so the whole TP group without DCP."""
+    tp = get_tp_group()
+    dcp = get_dcp_group().world_size
+    if dcp == 1:
+        return tp
+    # Without PCP, TP groups are runs of world ranks and DCP groups runs of
+    # dcp TP ranks, so a rank shares its KV shard with every dcp-th TP rank.
+    world = get_world_group()
+    group_ranks = [
+        list(range(start + offset, start + tp.world_size, dcp))
+        for start in range(0, world.world_size, tp.world_size)
+        for offset in range(dcp)
+    ]
+    return init_model_parallel_group(
+        group_ranks,
+        world.local_rank,
+        dist.get_backend(tp.device_group),
+        group_name="shardq",
+        use_device_communicator=False,
+    )
 
 
 @dataclass
 class ShardQSplit:
-    """This step's token split over the TP group."""
+    """This step's token split over the ``shardq_group``.
+
+    The split covers the tokens after ``num_decode_tokens`` head-sharded
+    decode tokens; its token ids are relative to the first of them.
+    """
 
     world: int
     rank: int
+    num_decode_tokens: int
     # Tokens per rank.
     counts: list[int]
     # Every rank's tokens, concatenated in rank order: [num_tokens].
     rank_order: torch.Tensor
     # This rank's tokens (a view of ``rank_order``), ascending.
     local_idx: torch.Tensor
-    # This rank's tokens on the host, for per-chunk bounds.
     local_idx_cpu: np.ndarray
     # Destination rank and position there of each ``rank_order`` row.
     row_peer: torch.Tensor
     row_pos: torch.Tensor
+    # forward_mqa metadata of this rank's tokens, which run with all heads.
+    metadata: "SparseMLACommonMetadata | None" = None
 
     @property
     def num_local(self) -> int:
@@ -75,7 +121,11 @@ def fold_split(query_start_loc: np.ndarray, world: int) -> list[np.ndarray]:
 
 
 def make_shardq_split(
-    query_start_loc: np.ndarray, world: int, rank: int, device: torch.device
+    query_start_loc: np.ndarray,
+    world: int,
+    rank: int,
+    device: torch.device,
+    num_decode_tokens: int = 0,
 ) -> ShardQSplit:
     per_rank = fold_split(query_start_loc, world)
     counts = [len(x) for x in per_rank]
@@ -95,6 +145,7 @@ def make_shardq_split(
     return ShardQSplit(
         world=world,
         rank=rank,
+        num_decode_tokens=num_decode_tokens,
         counts=counts,
         rank_order=rank_order,
         local_idx=rank_order[start : start + counts[rank]],
@@ -108,14 +159,15 @@ def build_shardq_split(
     common_attn_metadata: "CommonAttentionMetadata",
     vllm_config: "VllmConfig",
     device: torch.device,
-) -> tuple[int, ShardQSplit] | None:
-    """This step's leading decode tokens and the split of the tokens after
-    them, or None when too few tokens follow the decodes.
+) -> ShardQSplit | None:
+    """This step's split, or None when too few tokens follow the decodes, none
+    of their requests is longer than the top-k, or a rank would own no tokens.
 
     Decodes are the indexer's: requests of at most 1 + num_speculative_tokens
-    tokens. They stay head-sharded. The main MLA layer's builder and its
-    indexer's builder each call this and, like every TP rank, derive the same
-    answer from the same batch.
+    tokens. The main MLA layer's builder and its indexer's builder each call
+    this and, like every TP rank, derive the same split from the same batch.
+    Without a long request, dense MHA or the indexer's causal fill serves the
+    prefill with its rows in place.
     """
     spec_config = vllm_config.speculative_config
     num_spec = spec_config.num_speculative_tokens if spec_config else 0
@@ -126,6 +178,11 @@ def build_shardq_split(
     if num_prefills == 0 or num_prefill_tokens < min_tokens:
         return None
     num_reqs = common_attn_metadata.num_reqs
+    seq_lens = common_attn_metadata.seq_lens_cpu_upper_bound
+    assert seq_lens is not None
+    topk_tokens = vllm_config.model_config.hf_text_config.index_topk
+    if int(seq_lens[num_decodes:num_reqs].max()) <= topk_tokens:
+        return None
     qsl = (
         common_attn_metadata.query_start_loc_cpu[num_decodes : num_reqs + 1]
         .numpy()
@@ -134,100 +191,34 @@ def build_shardq_split(
     )
     if qsl[-1] != num_prefill_tokens:
         return None
-    tp = get_tp_group()
-    split = make_shardq_split(qsl, tp.world_size, tp.rank_in_group, device)
-    return num_decode_tokens, split
+    group = shardq_group()
+    split = make_shardq_split(
+        qsl, group.world_size, group.rank_in_group, device, num_decode_tokens
+    )
+    # Attention kernels reject empty batches.
+    return split if min(split.counts) > 0 else None
 
 
-def indexer_rows(
-    split: ShardQSplit, num_decode_tokens: int
-) -> tuple[np.ndarray, torch.Tensor]:
-    """Rows the indexer scores for a step whose prefill tokens follow
-    ``num_decode_tokens`` head-sharded decode tokens, ascending on the host and
-    on ``split``'s device.
+def indexer_rows(split: ShardQSplit) -> tuple[np.ndarray, torch.Tensor]:
+    """Rows the indexer scores under ``split``, ascending, on the host and on
+    the split's device.
 
-    Every rank scores every decode row and its own prefill rows, and writes
-    the top-k of the p-th row to buffer row p: decode rows stay in place, and
-    this rank's prefill rows follow them compactly.
+    Every rank scores every decode row and its own split rows, and writes the
+    top-k of the p-th scored row to buffer row p: decode rows stay in place,
+    and this rank's split rows follow them compactly, in the order the
+    token-sharded attention reads them.
     """
+    num_decode_tokens = split.num_decode_tokens
     host = np.concatenate(
         (np.arange(num_decode_tokens), split.local_idx_cpu + num_decode_tokens)
     )
-    device = split.local_idx.device
     rows = torch.cat(
         (
-            torch.arange(num_decode_tokens, device=device),
+            torch.arange(num_decode_tokens, device=split.local_idx.device),
             split.local_idx + num_decode_tokens,
         )
     )
     return host, rows
-
-
-@dataclass
-class ShardQIndexerRows:
-    """The rows of an indexer prefill chunk this TP rank scores (see
-    indexer_rows)."""
-
-    q_rows: torch.Tensor
-    # Their top-k rows: compact, in scoring order.
-    topk_rows: slice
-    cu_seqlen_ks: torch.Tensor
-    cu_seqlen_ke: torch.Tensor
-
-
-def chunk_indexer_rows(
-    rows_cpu: np.ndarray,
-    rows: torch.Tensor,
-    token_start: int,
-    token_end: int,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-) -> ShardQIndexerRows:
-    """Narrow the chunk of rows [token_start, token_end) and its per-row KV
-    bounds to the ``indexer_rows`` it holds."""
-    lo, hi = (int(i) for i in np.searchsorted(rows_cpu, (token_start, token_end)))
-    q_rows = rows[lo:hi]
-    chunk_rows = q_rows - token_start
-    return ShardQIndexerRows(
-        q_rows=q_rows,
-        topk_rows=slice(lo, hi),
-        cu_seqlen_ks=cu_seqlen_ks[chunk_rows],
-        cu_seqlen_ke=cu_seqlen_ke[chunk_rows],
-    )
-
-
-def reserve_shardq_buffers(
-    max_tokens: int,
-    max_reqs: int,
-    num_local_heads: int,
-    qk_dim: int,
-    v_dim: int,
-    q_dtype: torch.dtype,
-    out_dtype: torch.dtype,
-    device: torch.device,
-) -> None:
-    """Allocate the exchange buffers of a worst-case step in the memory profile.
-
-    Profile runs never build a ``ShardQSplit``. Symmetric-memory buffers live
-    outside the torch caching allocator for good, so they are allocated here at
-    their largest size and counted as non-torch memory; NCCL buffers are
-    per-call transients, reserved inside the profiled peak instead.
-
-    ``qk_dim`` and ``v_dim`` are the MQA query and output widths.
-    """
-    world = get_tp_group().world_size
-    # A rank owns at most two pieces of ceil(n / (2 * world)) per request.
-    q_rows = -(-max_tokens // world) + 2 * max_reqs
-    q_numel = q_rows * world * num_local_heads * qk_dim
-    out_numel = max_tokens * num_local_heads * v_dim
-    if _use_sm(None):
-        group = get_tp_group().device_group
-        _symm_buffer(group, "q", q_numel, q_dtype, device)
-        _symm_buffer(group, "out", out_numel, out_dtype, device)
-    else:
-        # Send and receive buffers of both exchanges.
-        nbytes = q_numel * q_dtype.itemsize + out_numel * out_dtype.itemsize
-        _ = torch.empty(2 * nbytes, dtype=torch.uint8, device=device)
 
 
 @triton.jit
@@ -284,167 +275,178 @@ def _unshard_out_kernel(
 _PUSH_BLOCK = 1024
 
 
-@dataclass
-class _SymmBuffer:
-    storage: torch.Tensor
-    handle: Any
-    # Every rank's buffer address, [world].
-    peer_ptrs: torch.Tensor
+class ShardQWorkspace(DirectCPWorkspace):
+    """The exchange buffers in symmetric memory, with one slot per ubatch."""
+
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        device: torch.device,
+        num_ubatches: int,
+        shapes: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ) -> None:
+        super().__init__(group, device, num_ubatches)
+        # Each is its storage and every rank's address of each ubatch slot.
+        self.buffers = {
+            name: self._allocate((num_ubatches, *shape), dtype)
+            for name, (shape, dtype) in shapes.items()
+        }
+        # Any allocation's handle synchronizes the whole group.
+        self.handle = self._allocations[0][1]
 
 
-# Grown geometrically; outgrown buffers stay alive for queued kernels.
-_buffers: dict[tuple, _SymmBuffer] = {}
-_retired: list[_SymmBuffer] = []
+# Shared by every ShardQ layer; without it the exchanges use NCCL.
+_workspace: ShardQWorkspace | None = None
 
 
-def _symm_buffer(
-    group: dist.ProcessGroup, role: str, numel: int, dtype: torch.dtype, device
-) -> _SymmBuffer:
-    # Sizes depend only on the split, so every rank grows (and rendezvouses)
-    # in lockstep.
-    key = (group.group_name, role, dtype)
-    buf = _buffers.get(key)
-    if buf is not None and buf.storage.numel() >= numel:
-        return buf
-    if buf is not None:
-        _retired.append(buf)
-    capacity = max(numel, 2 * buf.storage.numel() if buf is not None else 0)
-    storage = symm_mem.empty(capacity, dtype=dtype, device=device)
-    handle = symm_mem.rendezvous(storage, group.group_name)
-    peer_ptrs = torch.tensor(
-        [
-            handle.get_buffer(peer, [capacity], dtype, 0).data_ptr()
-            for peer in range(group.size())
-        ],
-        dtype=torch.int64,
-        device=device,
+def allocate_shardq_buffers(
+    vllm_config: "VllmConfig",
+    num_heads: int,
+    query_head_dim: int,
+    output_head_dim: int,
+    query_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+) -> None:
+    """Allocate the worst-case exchange buffers, if the ``shardq_group`` has
+    symmetric memory. ``num_heads`` are a TP rank's."""
+    logger.info_once(
+        "Sharding sparse MLA prefill steps of >= %d tokens across TP ranks by "
+        "token (sparse_mla_shard_q).",
+        vllm_config.attention_config.sparse_mla_shard_q_min_tokens,
     )
-    buf = _buffers[key] = _SymmBuffer(storage, handle, peer_ptrs)
-    return buf
+    global _workspace
+    group = shardq_group()
+    if _workspace is not None or not direct_cp_enabled(group, torch.bfloat16, None):
+        return
+    # Under DCP the exchanges move the DCP-gathered heads.
+    dcp = get_dcp_group().world_size
+    num_heads *= dcp
+    max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+    # A rank owns at most two pieces of ceil(n / (2 * world)) per request.
+    q_rows = (
+        -(-max_num_tokens // group.world_size)
+        + 2 * vllm_config.scheduler_config.max_num_seqs
+    )
+    num_ubatches = max(vllm_config.parallel_config.num_ubatches, 1)
+    device = torch.device(
+        current_platform.device_type, torch.accelerator.current_device_index()
+    )
+    shapes: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
+        "q": ((q_rows, group.world_size * num_heads, query_head_dim), query_dtype),
+        "out": ((max_num_tokens, num_heads, output_head_dim), output_dtype),
+    }
+    if dcp > 1:
+        # DCP merges the attention outputs by their LSE.
+        shapes["lse"] = ((max_num_tokens, num_heads), torch.float32)
+    _workspace = ShardQWorkspace(group.device_group, device, num_ubatches, shapes)
 
 
-@functools.cache
-def _tp_has_symm_mem() -> bool:
-    # A collective probe; every TP rank reaches the first exchange together.
-    return direct_cp_enabled(get_tp_group(), torch.bfloat16, None)
-
-
-def _use_sm(group: dist.ProcessGroup | None) -> bool:
-    if symm_mem is None:
-        return False
-    return group is not None or _tp_has_symm_mem()
+def _all_to_all(
+    send: torch.Tensor,
+    recv: torch.Tensor,
+    send_counts: list[int] | None,
+    recv_counts: list[int] | None,
+) -> None:
+    # Exchange bytes: NCCL may lack the dtype (e.g. fp8).
+    dist.all_to_all_single(
+        recv.view(torch.uint8),
+        send.view(torch.uint8),
+        output_split_sizes=recv_counts,
+        input_split_sizes=send_counts,
+        group=shardq_group().device_group,
+    )
 
 
 def shard_q(
-    q: torch.Tensor,
-    split: ShardQSplit,
-    group: dist.ProcessGroup | None = None,
-    use_sm: bool | None = None,
-) -> torch.Tensor:
-    """[T, H_local, D] head shards -> [T_rank, world * H_local, D] token shard.
-
-    The symmetric-memory result views a buffer that the next call reuses.
-    """
+    q: torch.Tensor | tuple[torch.Tensor, torch.Tensor], split: ShardQSplit
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """[T, H, D] head shards -> the decode rows, still head-sharded, and this
+    rank's token shard with every rank's heads, [T_rank, world * H, D]."""
+    if isinstance(q, tuple):
+        q = torch.cat(q, dim=-1)
+    decode_q, q = q[: split.num_decode_tokens], q[split.num_decode_tokens :]
     _, heads, dim = q.shape
-    assert q.stride(2) == 1 and q.stride(1) == dim
-    if use_sm is None:
-        use_sm = _use_sm(group)
-    group = group or get_tp_group().device_group
-    all_heads = split.world * heads
-    if not use_sm:
-        # Exchange bytes: NCCL may lack the dtype (e.g. fp8).
-        send = q.index_select(0, split.rank_order).view(torch.uint8)
-        recv = send.new_empty((split.world * split.num_local, *send.shape[1:]))
-        dist.all_to_all_single(
-            recv,
-            send,
-            output_split_sizes=[split.num_local] * split.world,
-            input_split_sizes=split.counts,
-            group=group,
-        )
-        return (
-            recv.view(q.dtype)
-            .view(split.world, split.num_local, heads, dim)
-            .transpose(0, 1)
-            .reshape(split.num_local, all_heads, dim)
-        )
-    buf = _symm_buffer(
-        group, "q", max(split.counts) * all_heads * dim, q.dtype, q.device
-    )
+    assert q[0].is_contiguous()
+    if _workspace is None:
+        # Every rank sends this rank its num_local tokens, in rank order.
+        recv = q.new_empty((split.world, split.num_local, heads, dim))
+        _all_to_all(q.index_select(0, split.rank_order), recv, split.counts, None)
+        return decode_q, torch.cat(list(recv), dim=1)
+    storage, peer_ptrs = _workspace.buffers["q"]
+    assert storage.shape[2:] == (split.world * heads, dim)
+    ubatch = dbo_current_ubatch_id()
     width = heads * dim
     # Peers may still read the previous exchange from their buffers.
-    buf.handle.barrier()
+    _workspace.handle.barrier(channel=ubatch)
     _shard_q_kernel[(split.rank_order.numel(), triton.cdiv(width, _PUSH_BLOCK))](
         q,
         q.stride(0),
         split.rank_order,
         split.row_peer,
         split.row_pos,
-        buf.peer_ptrs,
-        all_heads * dim,
+        peer_ptrs[ubatch],
+        split.world * width,
         split.rank * width,
         width,
         BLOCK=_PUSH_BLOCK,
     )
-    buf.handle.barrier()
-    return buf.storage[: split.num_local * all_heads * dim].view(
-        split.num_local, all_heads, dim
-    )
+    _workspace.handle.barrier(channel=ubatch)
+    # Views the buffer, which the next exchange reuses.
+    return decode_q, storage[ubatch, : split.num_local]
+
+
+def _unshard(
+    x: torch.Tensor, split: ShardQSplit, decode_x: torch.Tensor | None, name: str
+) -> torch.Tensor:
+    """[T_rank, world * H, ...] token shard -> [T, H, ...] head shards, after
+    the ``decode_x`` rows."""
+    assert x[0].is_contiguous()
+    row_shape = (x.shape[1] // split.world, *x.shape[2:])
+    num_rows = split.num_decode_tokens + sum(split.counts)
+    if _workspace is None:
+        # One block of heads per destination rank.
+        send = torch.stack(x.chunk(split.world, dim=1))
+        recv = x.new_empty((sum(split.counts), *row_shape))
+        _all_to_all(send, recv, None, split.counts)
+        restored = x.new_empty((num_rows, *row_shape))
+        restored[split.num_decode_tokens :].index_copy_(0, split.rank_order, recv)
+    else:
+        storage, peer_ptrs = _workspace.buffers[name]
+        assert storage.shape[2:] == row_shape
+        ubatch = dbo_current_ubatch_id()
+        width = math.prod(row_shape)
+        _workspace.handle.barrier(channel=ubatch)
+        _unshard_out_kernel[
+            (split.num_local * split.world, triton.cdiv(width, _PUSH_BLOCK))
+        ](
+            x,
+            x.stride(0),
+            split.local_idx,
+            peer_ptrs[ubatch],
+            split.num_decode_tokens,
+            split.world,
+            width,
+            BLOCK=_PUSH_BLOCK,
+        )
+        _workspace.handle.barrier(channel=ubatch)
+        # Views the buffer, which the next exchange reuses.
+        restored = storage[ubatch, :num_rows]
+    if decode_x is not None:
+        restored[: split.num_decode_tokens] = decode_x
+    return restored
 
 
 def unshard_out(
     out: torch.Tensor,
+    lse: torch.Tensor | None,
     split: ShardQSplit,
-    group: dist.ProcessGroup | None = None,
-    use_sm: bool | None = None,
-    num_leading_rows: int = 0,
-) -> torch.Tensor:
-    """[T_rank, world * H_local, D] token shard -> [T, H_local, D] head shards.
-
-    The result has ``num_leading_rows`` uninitialized rows before the T
-    restored ones, for a mixed step's decode output to fill without copying
-    the prefill rows again. The symmetric-memory result views a buffer that
-    the next call reuses.
-    """
-    _, all_heads, dim = out.shape
-    heads = all_heads // split.world
-    assert out.stride(2) == 1 and out.stride(1) == dim
-    if use_sm is None:
-        use_sm = _use_sm(group)
-    group = group or get_tp_group().device_group
-    num_tokens = sum(split.counts)
-    if not use_sm:
-        send = (
-            out.view(split.num_local, split.world, heads, dim)
-            .transpose(0, 1)
-            .reshape(split.world * split.num_local, heads, dim)
-        )
-        recv = out.new_empty((num_tokens, heads, dim))
-        dist.all_to_all_single(
-            recv,
-            send,
-            output_split_sizes=split.counts,
-            input_split_sizes=[split.num_local] * split.world,
-            group=group,
-        )
-        restored = recv.new_empty((num_leading_rows + num_tokens, heads, dim))
-        restored[num_leading_rows:].index_copy_(0, split.rank_order, recv)
-        return restored
-    num_rows = num_leading_rows + num_tokens
-    buf = _symm_buffer(group, "out", num_rows * heads * dim, out.dtype, out.device)
-    width = heads * dim
-    buf.handle.barrier()
-    _unshard_out_kernel[
-        (split.num_local * split.world, triton.cdiv(width, _PUSH_BLOCK))
-    ](
-        out,
-        out.stride(0),
-        split.local_idx,
-        buf.peer_ptrs,
-        num_leading_rows,
-        split.world,
-        width,
-        BLOCK=_PUSH_BLOCK,
-    )
-    buf.handle.barrier()
-    return buf.storage[: num_rows * heads * dim].view(num_rows, heads, dim)
+    decode_out: torch.Tensor | None,
+    decode_lse: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """This rank's token shard of the attention output [T_rank, world * H, D]
+    and LSE [T_rank, world * H] -> [T, H, D] and [T, H] head shards, after the
+    head-sharded decode rows."""
+    out = _unshard(out, split, decode_out, "out")
+    if lse is not None:
+        lse = _unshard(lse, split, decode_lse, "lse")
+    return out, lse
