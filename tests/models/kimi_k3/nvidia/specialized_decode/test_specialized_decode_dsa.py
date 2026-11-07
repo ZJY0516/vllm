@@ -1879,9 +1879,14 @@ def layer_config(core, q, world=1, index_dtype="mxfp4"):
         config.kernel_config.flashinfer_sparse_mla_kernel = kernel
     if q > 1:  # DSpark verify: the indexer's decode rows take q tokens
         config.speculative_config = SimpleNamespace(
+            method="dspark",
             num_speculative_tokens=q - 1,
             enable_adaptive_verification=False,
             parallel_drafting=False,
+            # Read by the V2 model runner: VllmConfig's check (any speculator
+            # class) and the decode query length (DSpark appends no slots).
+            speculator_config=SimpleNamespace(speculator_class=object),
+            max_num_new_slots_for_drafting=0,
         )
     return config
 
