@@ -9,6 +9,7 @@ import math
 import queue
 import sys
 import threading
+import time
 import types
 from collections.abc import Callable
 from dataclasses import replace
@@ -1351,6 +1352,171 @@ def test_partial_tail_offload_writes_each_local_store_shard(chunk_size):
                 )
             )
     assert attention_puts == expected
+
+
+@pytest.fixture
+def _idle_tail_collector(monkeypatch):
+    """Keep the collector thread idle so tests sweep it on their own clock."""
+    monkeypatch.setattr(
+        mooncake_store_worker._ConsumedTailCollector, "_run", lambda self: None
+    )
+
+
+def _make_page_db(chunk_size: int = 16) -> ChunkedTokenDatabase:
+    db = ChunkedTokenDatabase(
+        KeyMetadata("test-model", 0, 0, 0, 0),
+        chunk_size=chunk_size,
+        hash_block_size=4,
+    )
+    db.set_kv_caches_base_addr([0x1000])
+    db.set_block_len([256])
+    return db
+
+
+@pytest.mark.parametrize("attention_chunk_size", [4, 16])
+def test_superseding_job_removes_the_consumed_tail_keys(
+    attention_chunk_size, _idle_tail_collector
+):
+    """A chunk-aligned attention tail key also names a full chunk of longer
+    prefixes, so only tail keys that end mid-chunk are removed."""
+    store = MagicMock()
+    stored: set[str] = set()
+    store.batch_is_exist.side_effect = lambda keys: [int(k in stored) for k in keys]
+
+    def put(keys, *args):
+        stored.update(keys)
+        return [256] * len(keys)
+
+    store.batch_put_from_multi_buffers.side_effect = put
+    store.batch_remove.side_effect = lambda keys: [0] * len(keys)
+    thread = _make_partial_tail_send_thread(store)
+    thread.token_databases[0] = _make_page_db(attention_chunk_size)
+
+    # The previous turn stored its prompt tail at 12 tokens.
+    assert thread._maybe_offload_boundary_states(
+        _resolve_partial_tail(thread, _make_partial_tail_req([1, 2, 3]))
+    )
+    tail_keys = [db.store_layout.key_for(0, b"a2") for db in thread.token_databases]
+    assert set(tail_keys) <= stored
+
+    # This turn loaded that tail and stores its own at 20 tokens.
+    req = ReqMeta(
+        req_id="req-a",
+        token_len_chunk=0,
+        block_ids=([1, 2, 3, 4, 5], [1]),
+        block_hashes=[b"a0", b"a1", b"a2", b"a3", b"a4"],
+        can_save=True,
+        boundary_puts=[(1, 8, 20)],
+        num_prompt_tokens=21,
+        completed_token_len=21,
+        remove_tail_keys=[(0, 12), (1, 12)],
+    )
+    _run_store_req(thread, _resolve_partial_tail(thread, req))
+    collector = thread._tail_collector
+    collector.remove_due(time.monotonic() + collector.delay_s)
+
+    expected = tail_keys if attention_chunk_size == 16 else tail_keys[1:]
+    store.batch_remove.assert_called_once_with(expected)
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_each_rank_removes_only_the_tail_keys_it_put(tp_rank):
+    thread = _make_partial_tail_send_thread(MagicMock())
+    thread.tp_rank = tp_rank
+    thread.group_put_steps = [2, 2]
+    thread.token_databases[0] = _make_page_db()
+    previous = _resolve_partial_tail(thread, _make_partial_tail_req([1, 2, 3]))
+    put_keys = [key for key, *_ in thread._boundary_puts(previous)]
+
+    removed = thread._superseded_tail_keys(
+        replace(previous, remove_tail_keys=[(0, 12), (1, 12)])
+    )
+
+    # The two single-chunk tails are striped across the two ranks.
+    assert len(put_keys) == 1
+    assert removed == put_keys
+
+
+def test_tail_collector_retries_leased_keys_without_force(_idle_tail_collector):
+    leased = {"k2", "k3"}
+    store = MagicMock(spec=["batch_remove"])
+    store.batch_remove.side_effect = lambda keys: [
+        -1 if key in leased else 0 for key in keys
+    ]
+    ops = []
+    collector = mooncake_store_worker._ConsumedTailCollector(
+        store,
+        lambda op, start, num_keys, **kw: ops.append(
+            (op, num_keys, kw["status"], kw["num_failed_keys"])
+        ),
+        delay_s=65.0,
+    )
+    t0 = time.monotonic()
+    collector.add(["k1", "k2", "k3"])
+
+    collector.remove_due(t0 + 64.0)
+    assert not store.batch_remove.called
+    collector.remove_due(t0 + 66.0)
+    leased.discard("k2")
+    for attempt in range(1, collector.MAX_ATTEMPTS + 1):
+        collector.remove_due(t0 + 66.0 + attempt * (collector.RETRY_INTERVAL_S + 1))
+
+    # k3 stays leased and is given up after MAX_ATTEMPTS tries.
+    assert [c.args[0] for c in store.batch_remove.call_args_list] == [
+        ["k1", "k2", "k3"],
+        ["k2", "k3"],
+        ["k3"],
+        ["k3"],
+    ]
+    assert all(not c.kwargs for c in store.batch_remove.call_args_list)
+    assert ops == [
+        ("tail_remove", 3, "partial_failure", 2),
+        ("tail_remove", 2, "partial_failure", 1),
+        ("tail_remove", 1, "partial_failure", 1),
+        ("tail_remove", 1, "partial_failure", 1),
+    ]
+
+
+def test_tail_collector_falls_back_to_single_key_remove(_idle_tail_collector):
+    store = MagicMock(spec=["remove"])
+    store.remove.return_value = 0
+    ops = []
+    collector = mooncake_store_worker._ConsumedTailCollector(
+        store, lambda op, start, num_keys, **kw: ops.append(kw["status"]), 0.0
+    )
+    collector.add(["k1", "k2"])
+
+    collector.remove_due(time.monotonic())
+
+    assert [c.args for c in store.remove.call_args_list] == [("k1",), ("k2",)]
+    assert all(not c.kwargs for c in store.remove.call_args_list)
+    assert ops == ["ok"]
+
+
+def test_tail_collector_survives_a_failed_sweep_and_stops_on_close():
+    swept = threading.Semaphore(0)
+
+    def record(op, start, num_keys, **kw):
+        swept.release()
+        raise RuntimeError("stats sink failed")
+
+    store = MagicMock(spec=["batch_remove"])
+    store.batch_remove.side_effect = lambda keys: [0] * len(keys)
+    collector = mooncake_store_worker._ConsumedTailCollector(store, record, 0.0)
+    collector.POLL_INTERVAL_S = 0.01
+
+    collector.add(["k1"])
+    assert swept.acquire(timeout=5)
+    collector.add(["k2"])
+    assert swept.acquire(timeout=5)
+
+    collector.close()
+    assert not collector._thread.is_alive()
+    collector.add(["k3"])
+    assert [c.args for c in store.batch_remove.call_args_list] == [
+        (["k1"],),
+        (["k2"],),
+    ]
 
 
 def test_store_sending_thread_skips_null_sparse_group_blocks():

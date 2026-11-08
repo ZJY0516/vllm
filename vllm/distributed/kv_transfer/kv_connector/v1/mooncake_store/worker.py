@@ -18,7 +18,7 @@ import queue
 import socket
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
@@ -526,6 +526,107 @@ class KVTransferThread(threading.Thread):
         return events
 
 
+class _ConsumedTailCollector:
+    """Removes superseded partial-tail keys after a delay.
+
+    The delay outlasts the master's KV lease TTL, so readers that leased a key
+    while it was live finish first. Removal is never forced: the master refuses
+    a key that is still leased, and such keys are retried later.
+    """
+
+    RETRY_INTERVAL_S = 30.0
+    MAX_ATTEMPTS = 4
+    POLL_INTERVAL_S = 1.0
+
+    def __init__(
+        self,
+        store: Any,
+        record_operation: Callable[..., None],
+        delay_s: float,
+    ):
+        self.store = store
+        self._record_operation = record_operation
+        self.delay_s = delay_s
+        self._lock = threading.Lock()
+        # (due time, key, attempts made)
+        self._pending: list[tuple[float, str, int]] = []
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def add(self, keys: list[str]) -> None:
+        due = time.monotonic() + self.delay_s
+        with self._lock:
+            if self._stop.is_set():
+                return
+            self._pending.extend((due, key, 0) for key in keys)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, daemon=True, name="MooncakeTailCollector"
+                )
+                self._thread.start()
+
+    def close(self) -> None:
+        """Stop before the store closes; pending keys are left to eviction."""
+        with self._lock:
+            self._stop.set()
+            self._pending.clear()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.POLL_INTERVAL_S):
+            try:
+                self.remove_due(time.monotonic())
+            except Exception:
+                logger.exception("Mooncake tail collector sweep failed")
+
+    def remove_due(self, now: float) -> None:
+        """Remove every key due by ``now``; requeue failures for a retry."""
+        with self._lock:
+            due = [entry for entry in self._pending if entry[0] <= now]
+            if not due:
+                return
+            self._pending = [entry for entry in self._pending if entry[0] > now]
+        attempts: dict[str, int] = {}
+        for _, key, made in due:
+            attempts[key] = max(attempts.get(key, 0), made + 1)
+        keys = list(attempts)
+        status = "ok"
+        start = time.perf_counter()
+        try:
+            if hasattr(self.store, "batch_remove"):
+                results = list(self.store.batch_remove(keys))
+            else:
+                results = [self.store.remove(key) for key in keys]
+        except Exception as e:
+            logger.warning("Failed to remove superseded tail keys: %s", e)
+            results = [-1] * len(keys)
+            status = "error"
+        if len(results) != len(keys):
+            results = [-1] * len(keys)
+            status = "error"
+        failed = [key for key, res in zip(keys, results) if res != 0]
+        if failed and status == "ok":
+            status = "partial_failure"
+        self._record_operation(
+            "tail_remove",
+            start,
+            len(keys),
+            status=status,
+            num_failed_keys=len(failed),
+        )
+        retry_at = now + self.RETRY_INTERVAL_S
+        retry = [
+            (retry_at, key, attempts[key])
+            for key in failed
+            if attempts[key] < self.MAX_ATTEMPTS
+        ]
+        if retry:
+            with self._lock:
+                self._pending.extend(retry)
+
+
 class KVCacheStoreSendingThread(KVTransferThread):
     """Background thread for storing KV cache blocks to the store."""
 
@@ -590,6 +691,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # Retained only after a failed store so retry events can recover the
         # token suffix without full snapshots on the normal path.
         self._retry_token_ids: dict[str, tuple[int, list[int]]] = {}
+        self._tail_collector = _ConsumedTailCollector(
+            store, self._record_operation, envs.VLLM_MOONCAKE_TAIL_GC_DELAY_S
+        )
 
     def add_request(self, request: ReqMeta) -> None:
         # Register before enqueueing so a job is never picked up unledgered.
@@ -701,6 +805,32 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._skip_store_requests.clear()
         return True
 
+    def _boundary_chunks(
+        self, group_id: int, num_tokens: int, block_hashes: Sequence[BlockHash]
+    ) -> Iterator[tuple[int, int, int, BlockHash]]:
+        """Yield ``(block_start, start, end, key_hash)`` for each Store chunk
+        this rank writes for the group's block ending at ``num_tokens``."""
+        if not self.group_participates[group_id] or num_tokens == 0:
+            return
+        hash_block_size = self.coord.hash_block_size
+        assert num_tokens % hash_block_size == 0, (
+            f"Boundary put at {num_tokens} tokens is not a multiple of the "
+            f"hash block size {hash_block_size}"
+        )
+        if num_tokens // hash_block_size > len(block_hashes):
+            return
+        db = self.token_databases[group_id]
+        # Distribute across ranks by the same rule as normal chunks.
+        put_step = self.group_put_steps[group_id]
+        put_step_rank = (self.tp_rank + group_id) % put_step
+        block_size = db.store_layout.block_size
+        block_start = (cdiv(num_tokens, block_size) - 1) * block_size
+        for start in range(block_start, num_tokens, db.chunk_size):
+            if start // db.chunk_size % put_step != put_step_rank:
+                continue
+            end = min(start + db.chunk_size, num_tokens)
+            yield block_start, start, end, block_hashes[end // hash_block_size - 1]
+
     def _boundary_puts(
         self, req_meta: ReqMeta
     ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
@@ -709,34 +839,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
         Attention pages may contain several chunks. Mamba entries retain the
         exact handed-off state block under its checkpoint hash.
         """
-        hash_block_size = self.coord.hash_block_size
         puts: list[tuple[str, list[int], list[int], KeyMetadata]] = []
         for group_id, block_id, num_tokens in req_meta.boundary_puts or []:
-            if (
-                not self.group_participates[group_id]
-                or num_tokens == 0
-                or block_id == NULL_BLOCK_ID
-            ):
-                continue
-            assert num_tokens % hash_block_size == 0, (
-                f"Boundary put at {num_tokens} tokens is not a multiple of the "
-                f"hash block size {hash_block_size}"
-            )
-            hash_idx = num_tokens // hash_block_size - 1
-            if hash_idx >= len(req_meta.block_hashes):
+            if block_id == NULL_BLOCK_ID:
                 continue
             db = self.token_databases[group_id]
-            # Distribute across ranks by the same rule as normal chunks.
-            put_step = self.group_put_steps[group_id]
-            put_step_rank = (self.tp_rank + group_id) % put_step
             shard_ids = db.store_layout.local_shard_ids
-            block_size = db.store_layout.block_size
-            block_start = (cdiv(num_tokens, block_size) - 1) * block_size
-            for start in range(block_start, num_tokens, db.chunk_size):
-                if start // db.chunk_size % put_step != put_step_rank:
-                    continue
-                end = min(start + db.chunk_size, num_tokens)
-                key_hash = req_meta.block_hashes[end // hash_block_size - 1]
+            for block_start, start, end, key_hash in self._boundary_chunks(
+                group_id, num_tokens, req_meta.block_hashes
+            ):
                 addrs, sizes, _ = db.store_layout.prepare_values(
                     [(start - block_start, end - block_start)] * len(shard_ids),
                     [block_id],
@@ -788,6 +899,31 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
             return None
         return results
+
+    def _superseded_tail_keys(self, req_meta: ReqMeta) -> list[str]:
+        """This rank's Store keys of the tails listed in ``remove_tail_keys``.
+
+        Keys are built as ``_boundary_puts`` built them. Only a tail's final
+        chunk qualifies, and only when it ends off a chunk boundary: any other
+        chunk key also names a full chunk of every longer prefix.
+        """
+        if not req_meta.remove_tail_keys:
+            return []
+        hash_block_size = self.coord.hash_block_size
+        keys: list[str] = []
+        for group_id, num_tokens in req_meta.remove_tail_keys:
+            db = self.token_databases[group_id]
+            if num_tokens % hash_block_size or num_tokens % db.chunk_size == 0:
+                continue
+            for _, _, end, key_hash in self._boundary_chunks(
+                group_id, num_tokens, req_meta.block_hashes
+            ):
+                if end == num_tokens:
+                    keys.extend(
+                        db.store_layout.key_for(shard_id, key_hash)
+                        for shard_id in db.store_layout.local_shard_ids
+                    )
+        return keys
 
     def _maybe_offload_boundary_states(self, req_meta: ReqMeta) -> bool:
         """Persist this job's boundary puts, deduped against the store.
@@ -927,6 +1063,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             # normal positional save, which may be skipped this step).
             if not self._maybe_offload_boundary_states(req_meta):
                 return
+            if tail_keys := self._superseded_tail_keys(req_meta):
+                self._tail_collector.add(tail_keys)
 
             save_start = self._saved_offset.get(req_id, 0)
             if checkpoint_len <= save_start:
@@ -2734,6 +2872,9 @@ class MooncakeStoreWorker:
         if store is None:
             return
         self.store = None
+        tail_collector = getattr(self.kv_send_thread, "_tail_collector", None)
+        if tail_collector is not None:
+            tail_collector.close()
         deadline = time.monotonic() + 5.0
         for thread in (self.kv_send_thread, *self.kv_recv_threads):
             if thread is None:

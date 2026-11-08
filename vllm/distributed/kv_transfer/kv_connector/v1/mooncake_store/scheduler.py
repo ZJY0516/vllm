@@ -5,8 +5,10 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+from collections import OrderedDict
 from collections.abc import Sequence
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -43,6 +45,9 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+# Upper bound on requests tracked for consumed partial-tail keys.
+_MAX_CONSUMED_TAIL_REQS = 65536
 
 
 def _partial_tail_non_mamba_puts(
@@ -201,6 +206,10 @@ class MooncakeStoreScheduler:
         self._unfinished_request_ids: set[str] = set()
         self._finished_partial_tail_metas: dict[str, ReqMeta] = {}
         self._finished_lookahead_metas: dict[str, ReqMeta] = {}
+        # req_id -> (group_id, boundary_tokens) of the partial-tail keys its
+        # load read, kept until the request stores a longer tail of its own.
+        self._drop_consumed_tails = envs.VLLM_MOONCAKE_STORE_DROP_CONSUMED_TAILS
+        self._consumed_tails: OrderedDict[str, list[tuple[int, int]]] = OrderedDict()
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
@@ -331,6 +340,7 @@ class MooncakeStoreScheduler:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
             self._unfinished_request_ids.discard(finished_req_id)
+            self._consumed_tails.pop(finished_req_id, None)
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
@@ -341,6 +351,7 @@ class MooncakeStoreScheduler:
             self.load_specs.pop(req_id, None)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
+            self._consumed_tails.pop(req_id, None)
 
         meta = MooncakeStoreConnectorMetadata(
             self._unfinished_request_ids,
@@ -505,7 +516,69 @@ class MooncakeStoreScheduler:
 
         if not self._capacity_only:
             self._reference_save_blocks(meta.requests)
+            if self._drop_consumed_tails:
+                self._note_consumed_tails(meta.requests)
+                self._attach_consumed_tail_removals(meta.requests)
         return meta
+
+    def _note_consumed_tails(self, requests: list[ReqMeta]) -> None:
+        """Record the partial-tail keys each issued load reads.
+
+        A key at an LCM-aligned boundary ends a full page that longer prefixes
+        share, so only keys at a non-aligned boundary are recorded.
+        """
+        coord = self._store_coord
+        assert coord is not None
+        lcm_block_size = coord.lcm_block_size
+        for req_meta in requests:
+            if req_meta.load_spec is None:
+                continue
+            tails = [
+                (boundary.group_id, boundary.num_tokens)
+                for boundary in req_meta.load_spec.tail_key_boundaries
+                if boundary.num_tokens % lcm_block_size
+            ]
+            if not tails:
+                continue
+            self._consumed_tails[req_meta.req_id] = tails
+            self._consumed_tails.move_to_end(req_meta.req_id)
+            if len(self._consumed_tails) > _MAX_CONSUMED_TAIL_REQS:
+                self._consumed_tails.popitem(last=False)
+
+    def _attach_consumed_tail_removals(self, requests: list[ReqMeta]) -> None:
+        """Hand each consumed tail to the store job that supersedes it.
+
+        That is the request's first job whose boundary puts store a non-aligned,
+        non-Mamba tail; it removes the consumed tails that end before it.
+        """
+        if not self._consumed_tails:
+            return
+        coord = self._store_coord
+        assert coord is not None
+        lcm_block_size = coord.lcm_block_size
+        margins = coord.eagle_proof_margin_by_group
+        for req_meta in requests:
+            consumed = self._consumed_tails.get(req_meta.req_id)
+            if consumed is None or not req_meta.can_save:
+                continue
+            # Attention tail puts end at the checkpoint plus the group's EAGLE
+            # proof margin; compare with the checkpoint itself, so a repeat of
+            # the same prompt keeps the checkpoint it loaded.
+            new_tail = max(
+                (
+                    put.num_tokens - margins.get(put.group_id, 0)
+                    for put in req_meta.boundary_puts or ()
+                    if put.group_id not in self._boundary_state_group_ids
+                    and put.num_tokens % lcm_block_size
+                ),
+                default=0,
+            )
+            if new_tail <= 0:
+                continue
+            del self._consumed_tails[req_meta.req_id]
+            superseded = [(g, b) for g, b in consumed if b < new_tail]
+            if superseded:
+                req_meta.remove_tail_keys = superseded
 
     def _apply_current_save_block_ids(
         self,
@@ -694,6 +767,9 @@ class MooncakeStoreScheduler:
         pool.touch([pool.blocks[block_id] for block_id in pinned_block_ids])
 
         req_meta.store_job_id = store_job_id
+        if self._drop_consumed_tails:
+            # The request's bookkeeping is dropped before this job is emitted.
+            self._attach_consumed_tail_removals([req_meta])
         self._finished_partial_tail_metas[request.request_id] = req_meta
         tracker.has_pending_offload = True
         # The store job owns exact block refs, so request cleanup need not wait.

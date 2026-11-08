@@ -328,6 +328,8 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 | `MOONCAKE_REQUESTER_LOCAL_HOSTNAME` | Override the hostname the vLLM rank registers with Mooncake as a requester. Defaults to the rank's resolved IP. | — |
 | `VLLM_MOONCAKE_STORE_TIER_LOG` | When `1`, logs a per-batch tier summary (memory vs disk hits) for observability | disabled |
 | `VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO` | Fraction of the owner's DirectIO staging buffer that the requester will fill in a single `batch_get_into_multi_buffers` call. Lower → more conservative pre-split, more round trips. | 0.9 |
+| `VLLM_MOONCAKE_STORE_DROP_CONSUMED_TAILS` | When `1`, a request removes the partial-tail keys it loaded once it has stored its own longer tail, so dead tails do not wait for eviction | disabled |
+| `VLLM_MOONCAKE_TAIL_GC_DELAY_S` | Delay before those keys are removed; keep it above the master's KV lease TTL | 65 |
 
 ## KV Transfer Config
 

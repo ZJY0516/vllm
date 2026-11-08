@@ -252,6 +252,8 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_STORE_SELECTIVE_LEASE: bool = False
+    VLLM_MOONCAKE_STORE_DROP_CONSUMED_TAILS: bool = False
+    VLLM_MOONCAKE_TAIL_GC_DELAY_S: float = 65.0
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
     MOONCAKE_PREFERRED_SEGMENT: str | None = None
@@ -1891,6 +1893,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOONCAKE_STORE_SELECTIVE_LEASE": lambda: (
         os.getenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "False").lower()
         in ("true", "1")
+    ),
+    # Remove a partial-tail key that a request loaded once the request stores
+    # its own, longer tail. Each multi-turn prompt then keeps one tail in the
+    # store instead of one per turn.
+    "VLLM_MOONCAKE_STORE_DROP_CONSUMED_TAILS": lambda: (
+        os.getenv("VLLM_MOONCAKE_STORE_DROP_CONSUMED_TAILS", "False").lower()
+        in ("true", "1")
+    ),
+    # Seconds to wait before removing a superseded tail key. Keep it above the
+    # Mooncake master's KV lease TTL so readers that leased the key finish first.
+    "VLLM_MOONCAKE_TAIL_GC_DELAY_S": lambda: float(
+        os.getenv("VLLM_MOONCAKE_TAIL_GC_DELAY_S", "65")
     ),
     # Number of parallel KV-load receive threads per worker rank. Lets the
     # per-request control overhead (Python prep + master key lookup) of one

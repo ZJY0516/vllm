@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.data import (
     MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
+    TailKeyBoundary,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.scheduler import (
     MooncakeStoreScheduler,
@@ -43,6 +45,7 @@ def _make_bare_scheduler(
     enable_partial_hash_hits: bool = False,
     kv_role: str = "kv_both",
     save_decode_cache: bool = False,
+    drop_consumed_tails: bool = False,
 ) -> MooncakeStoreScheduler:
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = kv_role
@@ -64,6 +67,8 @@ def _make_bare_scheduler(
     scheduler._request_trackers = {}
     scheduler._finished_partial_tail_metas = {}
     scheduler._finished_lookahead_metas = {}
+    scheduler._drop_consumed_tails = drop_consumed_tails
+    scheduler._consumed_tails = OrderedDict()
     scheduler._gpu_block_pool = BlockPool(
         num_gpu_blocks=64, enable_caching=True, hash_block_size=hash_block_size
     )
@@ -1971,3 +1976,161 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+def _load_tails_then_hand_off(
+    scheduler: MooncakeStoreScheduler,
+    tail_key_boundaries: tuple[TailKeyBoundary, ...],
+    offloads: list[tuple[int, int, int]],
+) -> ReqMeta:
+    """Load a 45-token prompt's hit with ``tail_key_boundaries``, then hand off
+    ``offloads`` once the prompt is computed. Returns the hand-off store job."""
+    _make_pending_load_unfinished_request(
+        scheduler,
+        num_tokens=45,
+        block_hashes=[bytes([i]) for i in range(11)],
+        block_ids=([5, 6, 7],),
+    )
+    scheduler.load_specs["req-0"] = LoadSpec(
+        vllm_cached_tokens=0,
+        kvpool_cached_tokens=24,
+        can_load=True,
+        tail_key_boundaries=tail_key_boundaries,
+    )
+    load_meta = scheduler.build_connector_meta(_make_pending_load_scheduler_output())
+    assert load_meta.requests[0].load_spec is not None
+
+    _register_offload_request(scheduler, prefill_end_tokens=45, num_prompt_tokens=45)
+    meta = scheduler.build_connector_meta(
+        _make_offload_only_output(offloads, block_ids=([5, 6, 7],))
+    )
+    assert len(meta.requests) == 1
+    return meta.requests[0]
+
+
+def test_superseding_tail_job_removes_the_consumed_tails():
+    scheduler = _make_bare_scheduler(
+        hash_block_size=4, enable_partial_hash_hits=True, drop_consumed_tails=True
+    )
+    consumed = (TailKeyBoundary(0, 24), TailKeyBoundary(1, 24))
+
+    req_meta = _load_tails_then_hand_off(scheduler, consumed, [(1, 9, 44)])
+
+    # The prompt checkpoint at 44 publishes the attention tail with the state.
+    assert req_meta.boundary_puts == [(0, 7, 44), (1, 9, 44)]
+    assert req_meta.remove_tail_keys == [(0, 24), (1, 24)]
+
+    # The consumed tails are handed to exactly one job.
+    meta = scheduler.build_connector_meta(
+        _make_offload_only_output([(1, 9, 44)], block_ids=([5, 6, 7],))
+    )
+    assert meta.requests[0].remove_tail_keys is None
+
+
+@pytest.mark.parametrize(
+    "drop_consumed_tails, consumed",
+    [
+        # Disabled by default.
+        (False, (TailKeyBoundary(0, 24), TailKeyBoundary(1, 24))),
+        # LCM-aligned keys are full pages that longer prefixes share.
+        (True, (TailKeyBoundary(0, 32), TailKeyBoundary(1, 32))),
+        # A tail at the new tail's own boundary is not superseded.
+        (True, (TailKeyBoundary(0, 44), TailKeyBoundary(1, 44))),
+    ],
+)
+def test_consumed_tails_are_kept_unless_superseded(drop_consumed_tails, consumed):
+    scheduler = _make_bare_scheduler(
+        hash_block_size=4,
+        enable_partial_hash_hits=True,
+        drop_consumed_tails=drop_consumed_tails,
+    )
+
+    req_meta = _load_tails_then_hand_off(scheduler, consumed, [(1, 9, 44)])
+
+    assert req_meta.boundary_puts == [(0, 7, 44), (1, 9, 44)]
+    assert req_meta.remove_tail_keys is None
+
+
+@pytest.mark.parametrize(
+    "consumed, removed",
+    [
+        # A repeat of the same prompt loaded the checkpoint it stores again.
+        ((TailKeyBoundary(0, 44), TailKeyBoundary(1, 44)), None),
+        # An earlier turn's tail is superseded.
+        ((TailKeyBoundary(0, 24), TailKeyBoundary(1, 24)), [(0, 24), (1, 24)]),
+    ],
+)
+def test_eagle_proof_margin_does_not_supersede_the_same_checkpoint(consumed, removed):
+    """Attention tail puts end at the checkpoint plus the EAGLE proof margin,
+    while the Mamba state sits at the checkpoint itself."""
+    scheduler = _make_bare_scheduler(
+        hash_block_size=4, enable_partial_hash_hits=True, drop_consumed_tails=True
+    )
+    scheduler._store_coord.eagle_proof_margin_by_group = {0: 1}
+
+    req_meta = _load_tails_then_hand_off(scheduler, consumed, [(1, 9, 44)])
+
+    assert req_meta.boundary_puts == [(0, 7, 45), (1, 9, 44)]
+    assert req_meta.remove_tail_keys == removed
+
+
+def test_mamba_only_handoff_defers_removal_to_the_attention_tail():
+    """A shared-prefix junction hands off only a Mamba state, which does not
+    supersede the loaded tail; the later prompt-tail job does."""
+    scheduler = _make_bare_scheduler(
+        hash_block_size=4, enable_partial_hash_hits=True, drop_consumed_tails=True
+    )
+    consumed = (TailKeyBoundary(0, 24), TailKeyBoundary(1, 24))
+
+    junction = _load_tails_then_hand_off(scheduler, consumed, [(1, 9, 40)])
+    assert junction.boundary_puts == [(1, 9, 40)]
+    assert junction.remove_tail_keys is None
+
+    meta = scheduler.build_connector_meta(
+        _make_offload_only_output([(1, 11, 44)], block_ids=([5, 6, 7],))
+    )
+    assert meta.requests[0].boundary_puts == [(0, 7, 44), (1, 11, 44)]
+    assert meta.requests[0].remove_tail_keys == [(0, 24), (1, 24)]
+
+
+def test_finish_time_tail_removes_the_consumed_tails():
+    """The finish-time tail job is emitted after the request's bookkeeping is
+    dropped, so the removal is attached when the job is registered."""
+    scheduler = _make_bare_scheduler(
+        hash_block_size=4, enable_partial_hash_hits=True, drop_consumed_tails=True
+    )
+    scheduler._store_group_ids = (0, 1)
+    _make_pending_load_unfinished_request(
+        scheduler,
+        num_tokens=45,
+        block_hashes=[bytes([i]) for i in range(11)],
+        block_ids=([1, 2, 3], [50]),
+    )
+    scheduler.load_specs["req-0"] = LoadSpec(
+        vllm_cached_tokens=0,
+        kvpool_cached_tokens=24,
+        can_load=True,
+        tail_key_boundaries=(TailKeyBoundary(0, 24), TailKeyBoundary(1, 24)),
+    )
+    scheduler.build_connector_meta(_make_pending_load_scheduler_output())
+    request = SimpleNamespace(
+        request_id="req-0",
+        block_hashes=[bytes([i]) for i in range(11)],
+        num_computed_tokens=45,
+        num_prompt_tokens=45,
+    )
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        req_id="req-0",
+        token_len=45,
+        allocated_block_ids=([1, 2, 3], [50]),
+        prefill_end_tokens=45,
+    )
+
+    scheduler.register_finished_partial_tail(request, ([1, 2, 3], [50]), [(1, 50, 44)])
+    out = _make_pending_load_scheduler_output()
+    out.finished_req_ids = {"req-0"}
+    meta = scheduler.build_connector_meta(out)
+
+    assert len(meta.requests) == 1
+    assert meta.requests[0].boundary_puts == [(0, 3, 44), (1, 50, 44)]
+    assert meta.requests[0].remove_tail_keys == [(0, 24), (1, 24)]

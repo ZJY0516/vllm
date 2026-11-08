@@ -307,6 +307,10 @@ class ReqMeta:
     # Set on the save that first covers the whole prompt, so the scheduler
     # publishes the prompt's partial tail once rather than on every save.
     publish_partial_tail: bool = False
+    # (group_id, boundary_tokens) of partial-tail keys this request loaded and
+    # this job's boundary puts supersede. Each rank removes its own copies once
+    # those puts succeed.
+    remove_tail_keys: list[tuple[int, int]] | None = None
 
     @staticmethod
     def from_request_tracker(
