@@ -796,7 +796,9 @@ LOG2E = 1.4426950408889634
 #             merged causally (``dcp_causal_block_merge``).
 # Larger row counts keep "fold": on a graph padded past the live requests, its split
 # tiers spread a long context over more SMs than the native decode's split.
-CAUSAL_DCP_DECODE = {16: "1-35:native"}
+# DCP 8 runs "native" at every row count the path serves (ROWS_CAP): its "fold"
+# faults (illegal address) on the first replay of the 64-row draft graph.
+CAUSAL_DCP_DECODE = {16: "1-35:native", 8: "1-64:native"}
 
 
 def causal_dcp_decode(world: int, rows: int) -> str:
