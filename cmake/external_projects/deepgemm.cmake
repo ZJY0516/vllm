@@ -65,6 +65,29 @@ else()
     )
   endif()
   message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
+
+  # Local changes on top of the pinned commit, applied to the fetched tree only
+  # (a DEEPGEMM_SRC_DIR tree is used as is). A tree that already has a patch,
+  # such as a reused _deps checkout, is left alone.
+  #   deepgemm_mega_moe_situ_fixed_cost.patch: lower fixed per-call cost of the
+  #   FP8/FP4 SiTU Mega MoE kernel for decode-sized launches; outputs are
+  #   bitwise identical.
+  find_package(Git REQUIRED)
+  foreach(_dg_patch
+      "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm_mega_moe_situ_fixed_cost.patch")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_dg_patch}"
+      WORKING_DIRECTORY "${deepgemm_SOURCE_DIR}"
+      RESULT_VARIABLE _dg_patch_present
+      OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _dg_patch_present EQUAL 0)
+      message(STATUS "DeepGEMM: applying ${_dg_patch}")
+      execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply "${_dg_patch}"
+        WORKING_DIRECTORY "${deepgemm_SOURCE_DIR}"
+        COMMAND_ERROR_IS_FATAL ANY)
+    endif()
+  endforeach()
 endif()
 
 # DeepGEMM requires CUDA 12.3+ for SM90, 12.9+ for SM100 (official upstream),
