@@ -3,7 +3,7 @@
 """Kimi-K3.1 DSA indexer cache, shared by the NVIDIA and ROCm stacks."""
 
 import math
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 
 import torch
 
@@ -134,16 +134,27 @@ class KimiK3IndexerBackend(DeepseekV32IndexerBackend):
         # KDA state page sizes the whole block row rather than one MLA page.
         return (KVCacheLayout.BLHNC,)
 
-    @classmethod
-    def writes_kv_cache_from_block_table(cls) -> bool:
-        return True
-
     @staticmethod
     def get_builder_cls() -> type[KimiK3IndexerMetadataBuilder]:
         return KimiK3IndexerMetadataBuilder
 
 
+@dataclass(frozen=True, kw_only=True)
+class KimiK3IndexerSpec(MLAAttentionSpec):
+    """Keys are written at slots derived from the kernel block table."""
+
+    @property
+    def uses_slot_mapping(self) -> bool:
+        return False
+
+
 class KimiK3IndexerCache(DeepseekV32IndexerCache):
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KimiK3IndexerSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        return KimiK3IndexerSpec(
+            **{f.name: getattr(spec, f.name) for f in fields(spec) if f.init}
+        )
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return KimiK3IndexerBackend
 
