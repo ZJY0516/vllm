@@ -76,11 +76,15 @@ DEP_PROJECTION = {
     160: (128, 160, 1, 3),
     DEP_MAX_ROWS: None,
 }
+# o_proj 17-64 rows: 64-row weight tiles (112 CTAs on 152 SMs) stream the weight
+# at ~6.1-6.5 TB/s (GB300 cold L2, us: 20 rows 27.2 vs 30.6 at (128, 32, 1, 5);
+# 60 rows 29.0 vs 35.2 at (128, 64, 1, 4)); past 64 rows the 64-token tile streams
+# the weight twice and cuBLAS wins (80 rows 35.5 vs 37.6).
 DEP_OPROJ = {
     8: (64, 8, 1, 8),
     16: (128, 16, 1, 6),
-    32: (128, 32, 1, 5),
-    80: (128, 64, 1, 4),
+    32: (64, 32, 1, 8),
+    64: (64, 64, 1, 6),
     DEP_MAX_ROWS: None,
 }
 
