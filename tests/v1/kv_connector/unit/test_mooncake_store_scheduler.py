@@ -46,6 +46,7 @@ def _make_bare_scheduler(
     kv_role: str = "kv_both",
     save_decode_cache: bool = False,
     drop_consumed_tails: bool = False,
+    keep_loaded_tail: bool = False,
 ) -> MooncakeStoreScheduler:
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = kv_role
@@ -68,6 +69,7 @@ def _make_bare_scheduler(
     scheduler._finished_partial_tail_metas = {}
     scheduler._finished_lookahead_metas = {}
     scheduler._drop_consumed_tails = drop_consumed_tails
+    scheduler._keep_loaded_tail = keep_loaded_tail
     scheduler._consumed_tails = OrderedDict()
     scheduler._gpu_block_pool = BlockPool(
         num_gpu_blocks=64, enable_caching=True, hash_block_size=hash_block_size
@@ -1982,6 +1984,7 @@ def _load_tails_then_hand_off(
     scheduler: MooncakeStoreScheduler,
     tail_key_boundaries: tuple[TailKeyBoundary, ...],
     offloads: list[tuple[int, int, int]],
+    older_tail_boundaries: tuple[TailKeyBoundary, ...] = (),
 ) -> ReqMeta:
     """Load a 45-token prompt's hit with ``tail_key_boundaries``, then hand off
     ``offloads`` once the prompt is computed. Returns the hand-off store job."""
@@ -1996,6 +1999,7 @@ def _load_tails_then_hand_off(
         kvpool_cached_tokens=24,
         can_load=True,
         tail_key_boundaries=tail_key_boundaries,
+        older_tail_boundaries=older_tail_boundaries,
     )
     load_meta = scheduler.build_connector_meta(_make_pending_load_scheduler_output())
     assert load_meta.requests[0].load_spec is not None
@@ -2025,6 +2029,25 @@ def test_superseding_tail_job_removes_the_consumed_tails():
         _make_offload_only_output([(1, 9, 44)], block_ids=([5, 6, 7],))
     )
     assert meta.requests[0].remove_tail_keys is None
+
+
+def test_keep_loaded_tail_removes_only_older_tails():
+    scheduler = _make_bare_scheduler(
+        hash_block_size=4,
+        enable_partial_hash_hits=True,
+        drop_consumed_tails=True,
+        keep_loaded_tail=True,
+    )
+    loaded = (TailKeyBoundary(0, 24), TailKeyBoundary(1, 24))
+    older = (TailKeyBoundary(0, 12), TailKeyBoundary(1, 12), TailKeyBoundary(1, 20))
+
+    req_meta = _load_tails_then_hand_off(
+        scheduler, loaded, [(1, 9, 44)], older_tail_boundaries=older
+    )
+
+    # The tail this request loaded stays for a prompt that branches back to it.
+    assert req_meta.boundary_puts == [(0, 7, 44), (1, 9, 44)]
+    assert req_meta.remove_tail_keys == [(0, 12), (1, 12), (1, 20)]
 
 
 @pytest.mark.parametrize(

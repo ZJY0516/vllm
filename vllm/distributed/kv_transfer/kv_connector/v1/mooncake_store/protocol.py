@@ -18,7 +18,8 @@ Wire format (REQ/REP over IPC):
                    bytes); the server splits on hash_len
         Response: hit_length (u32 big-endian, first 4 bytes), followed by zero
                   or more 8-byte tail-key boundaries. Each entry is group_id
-                  (u32), then boundary_tokens (u32).
+                  (u32), then boundary_tokens (u32). `OLDER_TAIL_FLAG` set in
+                  group_id marks an older stored tail.
 
       msg_type == RESET_MSG:
           (no payload frames)
@@ -48,17 +49,23 @@ RESP_ERR: bytes = b"\x00"
 
 # group_id (u32), boundary_tokens (u32).
 TAIL_KEY_BOUNDARY_ENTRY_SIZE: int = 8
+# Set in group_id for `MooncakeLookupResult.older_tail_boundaries` entries.
+OLDER_TAIL_FLAG: int = 1 << 31
 
 
 def encode_lookup_response(result: MooncakeLookupResult) -> bytes:
     hit_length = result.hit_length.to_bytes(4, "big")
-    if not result.tail_key_boundaries:
+    if not result.tail_key_boundaries and not result.older_tail_boundaries:
         return hit_length
 
     payload = bytearray(hit_length)
-    for boundary in result.tail_key_boundaries:
-        payload.extend(boundary.group_id.to_bytes(4, "big"))
-        payload.extend(boundary.num_tokens.to_bytes(4, "big"))
+    for flag, boundaries in (
+        (0, result.tail_key_boundaries),
+        (OLDER_TAIL_FLAG, result.older_tail_boundaries),
+    ):
+        for boundary in boundaries:
+            payload.extend((boundary.group_id | flag).to_bytes(4, "big"))
+            payload.extend(boundary.num_tokens.to_bytes(4, "big"))
     return bytes(payload)
 
 
@@ -71,11 +78,12 @@ def decode_lookup_response(payload: bytes) -> MooncakeLookupResult:
         return MooncakeLookupResult(hit_length)
 
     boundaries = []
+    older = []
     for offset in range(4, len(payload), TAIL_KEY_BOUNDARY_ENTRY_SIZE):
-        boundaries.append(
-            TailKeyBoundary(
-                group_id=int.from_bytes(payload[offset : offset + 4], "big"),
-                num_tokens=int.from_bytes(payload[offset + 4 : offset + 8], "big"),
-            )
+        group_id = int.from_bytes(payload[offset : offset + 4], "big")
+        boundary = TailKeyBoundary(
+            group_id=group_id & ~OLDER_TAIL_FLAG,
+            num_tokens=int.from_bytes(payload[offset + 4 : offset + 8], "big"),
         )
-    return MooncakeLookupResult(hit_length, tuple(boundaries))
+        (older if group_id & OLDER_TAIL_FLAG else boundaries).append(boundary)
+    return MooncakeLookupResult(hit_length, tuple(boundaries), tuple(older))

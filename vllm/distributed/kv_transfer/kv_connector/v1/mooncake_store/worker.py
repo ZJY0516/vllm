@@ -1663,6 +1663,8 @@ class MooncakeStoreWorker:
     # Bare workers built with __new__ in tests read this default.
     _reuse_pd_transfer_engine: bool = False
 
+    _keep_loaded_tail = False
+
     @staticmethod
     def _create_mem_pool(
         extra_config: dict[str, Any], model_config: ModelConfig
@@ -1749,6 +1751,10 @@ class MooncakeStoreWorker:
             self.kv_role == "kv_consumer"
             and not extra_config.get("enable_lookup", True)
             and not self.can_put
+        )
+        self._keep_loaded_tail = (
+            envs.VLLM_MOONCAKE_STORE_DROP_CONSUMED_TAILS
+            and envs.VLLM_MOONCAKE_STORE_KEEP_LOADED_TAIL
         )
         self.cache_config = vllm_config.cache_config
         self._is_hma_required = len(kv_cache_config.kv_cache_groups) > 1
@@ -2733,6 +2739,7 @@ class MooncakeStoreWorker:
         # loaded has it (per-group count: sharded groups need every rank's
         # shard, replicated groups one namespace per unique KV head).
         exists_set = set()
+        present_tails: list[tuple[int, int]] = []
         pos = 0
         previous_page = None
         preceding_chunks_present = True
@@ -2749,19 +2756,44 @@ class MooncakeStoreWorker:
                 exists_set.add((g_idx, hash_bytes))
             if end_token % self.token_dbs[g_idx].chunk_size == 0:
                 preceding_chunks_present &= present
+            elif present and self._keep_loaded_tail:
+                present_tails.append((g_idx, end_token))
             pos += count
 
         hit, load_masks = self._longest_hit(
             num_tokens, token_len, block_hashes, exists_set
         )
-        if self._selective_lease is None:
-            return hit
-        return self._selective_lease.lease_hit(
-            block_hashes,
-            hit,
-            load_masks,
-            exists_set,
-            functools.partial(self._longest_hit, num_tokens, token_len, block_hashes),
+        if self._selective_lease is not None:
+            hit = self._selective_lease.lease_hit(
+                block_hashes,
+                hit,
+                load_masks,
+                exists_set,
+                functools.partial(
+                    self._longest_hit, num_tokens, token_len, block_hashes
+                ),
+            )
+        if present_tails and hit.hit_length > 0:
+            hit = dataclasses.replace(
+                hit,
+                older_tail_boundaries=self._older_tail_boundaries(hit, present_tails),
+            )
+        return hit
+
+    @staticmethod
+    def _older_tail_boundaries(
+        hit: MooncakeLookupResult, present_tails: list[tuple[int, int]]
+    ) -> tuple[TailKeyBoundary, ...]:
+        """Stored partial tails of this prompt that end before the loaded tail.
+
+        Each earlier turn of a conversation leaves one such tail. The loaded
+        tail itself is kept, so a later prompt that branches from it still hits.
+        """
+        loaded = {b.group_id: b.num_tokens for b in hit.tail_key_boundaries}
+        return tuple(
+            TailKeyBoundary(g_idx, end_token)
+            for g_idx, end_token in present_tails
+            if end_token < loaded.get(g_idx, hit.hit_length)
         )
 
     def _longest_hit(

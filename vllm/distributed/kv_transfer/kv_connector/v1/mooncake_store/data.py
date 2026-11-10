@@ -211,11 +211,15 @@ class MooncakeLookupResult:
         tail_key_boundaries: Hash boundary used to store each cache group's
             tail block when `hit_length` does not identify its store key.
             There is one entry per group for every nonzero hit.
+        older_tail_boundaries: Stored partial tails of the prompt that end
+            before the loaded tail of their group. Filled only when superseded
+            tails are removed with the loaded tail kept.
 
     """
 
     hit_length: int
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+    older_tail_boundaries: tuple[TailKeyBoundary, ...] = ()
 
 
 @dataclass
@@ -227,6 +231,7 @@ class LoadSpec:
     can_load: bool
     token_len: int = 0
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+    older_tail_boundaries: tuple[TailKeyBoundary, ...] = ()
 
 
 @dataclass

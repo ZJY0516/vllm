@@ -209,6 +209,7 @@ class MooncakeStoreScheduler:
         # req_id -> (group_id, boundary_tokens) of the partial-tail keys its
         # load read, kept until the request stores a longer tail of its own.
         self._drop_consumed_tails = envs.VLLM_MOONCAKE_STORE_DROP_CONSUMED_TAILS
+        self._keep_loaded_tail = envs.VLLM_MOONCAKE_STORE_KEEP_LOADED_TAIL
         self._consumed_tails: OrderedDict[str, list[tuple[int, int]]] = OrderedDict()
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
@@ -284,6 +285,7 @@ class MooncakeStoreScheduler:
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=False,
             tail_key_boundaries=lookup_result.tail_key_boundaries,
+            older_tail_boundaries=lookup_result.older_tail_boundaries,
         )
 
         return need_to_allocate, self.load_async
@@ -522,7 +524,11 @@ class MooncakeStoreScheduler:
         return meta
 
     def _note_consumed_tails(self, requests: list[ReqMeta]) -> None:
-        """Record the partial-tail keys each issued load reads.
+        """Record the partial-tail keys each issued load supersedes.
+
+        These are the tails the load reads, or with `_keep_loaded_tail` the
+        older tails stored along the prompt, so that the latest two tails of a
+        conversation stay for prompts that branch back one turn.
 
         A key at an LCM-aligned boundary ends a full page that longer prefixes
         share, so only keys at a non-aligned boundary are recorded.
@@ -533,9 +539,14 @@ class MooncakeStoreScheduler:
         for req_meta in requests:
             if req_meta.load_spec is None:
                 continue
+            boundaries = (
+                req_meta.load_spec.older_tail_boundaries
+                if self._keep_loaded_tail
+                else req_meta.load_spec.tail_key_boundaries
+            )
             tails = [
                 (boundary.group_id, boundary.num_tokens)
-                for boundary in req_meta.load_spec.tail_key_boundaries
+                for boundary in boundaries
                 if boundary.num_tokens % lcm_block_size
             ]
             if not tails:
