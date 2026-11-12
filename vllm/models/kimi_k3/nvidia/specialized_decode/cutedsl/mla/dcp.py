@@ -17,7 +17,9 @@ every context.
 """
 
 import math
-from functools import cache
+import os
+from functools import cache, reduce
+from operator import or_
 
 import cutlass
 import cutlass.cute as cute
@@ -95,6 +97,14 @@ PARTIALS_DEFAULT = {
 # DCP8 entries (TP8 + DCP8, DSpark k = 4, 1-3 requests = 5-15 rows): set by a
 # decode-step A/B there.
 VALUE_ROWS = {16: "7-8:2", 8: "5-15:2"}
+# The `rows_per_cta` merge's poll of the DCP sources, batch tables per DCP size (1: on;
+# VLLM_KIMI_K3_DCP_VALUE_POLL_ALL=0 turns it off): every pass reloads every source's 8
+# bytes at once and the merge then adds them in source order, instead of waiting on
+# each source in turn (one dependent reload per source still pending when the row's
+# LSEs landed). Same words, same order (bit for bit). DCP16 at 7-8 rows: set by a
+# 16-rank decode-step A/B and the c=1 AgentX runs below.
+VALUE_POLL_ALL = {16: "7-8:1"}
+VALUE_POLL_ALL_ON = os.environ.get("VLLM_KIMI_K3_DCP_VALUE_POLL_ALL", "1") != "0"
 
 
 def resolve_partials(spec, kind):
@@ -333,6 +343,11 @@ class DcpValue:
             assert 1 <= rows_per_cta <= 4 and batch <= 64, (rows_per_cta, batch)
             self.rows_per_cta = rows_per_cta
             self.grid = (heads, -(-batch // rows_per_cta), 1)
+        self.poll_all = (
+            VALUE_POLL_ALL_ON
+            and self.rows_per_cta > 0
+            and batch_table(VALUE_POLL_ALL.get(size, "")).get(batch, 0) == 1
+        )
 
     @cute.jit
     def __call__(self, *args):
@@ -476,10 +491,13 @@ class DcpValue:
                 scales[r, lane] = scale
         named_barrier(1 + r, 128)  # the weights, for this slot's 4 warps
         merged = zeros(4, Float32)
-        for s in cutlass.range_constexpr(D):
-            w = scales[r, s]
-            if w >= Float32(0):
-                self.poll_pair(sources[s], loads[s], w, merged)
+        if cutlass.const_expr(self.poll_all):
+            self.poll_all_sources(sources, loads, scales, r, merged)
+        else:
+            for s in cutlass.range_constexpr(D):
+                w = scales[r, s]
+                if w >= Float32(0):
+                    self.poll_pair(sources[s], loads[s], w, merged)
         pairs = tuple(
             pack_pair(merged[2 * e], merged[2 * e + 1], policy=None) for e in range(2)
         )
@@ -859,6 +877,46 @@ class DcpValue:
                         for e in range(2)
                     )
                 store_words(at(output, t, col), (bf16x2(lo, hi),))
+
+    @cute.jit
+    def poll_all_sources(
+        self, sources, loads, scales, r: cutlass.Constexpr[int], merged
+    ):
+        """`poll_all`: the row's sources with a partial (scale >= 0) polled together
+        (every pass reloads every source into registers; a published source keeps its
+        words until re-armed below), then re-armed and added in source order with
+        poll_pair's operations."""
+        D = self.size
+        n: cutlass.Constexpr = len(loads[0])
+        values = cute.make_rmem_tensor((D, n), Uint32)
+        want = Uint32(0)
+        pending = Uint32(0)
+        for s in cutlass.range_constexpr(D):
+            want |= Uint32(scales[r, s] >= Float32(0)) << s
+            for k in cutlass.range_constexpr(n):
+                values[s, k] = loads[s][k]
+            pending |= (
+                Uint32(reduce(or_, (v == Uint32(PAIR_SENT) for v in loads[s]))) << s
+            )
+        pending &= want
+        while pending != 0:
+            pending = Uint32(0)
+            for s in cutlass.range_constexpr(D):
+                words = load_volatile(sources[s], count=n)
+                for k in cutlass.range_constexpr(n):
+                    values[s, k] = words[k]
+                pending |= (
+                    Uint32(reduce(or_, (v == Uint32(PAIR_SENT) for v in words))) << s
+                )
+            pending &= want
+        for s in cutlass.range_constexpr(D):
+            w = scales[r, s]
+            if w >= Float32(0):
+                store_words(sources[s], (Uint32(PAIR_SENT),) * n)
+                for e in cutlass.range_constexpr(n):
+                    lo, hi = unpack_bf16(values[s, e])
+                    merged[2 * e] += w * lo
+                    merged[2 * e + 1] += w * hi
 
     @cute.jit
     def poll_pair(self, source, words, w, merged):
