@@ -31,6 +31,16 @@ def _post_sample_fused_enabled() -> bool:
         return False
 
 
+def _post_sample_side_stream_enabled() -> bool:
+    """K31_HP_PO (default 1; needs the fused update): the fused post-sample state
+    update (the fused kernel, the Mamba align postprocess and the ReplaySSM publish)
+    runs on a side stream forked after post_update, beside the drafter, which reads
+    none of that state; the next step joins it before any of its GPU work."""
+    import os
+
+    return os.environ.get("K31_HP_PO", "1") not in ("", "0")
+
+
 @triton.jit
 def _post_sample_group(
     b,
@@ -268,6 +278,10 @@ class KimiK3ModelState(MambaHybridModelState):
         # counters for the log.
         self._post_sample_fused: bool | None = None
         self._post_sample_steps = self._post_sample_fallbacks = 0
+        # Its side stream (K31_HP_PO) and the event the next step joins.
+        self._post_sample_side = _post_sample_side_stream_enabled()
+        self._post_sample_stream = None
+        self._post_sample_done = None
         if model.specialized_decode_config is not None:
             model.build_specialized_decode()
             model.specialized_decode.bind_model_state(self)
@@ -310,6 +324,10 @@ class KimiK3ModelState(MambaHybridModelState):
             self._post_sample_fallbacks += 1
             return False
         groups, spec_len = found
+        if self._post_sample_side:
+            return self._post_sample_on_side_stream(
+                idx_mapping, num_sampled, num_computed_tokens, groups, spec_len
+            )
         if not _post_sample_launch(
             idx_mapping,
             num_sampled,
@@ -340,3 +358,66 @@ class KimiK3ModelState(MambaHybridModelState):
             )
         self._publish_replayssm_trackers(idx_mapping, num_computed_tokens)
         return True
+
+    def _post_sample_on_side_stream(
+        self, idx_mapping, num_sampled, num_computed_tokens, groups, spec_len
+    ):
+        """The fused update and the rest of the stock postprocess on the side
+        stream; the next step's join_post_sample orders the main stream after it."""
+        if self._post_sample_stream is None:
+            self._post_sample_stream = torch.cuda.Stream(device=idx_mapping.device)
+        side = self._post_sample_stream
+        main = torch.cuda.current_stream(idx_mapping.device)
+        fork = torch.cuda.Event()
+        fork.record(main)
+        side.wait_event(fork)
+        num_reqs = idx_mapping.shape[0]
+        with torch.cuda.stream(side):
+            if not _post_sample_launch(
+                idx_mapping,
+                num_sampled,
+                self.num_accepted_tokens_gpu,
+                self._mamba_state_idx_gpu,
+                groups,
+                spec_len,
+            ):
+                # Nothing launched on the side stream: the stock sequence, on main.
+                self._post_sample_fallbacks += 1
+                return False
+            if num_computed_tokens is not None and self._mamba_ctx is not None:
+                self._mamba_ctx.run_fused_postprocess_align(
+                    num_reqs,
+                    self.num_accepted_tokens_gpu,
+                    self._mamba_state_idx_gpu,
+                    num_computed_tokens,
+                    idx_mapping,
+                )
+            self._publish_replayssm_trackers(idx_mapping, num_computed_tokens)
+            done = torch.cuda.Event()
+            done.record(side)
+        # Main-stream allocations the side stream reads stay alive until it is done.
+        seen = set()
+        for t in [idx_mapping, num_sampled, num_computed_tokens] + [
+            x for g in groups for x in g[:4] + (g[6],)
+        ]:
+            if isinstance(t, torch.Tensor) and t.is_cuda and id(t) not in seen:
+                seen.add(id(t))
+                t.record_stream(side)
+        self.recoverssm._step = None
+        self._post_sample_done = done
+        self._post_sample_steps += 1
+        if self._post_sample_steps in (1, 1000):
+            logger.info(
+                "Kimi K3: %d side-stream post-sample steps (%d groups), %d fallbacks",
+                self._post_sample_steps,
+                len(groups),
+                self._post_sample_fallbacks,
+            )
+        return True
+
+    def join_post_sample(self) -> None:
+        """Order the current stream after a pending side-stream post-sample update;
+        a no-op otherwise."""
+        done, self._post_sample_done = self._post_sample_done, None
+        if done is not None:
+            torch.cuda.current_stream().wait_event(done)

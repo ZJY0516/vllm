@@ -1892,6 +1892,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # Join the previous step's side-stream post-sample state update, if any
+        # (a model state's join_post_sample) before this step's GPU work.
+        join_post_sample = getattr(self.model_state, "join_post_sample", None)
+        if join_post_sample is not None:
+            join_post_sample()
         if not dummy_run:
             self.draft_tokens_handler.begin_step(scheduler_output)
             # Update the request states.
