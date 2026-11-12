@@ -452,6 +452,22 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+def _share_num_computed_enabled() -> bool:
+    """K31_HP_NC (default 1 = on): the KV cache groups of one build share the
+    device `seq_lens - query_lens` (CommonAttentionMetadata's num_computed_tokens
+    cache): every group's seq_lens and query_start_loc are the same tensors, so
+    each group's own computation gives the same values."""
+    import os
+
+    try:
+        return int(os.environ.get("K31_HP_NC", "1") or 0) > 0
+    except ValueError:
+        return False
+
+
+_SHARE_NUM_COMPUTED = _share_num_computed_enabled()
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,
@@ -496,6 +512,8 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     token_to_req_indices: torch.Tensor | None = None
+    # The first group's num_computed_tokens, shared (K31_HP_NC).
+    num_computed_tokens: torch.Tensor | None = None
     # Mamba groups with the same spec and builder differ only in their state
     # indices, so later groups re-gather those from the first group's metadata.
     # Also at capture, so FULL graphs share the batch-level buffers.
@@ -549,6 +567,8 @@ def build_attn_metadata(
             _token_to_req_indices_cache=token_to_req_indices,
             **common_attn_metadata_extra_kwargs,
         )
+        if _SHARE_NUM_COMPUTED and num_computed_tokens is not None:
+            common_attn_metadata._num_computed_tokens_cache = num_computed_tokens
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
@@ -582,4 +602,6 @@ def build_attn_metadata(
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
+        if _SHARE_NUM_COMPUTED:
+            num_computed_tokens = common_attn_metadata._num_computed_tokens_cache
     return attn_metadata
