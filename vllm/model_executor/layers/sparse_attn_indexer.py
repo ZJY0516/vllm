@@ -1038,11 +1038,9 @@ def sparse_attn_indexer(
                             logits_dtype=logits_dtype,
                         )
                         # DeepSelect ranks the bf16 logits in place of their exact
-                        # fp32 copy (only ties at the cutoff may resolve
-                        # differently), so "auto" takes it too and skips the
-                        # upcast; fp32 logits keep the per-row top-k.
+                        # fp32 copy; fp32 logits keep the per-row top-k.
                         use_deep_select = (
-                            topk_backend in ("auto", "deep_select")
+                            topk_backend == "deep_select"
                             and logits.dtype == torch.bfloat16
                             and prefill_dcp_world_size == 1
                             and is_deep_select_supported(logits, topk_tokens)
@@ -1615,6 +1613,8 @@ class SparseAttnIndexer(CustomOp):
                 candidate_blocks=self.candidate_blocks,
                 candidate_block_size=self.candidate_block_size,
                 candidate_write=self.candidate_write,
+                use_pcp=self.use_pcp,
+                pcp_shard_decode_requests=self.pcp_shard_decode_requests,
                 cache_layout=self.cache_layout,
                 dcp_rank=self.dcp_rank,
                 dcp_world_size=self.dcp_world_size,
