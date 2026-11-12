@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -1197,7 +1198,32 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         seq_lens: torch.Tensor,
         num_decodes: int,
         seq_lens_is_buffer_view: bool,
+        global_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if (
+            _FUSED_DCP_LOCALIZE
+            and seq_lens_is_buffer_view
+            and seq_lens.dtype == torch.int32
+            and seq_lens.dim() == 1
+            and seq_lens.is_contiguous()
+        ):
+            # One launch for the global copy (if any) and the in-place
+            # localization; the same integer formula as get_dcp_local_seq_lens.
+            n = seq_lens.numel()
+            if n > 0:
+                _fused_dcp_localize_kernel[(triton.cdiv(n, 128),)](
+                    seq_lens,
+                    seq_lens if global_out is None else global_out,
+                    n,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
+                    WRITE_GLOBAL=global_out is not None,
+                    BLOCK=128,
+                )
+            return seq_lens
+        if global_out is not None:
+            global_out[: seq_lens.numel()].copy_(seq_lens.reshape(-1))
         local_seq_lens = get_dcp_local_seq_lens(
             seq_lens,
             self.dcp_world_size,
@@ -1761,6 +1787,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
 
             decode_indices = None
+            fused_global_out = None
             if self.supports_varlen:
                 from vllm.v1.attention.ops.metadata import (
                     _indexer_decode_metadata_kernel,
@@ -1794,9 +1821,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_indices = self.decode_indices_buffer[:num_decode_tokens]
                 requires_padding = False
                 if global_seq_lens_for_decode is not None and max_decode_len > 1:
-                    self.global_decode_seq_lens_buffer[:num_decode_tokens].copy_(
-                        seq_lens
-                    )
+                    if _FUSED_DCP_LOCALIZE and dcp_local_seq_lens is not None:
+                        # The DCP localization below stores this copy too.
+                        fused_global_out = self.global_decode_seq_lens_buffer
+                    else:
+                        self.global_decode_seq_lens_buffer[:num_decode_tokens].copy_(
+                            seq_lens
+                        )
                     global_seq_lens_for_decode = self.global_decode_seq_lens_buffer[
                         :num_decode_tokens
                     ]
@@ -1827,7 +1858,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # causal length is localized individually; see the comment above.
             if dcp_local_seq_lens is not None:
                 seq_lens = self._dcp_localize_decode_seq_lens(
-                    seq_lens, num_decodes, seq_lens_is_buffer_view
+                    seq_lens, num_decodes, seq_lens_is_buffer_view, fused_global_out
                 )
 
             # For DeepseekV4 (compress_ratio > 1), the indexer KV cache stores
@@ -2101,3 +2132,30 @@ def build_prefill_chunk_metadata(
 
 _PREPARE_UNIFORM_DECODE_KERNEL = PrepareUniformDecodeKernel()
 _BUILD_PREFILL_CHUNK_METADATA_KERNEL = BuildPrefillChunkMetadataKernel()
+
+
+# Fuse the decode DCP localization (nine elementwise ops and a copy) and the
+# global-bounds copy into one launch. K31_NL1=0 restores the stock path.
+_FUSED_DCP_LOCALIZE = os.environ.get("K31_NL1", "1") != "0"
+
+
+@triton.jit
+def _fused_dcp_localize_kernel(
+    seq_ptr,
+    global_ptr,
+    n,
+    dcp_size,
+    dcp_rank,
+    interleave,
+    WRITE_GLOBAL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    seq = tl.load(seq_ptr + offs, mask=mask, other=0)
+    if WRITE_GLOBAL:
+        tl.store(global_ptr + offs, seq, mask=mask)
+    base = seq // interleave // dcp_size * interleave
+    rem = seq - base * dcp_size
+    rem = tl.minimum(tl.maximum(rem - dcp_rank * interleave, 0), interleave)
+    tl.store(seq_ptr + offs, base + rem, mask=mask)
