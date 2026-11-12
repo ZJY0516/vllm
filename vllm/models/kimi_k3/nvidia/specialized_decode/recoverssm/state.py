@@ -35,6 +35,25 @@ from .context import (
 from .kernels import kda_recoverssm_verify
 
 
+def _share_record_rows_enabled() -> bool:
+    """K31_HP_RR (default 1 = on): the KDA builders of one model state share one
+    record-row buffer, and a step stages it once (the builders' row slots are the
+    same request slots: `bind` hands every builder the step's idx_mapping); the
+    other builders' copies wrote the same values to their own buffers, which the
+    verify reads from the address captured at build time."""
+    import os
+
+    try:
+        return int(os.environ.get("K31_HP_RR", "1") or 0) > 0
+    except ValueError:
+        return False
+
+
+_SHARE_RECORD_ROWS = _share_record_rows_enabled()
+# (device, max_num_reqs, pending buffer id) -> [shared record rows, last staging key]
+_SHARED_RECORD_ROWS: dict = {}
+
+
 class DeferredRecoverSSMState(RecoverSSMState):
     """`pending` [max_num_reqs]: per request-state slot, the accepted tokens of its
     last verify not yet folded into its checkpoint, for the KDA metadata builders
@@ -44,6 +63,8 @@ class DeferredRecoverSSMState(RecoverSSMState):
     def __init__(self, max_num_reqs: int, device: torch.device) -> None:
         super().__init__()
         self.pending = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        # bind() count: a step id for the builders' shared record rows.
+        self._record_rows_step = 0
 
     def add_request(self, req_index: int) -> None:
         # A new or resumed request starts from a committed (prefilled) state.
@@ -57,6 +78,7 @@ class DeferredRecoverSSMState(RecoverSSMState):
         """Hand deferring builders the step's request slots (None: capture or
         dummy batches, whose rows own no request) and, once, the pending counts.
         Only ubatch 0's builders: the hybrid state does not support DBO."""
+        self._record_rows_step += 1
         for group_list in attn_groups:
             for group in group_list:
                 builder = group.get_metadata_builder(0)
@@ -67,6 +89,7 @@ class DeferredRecoverSSMState(RecoverSSMState):
                 if getattr(builder, "recoverssm_pending", None) is not self.pending:
                     install_builder(builder, self.pending)
                 builder.recoverssm_request_slots = idx_mapping
+                builder._record_rows_step = self._record_rows_step
 
 
 def install_model_state(state: Any) -> None:
@@ -154,9 +177,21 @@ def install_builder(builder: KimiK3KDAMetadataBuilder, pending: torch.Tensor) ->
     max_num_reqs = builder.vllm_config.scheduler_config.max_num_seqs
     # Each speculative row's record slot (staged, so FULL CUDA graphs read the
     # step's values; -1 past the real rows).
-    builder.recoverssm_record_rows = torch.full(
-        (max_num_reqs,), -1, dtype=torch.int32, device=builder.device
-    )
+    if _SHARE_RECORD_ROWS:
+        key = (str(builder.device), max_num_reqs, id(pending))
+        if key not in _SHARED_RECORD_ROWS:
+            _SHARED_RECORD_ROWS[key] = [
+                torch.full(
+                    (max_num_reqs,), -1, dtype=torch.int32, device=builder.device
+                ),
+                None,  # (step id, slots id, live, fill end) last staged
+            ]
+        builder.recoverssm_record_rows = _SHARED_RECORD_ROWS[key][0]
+        builder._record_rows_shared = _SHARED_RECORD_ROWS[key]
+    else:
+        builder.recoverssm_record_rows = torch.full(
+            (max_num_reqs,), -1, dtype=torch.int32, device=builder.device
+        )
     base_get_context = builder._get_recoverssm_context
     base_build = builder.build
 
@@ -245,13 +280,30 @@ def _build_deferred(
     assert pending is not None
     rows = builder.recoverssm_record_rows
     slots = builder.recoverssm_request_slots
-    live = 0
-    if slots is not None:
-        if spec_request_indices is not None:
-            slots = slots[spec_request_indices]
+    shared = (
+        getattr(builder, "_record_rows_shared", None) if _SHARE_RECORD_ROWS else None
+    )
+    stage_key = None
+    if shared is not None and slots is not None and spec_request_indices is None:
         live = min(num_spec_decodes, slots.shape[0])
-        rows[:live].copy_(slots[:live], non_blocking=True)
-    rows[live : max(m.num_reqs, num_spec_decodes)].fill_(-1)
+        stage_key = (
+            getattr(builder, "_record_rows_step", None),
+            id(slots),
+            live,
+            max(m.num_reqs, num_spec_decodes),
+        )
+    if stage_key is not None and stage_key[0] is not None and shared[1] == stage_key:
+        live = stage_key[2]  # this step's earlier builder staged the same rows
+    else:
+        live = 0
+        if slots is not None:
+            if spec_request_indices is not None:
+                slots = slots[spec_request_indices]
+            live = min(num_spec_decodes, slots.shape[0])
+            rows[:live].copy_(slots[:live], non_blocking=True)
+        rows[live : max(m.num_reqs, num_spec_decodes)].fill_(-1)
+        if shared is not None:
+            shared[1] = stage_key
     eager = None
     if builder.vllm_config.cache_config.mamba_cache_mode == "align":
         assert isinstance(builder.kv_cache_spec, MambaSpec)
