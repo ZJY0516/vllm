@@ -355,7 +355,9 @@ class MultiprocExecutor(Executor):
             inherited_fds is None
             and self.local_world_size > 1
             and not current_platform.is_cpu()
-            and not self.parallel_config.numa_bind
+            # numa_bind None (auto) is resolved per worker inside the NUMA wrapper
+            # context, which swaps the process-global spawn executable.
+            and self.parallel_config.numa_bind is False
         )
 
     def _start_workers_concurrently(
