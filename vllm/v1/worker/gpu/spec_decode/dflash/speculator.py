@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from typing import Any
 
 import torch
@@ -34,6 +35,16 @@ from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _early_ctx_env() -> int:
+    """K31_SE2: 1 (default) the drafter's context step runs on a side stream from
+    the end of the target's lm_head, beside the logits gather and verification;
+    0 it runs in the drafter's FULL graph after verification."""
+    try:
+        return min(1, max(0, int(os.environ.get("K31_SE2", "1") or 0)))
+    except ValueError:
+        return 0
 
 
 class DFlashSpeculator(DraftModelSpeculator):
@@ -111,6 +122,44 @@ class DFlashSpeculator(DraftModelSpeculator):
                 len(aux_layers) * vllm_config.model_config.get_hidden_size(),
                 dtype=self.dtype,
                 device=device,
+            )
+
+        # Early context step (K31_SE2): the FULL graph's context step (combine +
+        # context K/V) moves to its own graph, replayed on a side stream from the
+        # end of the target's lm_head, writing every verify row's K/V (block 0
+        # still PAD). A rejected row's position is one of the draft block's query
+        # positions, whose K/V every draft layer writes into the same slot before
+        # its attention reads the block, so the drafts are the same bits. Needs
+        # the base (empty) context anchor: the moved step must not read the
+        # rejected counts.
+        self._early_ctx_mode = 0
+        if (
+            self._aux_staging is not None
+            and type(self).prepare_context_anchor
+            is DFlashSpeculator.prepare_context_anchor
+        ):
+            self._early_ctx_mode = _early_ctx_env()
+        self._early_ctx_graphs: dict[int, tuple[torch.cuda.CUDAGraph, int]] = {}
+        self._early_ctx_launched = False
+        self._early_ctx_stream: torch.cuda.Stream | None = None
+        self._early_ctx_lm_head_end: torch.cuda.Event | None = None
+        self._early_ctx_done: torch.cuda.Event | None = None
+        self._early_ctx_launches = 0
+        self._early_ctx_skips = 0
+        if self._early_ctx_mode:
+            self._early_ctx_stream = torch.cuda.Stream(device)
+            self._early_ctx_lm_head_end = torch.cuda.Event()
+            self._early_ctx_done = torch.cuda.Event()
+            self._early_ctx_positions = torch.zeros(
+                self.max_num_tokens, dtype=torch.int64, device=device
+            )
+            # Sized at capture from self.hidden_states (a subclass may widen it).
+            self._early_ctx_hidden: torch.Tensor | None = None
+            logger.info(
+                "Early drafter context step (K31_SE2=%d): %s context step on a side "
+                "stream after the target lm_head",
+                self._early_ctx_mode,
+                self._speculator_name,
             )
 
         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
@@ -195,24 +244,220 @@ class DFlashSpeculator(DraftModelSpeculator):
             prepare_forward=self._prepare_graph_forward,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
+        if self._early_ctx_mode:
+            self._early_ctx_capture()
 
     def _prepare_graph_forward(
         self, num_reqs: int, attn_metadata: dict[str, Any] | None
     ) -> None:
         """The FULL graph's context step: combine the staged target hidden
-        states, publish the context anchor and store the context K/V."""
+        states, publish the context anchor and store the context K/V. With the
+        early context step the graph keeps only the anchor (and the metadata
+        update): the combine and the context K/V run before the replay
+        (`_eager_context_step` or the early context graph)."""
         num_context = self._num_graph_context_tokens(num_reqs)
-        if self._aux_staging is not None:
+        if self._aux_staging is not None and not self._early_ctx_mode:
             self.hidden_states[:num_context].copy_(
                 self.model.combine_hidden_states(self._aux_staging[:num_context])
             )
         self.prepare_context_anchor(
             num_reqs, self.target_input_buffers.query_start_loc, self._num_rejected
         )
-        self._precompute_context_kv(0, num_context)
+        if not self._early_ctx_mode:
+            self._precompute_context_kv(0, num_context)
         # Recorded in the FULL graph so replays skip the eager metadata build.
         if attn_metadata is not None and self.supports_decode_metadata_update:
             self._update_draft_decode_metadata(attn_metadata, num_reqs)
+
+    # ------------------------------------------------------------------------------
+    # The early context step, beside the target's logits gather and verification
+    # ------------------------------------------------------------------------------
+
+    def _eager_context_step(self, num_graph_reqs: int) -> None:
+        """The stock FULL graph's context step, eagerly (the early context graphs
+        leave it out): the same calls on the same rows, the verify's rejected rows
+        PAD."""
+        num_context = self._num_graph_context_tokens(num_graph_reqs)
+        assert self._aux_staging is not None
+        self.hidden_states[:num_context].copy_(
+            self.model.combine_hidden_states(self._aux_staging[:num_context])
+        )
+        self._precompute_context_kv(0, num_context)
+
+    def _early_ctx_slots(
+        self, out_positions, out_slots, positions, query_start_loc, n, rows_per_req
+    ):
+        """Context positions and slots of every row of `n` requests (block 0 and
+        positions this DCP rank does not own: PAD), one row per group in
+        `out_slots`; the rows of _prepare_dflash_inputs_kernel's context part
+        without the rejected-row mask."""
+        grid = (n, triton.cdiv(rows_per_req, _EARLY_CTX_ROWS_PER_REQ))
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            block_table = self.block_tables.input_block_tables[gid]
+            # The same block stride as propose's prepare_dflash_inputs.
+            block_stride = self.block_tables.block_sizes[gid]
+            group = self.attn_groups[gid][0]
+            if group.kernel_block_stride:
+                assert group.kernel_block_size is not None
+                block_stride = group.kernel_block_stride * group.kernel_block_size
+            _early_ctx_slots_kernel[grid](
+                out_positions,
+                out_slots[i],
+                positions,
+                query_start_loc,
+                block_table,
+                block_table.stride(0),
+                self.block_tables.block_sizes[gid],
+                block_stride,
+                self.block_tables.cp_rank,
+                PAD_SLOT_ID=PAD_SLOT_ID,
+                CP_SIZE=self.dcp_size,
+                CP_INTERLEAVE=self.block_tables.cp_interleave,
+                BLOCK_SIZE=_EARLY_CTX_ROWS_PER_REQ,
+            )
+
+    def _early_ctx_body(self, num_reqs: int, rows: int, warmup: bool) -> None:
+        """The early context graph: every verify row's context slots, the combine
+        of the staged aux hidden states (staged on the side stream before the
+        replay) and the context K/V."""
+        assert self._aux_staging is not None and self._early_ctx_hidden is not None
+        tib = self.target_input_buffers
+        self._early_ctx_slots(
+            self._early_ctx_positions,
+            self._early_ctx_slot_mappings,
+            tib.positions,
+            tib.query_start_loc,
+            num_reqs,
+            rows // num_reqs,
+        )
+        if warmup:  # dummy block tables: write no K/V
+            self._early_ctx_slot_mappings[:, :rows].fill_(PAD_SLOT_ID)
+        self._early_ctx_hidden[:rows].copy_(
+            self.model.combine_hidden_states(self._aux_staging[:rows])
+        )
+        slots = self._early_ctx_slot_mappings
+        if self._layer_group_idx is not None:
+            context_slots: Any = [slots[g][:rows] for g in self._layer_group_idx]
+        else:
+            context_slots = slots[0][:rows]
+        self.model.precompute_and_store_context_kv(
+            self._early_ctx_hidden[:rows],
+            self._early_ctx_positions[:rows],
+            context_slots,
+        )
+
+    def _early_ctx_capture(self) -> None:
+        """One early context graph per FULL draft graph's request count, in its
+        own pool (it replays beside the eager verification, never beside a graph)."""
+        assert self.query_cudagraph_manager is not None
+        self._early_ctx_graphs = {}
+        if self._early_ctx_hidden is None:
+            self._early_ctx_hidden = torch.zeros(
+                self._num_graph_context_tokens(self.max_num_reqs),
+                self.hidden_states.shape[1],
+                dtype=self.hidden_states.dtype,
+                device=self.device,
+            )
+        self._early_ctx_slot_mappings.fill_(PAD_SLOT_ID)
+        sizes = sorted(
+            {
+                desc.num_reqs
+                for desc in self.query_cudagraph_manager.graphs
+                if desc.cg_mode == CUDAGraphMode.FULL and desc.num_reqs
+            }
+        )
+        if not sizes:
+            logger.warning(
+                "Early drafter context step: no FULL draft graphs; it stays eager"
+            )
+            return
+        from vllm.distributed.parallel_state import graph_capture
+
+        pool = torch.cuda.graph_pool_handle()
+        main = torch.cuda.current_stream()
+        with graph_capture(self.device) as context:
+            stream = context.stream
+            for n in sizes:
+                rows = self._num_graph_context_tokens(n)
+                self._early_ctx_body(n, rows, warmup=True)
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=pool, stream=stream):
+                    self._early_ctx_body(n, rows, warmup=False)
+                self._early_ctx_graphs[n] = (graph, rows)
+        main.wait_stream(stream)
+        logger.info("Early drafter context step: graphs for %s requests", sizes)
+
+    def early_ctx_launch(
+        self,
+        input_batch: InputBatch,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> bool:
+        """At the end of the target's lm_head (current stream): start this step's
+        context step on the side stream, if the step qualifies (a uniform verify
+        of every request, a captured request count); `propose` joins it."""
+        if (
+            not self._early_ctx_mode
+            or self._early_ctx_launched
+            or not aux_hidden_states
+        ):
+            return False
+        n = input_batch.num_reqs
+        entry = self._early_ctx_graphs.get(n)
+        if entry is None:
+            return False
+        graph, rows = entry
+        tib = self.target_input_buffers
+        if (
+            input_batch.num_tokens != rows
+            or input_batch.positions.data_ptr() != tib.positions.data_ptr()
+            or input_batch.query_start_loc.data_ptr() != tib.query_start_loc.data_ptr()
+            or not (input_batch.num_scheduled_tokens[:n] == rows // n).all()
+        ):
+            if self._early_ctx_skips < 3:
+                self._early_ctx_skips += 1
+                logger.info(
+                    "Early drafter context step: step not served (tokens %d, "
+                    "rows %d, positions aliased %s, query starts aliased %s)",
+                    input_batch.num_tokens,
+                    rows,
+                    input_batch.positions.data_ptr() == tib.positions.data_ptr(),
+                    input_batch.query_start_loc.data_ptr()
+                    == tib.query_start_loc.data_ptr(),
+                )
+            return False
+        if self._early_ctx_launches == 0:
+            logger.info(
+                "Early drafter context step: first side-stream step (%d requests)", n
+            )
+        self._early_ctx_launches += 1
+        assert self._early_ctx_stream is not None
+        assert self._early_ctx_done is not None
+        assert self._early_ctx_lm_head_end is not None
+        assert self._aux_staging is not None
+        self._early_ctx_lm_head_end.record()
+        side = self._early_ctx_stream
+        side.wait_event(self._early_ctx_lm_head_end)
+        with torch.cuda.stream(side):
+            torch.cat(
+                [h[:rows] for h in aux_hidden_states],
+                dim=-1,
+                out=self._aux_staging[:rows],
+            )
+            graph.replay()
+            self._early_ctx_done.record(side)
+        self._early_ctx_launched = True
+        return True
+
+    def early_ctx_join(self) -> bool:
+        """Order the current stream after this step's early context step; whether
+        one was launched."""
+        if not self._early_ctx_launched:
+            return False
+        assert self._early_ctx_done is not None
+        torch.cuda.current_stream().wait_event(self._early_ctx_done)
+        self._early_ctx_launched = False
+        return True
 
     def _prepare_graph_replay(
         self,
@@ -222,15 +467,17 @@ class DFlashSpeculator(DraftModelSpeculator):
         aux_hidden_states: list[torch.Tensor] | None,
         num_rejected: torch.Tensor,
         dummy_run: bool,
+        early_ctx_staged: bool = False,
     ) -> None:
         """Eager work before a FULL replay: stage the inputs _prepare_graph_forward
         reads and store the context rows past the graph's num_context rows."""
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_context = self._num_graph_context_tokens(num_graph_reqs)
-        self._store_hidden_states(
-            num_target_tokens, last_hidden_states, aux_hidden_states, num_context
-        )
+        if not early_ctx_staged:  # else the side stream staged and stored them
+            self._store_hidden_states(
+                num_target_tokens, last_hidden_states, aux_hidden_states, num_context
+            )
         if self._num_rejected is not None:
             self._num_rejected[:num_reqs].copy_(num_rejected[:num_reqs])
         if dummy_run:
@@ -337,6 +584,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             dtype=torch.int64,
             device=self.device,
         )
+        if self._early_ctx_mode:
+            # The early context step's own context slots (every verify row; block 0
+            # PAD), read by its graph while the stock ones above are rewritten.
+            self._early_ctx_slot_mappings = torch.full_like(
+                self._context_slot_mappings, PAD_SLOT_ID
+            )
 
         # Map each draft decoder layer to the index (within draft_kv_cache_group_ids)
         # of the kv-cache group its cache belongs to. Models that share a single group
@@ -612,6 +865,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         if num_speculative_tokens == 0:
             # No drafts are needed: store the context K/V to keep the drafter in
             # sync, and skip the query pass.
+            self.early_ctx_join()
             self._store_hidden_states(
                 num_target_tokens, last_hidden_states, aux_hidden_states
             )
@@ -644,6 +898,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             batch_sync.num_tokens_across_dp if batch_sync is not None else None
         )
 
+        # This step's context step ran on the side stream (joined here).
+        early_ctx_ran = self.early_ctx_join()
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert batch_desc.num_reqs is not None
             self._prepare_graph_replay(
@@ -653,7 +909,19 @@ class DFlashSpeculator(DraftModelSpeculator):
                 aux_hidden_states,
                 num_rejected,
                 dummy_run,
+                early_ctx_staged=early_ctx_ran,
             )
+            if self._early_ctx_mode and not early_ctx_ran:
+                # The graph leaves the context step out: run it here, as the
+                # stock graph would (rejected rows PAD).
+                self._eager_context_step(batch_desc.num_reqs)
+                self._early_ctx_skips += 1
+                if self._early_ctx_skips in (1, 10, 100, 1000, 10000):
+                    logger.info(
+                        "Early drafter context step: %d eager, %d on the side stream",
+                        self._early_ctx_skips,
+                        self._early_ctx_launches,
+                    )
         else:
             self._store_hidden_states(
                 num_target_tokens, last_hidden_states, aux_hidden_states
@@ -705,6 +973,60 @@ class DFlashSpeculator(DraftModelSpeculator):
 
 # Extra programs that pad the buffers past the batch (up to max_num_tokens).
 _NUM_PAD_PROGRAMS = 32
+
+# Rows per program of the early context slot kernel (a verify block is k + 1 rows).
+_EARLY_CTX_ROWS_PER_REQ = 32
+
+
+@triton.jit
+def _early_ctx_slots_kernel(
+    out_positions_ptr,
+    out_slot_mapping_ptr,
+    positions_ptr,
+    query_start_loc_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    block_stride,
+    cp_rank,
+    PAD_SLOT_ID: tl.constexpr,
+    CP_SIZE: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # The context part of _prepare_dflash_inputs_kernel with every row valid:
+    # positions and slots of all of a request's rows (null block 0 and positions
+    # another DCP rank owns: PAD), whatever the verify will reject.
+    req_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    ctx_start = tl.load(query_start_loc_ptr + req_idx)
+    ctx_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    num_ctx = ctx_end - ctx_start
+    j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    is_ctx = j < num_ctx
+    ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
+    ctx_pos = tl.load(positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
+    ctx_block_num = ctx_pos // (block_size * CP_SIZE)
+    ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
+    ctx_block_id = tl.load(
+        block_table_ptr + req_idx * block_table_stride + ctx_block_num,
+        mask=is_ctx,
+        other=0,
+    ).to(tl.int64)
+    ctx_resident = is_ctx & (ctx_block_id != 0)
+    local_ctx_slot = cp_local_slot(
+        ctx_pos,
+        ctx_block_id,
+        block_size,
+        block_stride,
+        cp_rank,
+        CP_SIZE,
+        CP_INTERLEAVE,
+        PAD_SLOT_ID,
+    )
+    ctx_slot = tl.where(ctx_resident, local_ctx_slot, PAD_SLOT_ID)
+    tl.store(out_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
+    tl.store(out_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
 
 
 @triton.jit

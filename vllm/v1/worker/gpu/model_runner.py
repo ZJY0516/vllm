@@ -221,6 +221,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculative_config is not None
             and self.speculative_config.uses_separate_workspace_lane
         )
+        # Early drafter context step (K31_SE2, a DFlash/DSpark speculator's
+        # early_ctx_launch): it starts at the end of the target's lm_head, on a
+        # side stream.
+        self._early_ctx_pending: tuple | None = None
+        self._early_ctx_hooked = False
+        self._early_ctx_target_full = False
         self.observability_config = vllm_config.observability_config
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
 
@@ -1794,6 +1800,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert sampler_output is not None
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
+    def _early_ctx_fire(self) -> None:
+        """Start this step's early drafter context step (current stream: the end
+        of the target's lm_head GEMM) on the speculator's side stream."""
+        pending, self._early_ctx_pending = self._early_ctx_pending, None
+        if pending is None or self.speculator is None:
+            return
+        with use_workspace_lane(self._draft_workspace_lane):
+            self.speculator.early_ctx_launch(*pending)  # type: ignore[attr-defined]
+
+    def _early_ctx_install_hook(self) -> None:
+        """Wrap the target logits processor's gather (the step after its lm_head
+        GEMM; the specialized decode's Lamport gather when installed) so that a
+        pending early context step starts right before it."""
+        if self._early_ctx_hooked:
+            return
+        self._early_ctx_hooked = True
+        model = self.model
+        lp = getattr(model, "logits_processor", None)
+        if lp is None and hasattr(model, "get_language_model"):
+            lp = getattr(model.get_language_model(), "logits_processor", None)
+        if lp is None or not hasattr(lp, "_gather_logits"):
+            logger.warning(
+                "Early drafter context step: no target logits gather to hook; it "
+                "starts after sampling"
+            )
+            return
+        stock = lp._gather_logits
+        runner = self
+
+        def gather(logits, *args, **kwargs):
+            if runner._early_ctx_pending is not None:
+                runner._early_ctx_fire()
+            return stock(logits, *args, **kwargs)
+
+        lp._gather_logits = gather
+        logger.info("Early drafter context step: starts at the target logits gather")
+
     def postprocess_sampled(
         self,
         idx_mapping: torch.Tensor,  # May include -1 for masked entries
@@ -2208,6 +2251,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         finished_req_ids = scheduler_output.finished_req_ids
+        # The early context step reads the aux hidden states on a side stream: only
+        # a FULL graph's persistent output buffers (an eager forward's are freed
+        # after the step).
+        self._early_ctx_target_full = batch_desc.cg_mode == CUDAGraphMode.FULL
         # Propose no drafts (K=0) when no DP rank's scheduled requests can use them.
         skip_drafts = (
             dp_sync_state.skip_drafts
@@ -2292,9 +2339,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
+        if (
+            getattr(self.speculator, "_early_ctx_mode", 0)
+            and self._early_ctx_target_full
+            and num_spec_tokens > 0
+            and input_batch.num_draft_tokens > 0
+            and aux_hidden_states
+            and self.pcp_manager is None
+            and self.dp_size == 1
+        ):
+            # Started by the target logits gather hook (end of the lm_head GEMM).
+            self._early_ctx_install_hook()
+            self._early_ctx_pending = (input_batch, aux_hidden_states)
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if self._early_ctx_pending is not None:  # the hook did not run: start it now
+            self._early_ctx_fire()
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2409,6 +2470,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
                 )
+            early_ctx_join = getattr(self.speculator, "early_ctx_join", None)
+            if early_ctx_join is not None:  # one that propose did not join
+                early_ctx_join()
             if self.pcp_manager is not None:
                 self.pcp_manager.sync_drafts(
                     draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
