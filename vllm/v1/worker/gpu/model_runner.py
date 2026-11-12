@@ -206,6 +206,20 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 logger = init_logger(__name__)
 
 
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    try:
+        return int(os.environ.get(name, str(default)) or default)
+    except ValueError:
+        return default
+
+
+# K31_HP_DG (default 1 = on): skip the re-gather of the drafts that only
+# set_draft_tokens' width reads (no structured outputs, no PP).
+_SKIP_DRAFT_REGATHER = _env_int("K31_HP_DG", 1) > 0
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -2493,7 +2507,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            draft_tokens = self.req_states.draft_tokens[input_batch.idx_mapping]
+            if not (
+                _SKIP_DRAFT_REGATHER
+                and self.speculator is not None
+                and self.pp_handler is None
+                and not input_batch.has_structured_output_reqs
+            ):
+                draft_tokens = self.req_states.draft_tokens[input_batch.idx_mapping]
+            # else (K31_HP_DG): the draft tokens just scattered to these rows, same
+            # shape; set_draft_tokens only reads the width (no structured outputs)
+            # and no PP rank reads them, so the re-gather has no reader.
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch, draft_tokens[:, :num_spec_tokens]
             )
