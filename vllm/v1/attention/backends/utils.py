@@ -1237,6 +1237,17 @@ def dcp_local_to_global_index(local, dcp_rank, dcp_size, cp_kv_cache_interleave_
     )
 
 
+@triton.jit
+def dcp_global_to_local_index(pos, dcp_size, cp_kv_cache_interleave_size):
+    """Owning DCP rank and that rank's local KV slot for global position `pos`."""
+    owner = pos // cp_kv_cache_interleave_size % dcp_size
+    local = (
+        pos // (cp_kv_cache_interleave_size * dcp_size) * cp_kv_cache_interleave_size
+        + pos % cp_kv_cache_interleave_size
+    )
+    return owner, local
+
+
 @triton.jit(
     do_not_specialize_on_alignment=["out_ptr", "block_table_ptr", "seq_lens_ptr"]
 )
