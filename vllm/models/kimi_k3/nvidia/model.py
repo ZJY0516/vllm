@@ -520,12 +520,28 @@ class KimiMoE(nn.Module):
             ep_group = get_ep_group()
             ep_size = ep_group.world_size
             ep_rank = ep_group.rank_in_group
-            if num_experts % ep_size != 0:
+            # EPLB: `num_redundant_experts` physical replicas beyond the logical
+            # experts. The router keeps choosing logical experts; MegaMoE maps them
+            # to replicas through its EPLB state (identity without EPLB).
+            parallel_config = vllm_config.parallel_config
+            self.n_routed_experts = num_experts
+            self.n_logical_experts = num_experts
+            self.n_shared_experts = self.num_shared_experts or 0
+            self.n_redundant_experts = (
+                parallel_config.eplb_config.num_redundant_experts or 0
+                if parallel_config.enable_eplb
+                else 0
+            )
+            self.n_physical_experts = num_experts + self.n_redundant_experts
+            if self.n_physical_experts % ep_size != 0:
                 raise ValueError(
-                    f"Kimi K3 num_experts={num_experts} must be divisible by "
-                    f"EP size {ep_size}."
+                    f"Kimi K3 physical experts {self.n_physical_experts} "
+                    f"(num_experts={num_experts} + num_redundant_experts="
+                    f"{self.n_redundant_experts}) must be divisible by EP size "
+                    f"{ep_size}."
                 )
-            num_local_experts = num_experts // ep_size
+            num_local_experts = self.n_physical_experts // ep_size
+            self.n_local_physical_experts = num_local_experts
             max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             if use_sequence_parallel:
                 # The layer only sees this rank's shard of the batch.
@@ -533,9 +549,10 @@ class KimiMoE(nn.Module):
             self.experts = DeepGemmMegaMoEExperts(
                 vllm_config,
                 max_num_tokens=max_num_tokens,
-                num_experts=num_experts,
+                num_experts=self.n_physical_experts,
                 num_local_experts=num_local_experts,
                 experts_start_idx=ep_rank * num_local_experts,
+                num_logical_experts=num_experts,
                 top_k=num_experts_per_token,
                 hidden_size=self.moe_hidden_size,
                 intermediate_size=self.padded_moe_intermediate_size,
@@ -1580,6 +1597,55 @@ class KimiLinearForCausalLM(
         # The final norm is applied in compute_logits unless the specialized decode
         # applies it in forward.
         self.needs_norm_in_logits = True
+        self.set_moe_parameters(vllm_config)
+
+    def set_moe_parameters(self, vllm_config: VllmConfig) -> None:
+        """Register the MegaMoE layers with EPLB (`MixtureOfExperts`).
+
+        Only with `--enable-eplb`: without it the model reports no MoE layers, as
+        before, so nothing else treats it as an EPLB model.
+        """
+        self.num_expert_groups = 1
+        self.moe_layers = []
+        self.moe_mlp_layers = []
+        example: KimiMoE | None = None
+        if vllm_config.parallel_config.enable_eplb:
+            for layer in self.model.layers:
+                mlp = getattr(layer, "mlp", None)
+                if isinstance(mlp, KimiMoE) and mlp.use_mega_moe:
+                    example = mlp
+                    self.moe_mlp_layers.append(mlp)
+                    self.moe_layers.append(mlp.experts)
+        self.num_moe_layers = len(self.moe_layers)
+        if example is None:
+            self.num_logical_experts = 0
+            self.num_physical_experts = 0
+            self.num_local_physical_experts = 0
+            self.num_routed_experts = 0
+            self.num_shared_experts = 0
+            self.num_redundant_experts = 0
+            return
+        self.num_logical_experts = example.n_logical_experts
+        self.num_physical_experts = example.n_physical_experts
+        self.num_local_physical_experts = example.n_local_physical_experts
+        self.num_routed_experts = example.n_routed_experts
+        self.num_shared_experts = example.n_shared_experts
+        self.num_redundant_experts = example.n_redundant_experts
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for moe in self.moe_mlp_layers:
+            moe.n_local_physical_experts = num_local_physical_experts
+            moe.n_physical_experts = num_physical_experts
+            moe.n_redundant_experts = self.num_redundant_experts
+            moe.experts.update_expert_map()
 
     def build_specialized_decode(self) -> None:
         from .specialized_decode.runtime.decode import SpecializedDecode
