@@ -34,6 +34,10 @@ vllm serve <hybrid-model> \
 
 Choose a value that divides the block size of every prefix-cacheable KV cache group, and that is a multiple of the per-state compression ratio for models that use one, such as sparse MLA. vLLM validates both at startup and names the offending sizes in the error. Read the served block size from the startup log. 64 is a reasonable starting point.
 
+### Prefill checkpoints
+
+In Mamba cache mode `align`, a prefill normally stops at the prompt's last Mamba block boundary so the state there can be cached, and the remaining tokens run in the next step. Layers that store that state from inside the prefill let it run in one step instead. Qwen Gated DeltaNet does so on the FlashInfer prefill backend, and on the Triton/FLA backend on CUDA. Every Mamba layer of the model must support this; otherwise the prefill is split.
+
 ### FlashInfer ReplaySSM
 
 FlashInfer ReplaySSM caches recent inputs to reduce full-state writes during Mamba2 decoding. It is disabled by default. Both Model Runners V1 and V2 support prefix caching with ReplaySSM, including MTP speculative decoding.
