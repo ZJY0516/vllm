@@ -692,8 +692,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """
         # GPUWorker finalizes the PD interleave before KV cache initialization.
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
-        if self._np1 is not None:
-            self._np1.layout, self._np1.layout_failed = None, False
+        np1 = getattr(self, "_np1", None)
+        if np1 is not None:
+            np1.layout, np1.layout_failed = None, False
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self.extensible_kv_cache: ExtensibleKVCache | None = None
