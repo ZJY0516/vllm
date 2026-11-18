@@ -65,6 +65,35 @@ PUB8_POLL_NS = 0 if _on("K31_PUB8_POLL0") else None
 PUB8_RS_WARP = _on("K31_PUB8_RSWARP")
 if _on("K31_PUB8_EARLY"):
     EARLY[16] += ",5-8:1"
+# TP8 WaveMoeTail options (all default off; none changes what is loaded, summed or
+# stored, so the output bits are the same). K31_T8T=1: past one group (9-16 rows,
+# two or three requests at k = 4), every CTA polls its slice of each token from the
+# sources itself instead of reading latent rows another cluster reduced
+# (WaveMoeTail.direct). K31_T8T_POLL0=1: the published tails' polls (5-16 rows)
+# retry without sleeping. K31_T8T_VOTE=1: the published tails' polls (5-16 rows) run
+# on whole warps, each retry pass reloading every source, and a warp vote ends them.
+T8T = {8: "9-16:1" if _on("K31_T8T") else ""}
+T8T_POLL0 = {8: "5-16:1" if _on("K31_T8T_POLL0") else ""}
+T8T_VOTE = {8: "5-16:1" if _on("K31_T8T_VOTE") else ""}
+# K31_S21T8T=1: the POLL0 and VOTE entries above (when on) reach 32 rows (three or
+# four groups at k = 4); K31_S21T8D=1: the T8T entry (when on) too. Same code paths,
+# wider tables.
+if _on("K31_S21T8T"):
+    for _table in (T8T_POLL0, T8T_VOTE):
+        if _table[8]:
+            _table[8] = "5-32:1"
+if _on("K31_S21T8D") and T8T[8]:
+    T8T[8] = "9-32:1"
+
+
+# K31_S23DR=1: TP8 published tcgen05 tails of 17-40 rows start the up projection
+# before the RMS exchange completes and scale each output line by its token's inverse
+# RMS (WaveMoeTail.late; not the same bits as normalize-first). Default off.
+LATE = {8: "17-40:1"} if _on("K31_S23DR") else {}
+
+
+def late(tp, batch):
+    return bool(batch_table(LATE.get(tp, "")).get(batch, 0))
 
 
 def flat(t):
@@ -81,6 +110,27 @@ def published(tp, batch):
     """The experts publish the latent and WaveMoeTail runs the tail (else MoeTail
     front)."""
     return batch > (4 if tp == 8 else 8) or pub8(tp, batch)
+
+
+def direct(tp, batch, twoshot=False):
+    """TP8 published batch past one group whose tail polls directly (`T8T`)."""
+    table = batch_table(T8T.get(tp, ""))
+    on = tp == 8 and batch > 8 and not twoshot and bool(table.get(batch, 0))
+    return on and published(tp, batch)
+
+
+def published_vote(tp, batch, twoshot=False):
+    """TP8 published batch whose polls end by a warp vote (`T8T_VOTE`)."""
+    table = batch_table(T8T_VOTE.get(tp, ""))
+    on = tp == 8 and not twoshot and bool(table.get(batch, 0))
+    return on and published(tp, batch)
+
+
+def published_poll_ns(tp, batch):
+    """TP8 published batch's poll sleep in ns (`T8T_POLL0`: 0), or None."""
+    table = batch_table(T8T_POLL0.get(tp, ""))
+    on = tp == 8 and published(tp, batch) and bool(table.get(batch, 0))
+    return 0 if on else None
 
 
 def front_gate(tp, dcp, batch):
@@ -167,13 +217,17 @@ def compile_tail(
     umma=False,
     gate=False,
     poll_ns=None,
+    direct=False,
+    vote=False,
+    late=False,
 ):
     """front: rows complete at the PDL wait; front_poll: three 0xffff-armed G/W/S parity
     slots polled per row and re-armed after use; publish (`published`): WaveMoeTail
     over the published mailboxes, reading the weight shard directly, not by TMA;
     twoshot: publish over the two-shot receive slots and gather. `gate` and
     `poll_ns`: MoeTail's barrier before the latent/RS poll and its poll sleep
-    (`front_gate`, `front_poll_ns`)."""
+    (`front_gate`, `front_poll_ns`; published: `published_poll_ns`). `direct`,
+    `vote`: WaveMoeTail's (`T8T`)."""
     m8, twoshot = mode in ("publish", "twoshot"), mode == "twoshot"
     vec = lambda n, dtype=BFloat16, align=16: fake((n,), None, dtype, align)
     slots = 3 * POLL_CAP if mode == "front_poll" else batch
@@ -188,8 +242,12 @@ def compile_tail(
     kernel: MoeTail
     if m8 and pub8(tp, batch):
         kernel = wave = WaveMoeTailExact(batch, tp, early, poll_ns, PUB8_RS_WARP)
+    elif m8 and (direct or vote or poll_ns is not None):
+        kw = dict(direct=direct, poll_ns=poll_ns, vote=vote, late=late)
+        kernel = wave = WaveMoeTail(batch, tp, twoshot, early, umma, **kw)
+        scalars += (vec(3 * CAP * 3584),) if wave.reduce else ()
     elif m8:
-        kernel = wave = WaveMoeTail(batch, tp, twoshot, early, umma)
+        kernel = wave = WaveMoeTail(batch, tp, twoshot, early, umma, late=late)
         scalars += (vec(3 * CAP * 3584),) if wave.reduce else ()
     else:
         kernel = MoeTail(
@@ -258,6 +316,14 @@ class MoeTailWeights:
             if pub8(tp, b):
                 sleep = PUB8_POLL_NS
             kw = dict(early=b in early, umma=on, gate=gate, poll_ns=sleep)
+            if on and late(tp, b):
+                kw.update(late=True)
+            if mode != "front" and tp == 8:  # T8T: only TP8 published tails
+                direct8 = direct(tp, b, twoshot)
+                sleep8 = published_poll_ns(tp, b)
+                vote8 = published_vote(tp, b, twoshot)
+                if direct8 or vote8 or sleep8 is not None:
+                    kw.update(poll_ns=sleep8, direct=direct8, vote=vote8)
             code = compile_tail(tp, b, device, mode, **kw)
             self.codes[b] = code, views, shares(tp, b, twoshot), twoshot
         shared = any(shares(tp, b, b in twoshots) for b in batches)

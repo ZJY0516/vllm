@@ -850,20 +850,22 @@ NP1_N_IDX = 40  # + 8k: group, out stride, columns, capacity, B, alpha, kernel b
 NP1_N_KT = 64  # + 5m: group, B, alpha, out stride, kernel columns
 NP1_N_LEN = 88
 NP1_MAX_REQS = 4
+# K31_S21N8=1 (model_runner): up to eight request slots (kernel constant NR = 8).
+NP1_MAX_REQS_WIDE = 8
 
 
-def np1_arena_layout(q: int) -> dict[str, int]:
+def np1_arena_layout(q: int, max_reqs: int = NP1_MAX_REQS) -> dict[str, int]:
     """Word offsets (16-byte aligned) of the per-step outputs that the stock
     path allocates, in one int64 arena."""
-    t = NP1_MAX_REQS * q
+    t = max_reqs * q
     sizes = (
-        ("idx", NP1_MAX_REQS),  # int64 idx_mapping
-        ("cu", (NP1_MAX_REQS + 2) // 2),  # int32 cu_num_logits
+        ("idx", max_reqs),  # int64 idx_mapping
+        ("cu", (max_reqs + 2) // 2),  # int32 cu_num_logits
         ("eidx", t),  # int64 expanded_idx_mapping
         ("logits", t),  # int64 logits_indices
         ("epos", (t + 1) // 2),  # int32 expanded_local_pos
-        ("nacc", (NP1_MAX_REQS + 1) // 2),  # int32 gathered accepted tokens
-        ("ncomp", (NP1_MAX_REQS + 1) // 2),  # int32 num_computed_tokens
+        ("nacc", (max_reqs + 1) // 2),  # int32 gathered accepted tokens
+        ("ncomp", (max_reqs + 1) // 2),  # int32 num_computed_tokens
     )
     out, off = {}, 0
     for name, n in sizes:
@@ -874,13 +876,20 @@ def np1_arena_layout(q: int) -> dict[str, int]:
 
 
 @triton.jit
-def _np1_req(r, idx0, idx1, idx2, idx3):
-    return tl.where(r == 0, idx0, tl.where(r == 1, idx1, tl.where(r == 2, idx2, idx3)))
+def _np1_req(r, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR: tl.constexpr):
+    """Request slot of batch row `r` (NR = 4 or 8 slots passed as scalars)."""
+    if NR == 4:
+        return tl.where(r == 0, idx0, tl.where(r == 1, idx1, tl.where(r == 2, idx2, idx3)))
+    else:
+        lo = tl.where(r == 0, idx0, tl.where(r == 1, idx1, tl.where(r == 2, idx2, idx3)))
+        hi = tl.where(r == 4, idx4, tl.where(r == 5, idx5, tl.where(r == 6, idx6, idx7)))
+        return tl.where(r < 4, lo, hi)
 
 
 @triton.jit
 def _np1_gathered(
-    flat, gid, stride, num_reqs, num_rows, max_rows, idx0, idx1, idx2, idx3,
+    flat, gid, stride, num_reqs, num_rows, max_rows, idx0, idx1, idx2, idx3, idx4, idx5,
+    idx6, idx7, NR: tl.constexpr,
     src_ptrs, dst_ptrs, nb_ptr, nb_stride, mask,
 ):  # fmt: skip
     """The value `_gather_block_tables_kernel` leaves at flat offset `flat` of
@@ -891,7 +900,7 @@ def _np1_gathered(
     row = flat // stride
     col = flat % stride
     real = row < num_reqs
-    req = _np1_req(row, idx0, idx1, idx2, idx3)
+    req = _np1_req(row, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR)
     src = tl.load(src_ptrs + gid).to(tl.pointer_type(tl.int32))
     dst = tl.load(dst_ptrs + gid).to(tl.pointer_type(tl.int32))
     nb = tl.load(nb_ptr + gid * nb_stride + req, mask=mask & real, other=0)
@@ -905,6 +914,7 @@ def _np1_gathered(
 @triton.jit
 def _np1_kernel_table(
     row, kcol, gid, B, alpha, num_reqs, num_rows, max_rows, idx0, idx1, idx2, idx3,
+    idx4, idx5, idx6, idx7, NR: tl.constexpr,
     src_ptrs, dst_ptrs, bt_strides, nb_ptr, nb_stride, mask,
 ):  # fmt: skip
     """`AttentionGroup.map_to_kernel_block_table` of the forward block table:
@@ -912,7 +922,8 @@ def _np1_kernel_table(
     stride = tl.load(bt_strides + gid)
     v = _np1_gathered(
         row.to(tl.int64) * stride + kcol // B, gid, stride, num_reqs, num_rows,
-        max_rows, idx0, idx1, idx2, idx3, src_ptrs, dst_ptrs, nb_ptr, nb_stride, mask,
+        max_rows, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR, src_ptrs,
+        dst_ptrs, nb_ptr, nb_stride, mask,
     )  # fmt: skip
     return (kcol % B) + alpha * v
 
@@ -960,7 +971,8 @@ def _np1_slot(
 @triton.jit(
     do_not_specialize=[
         "nb_stride", "num_reqs", "num_rows", "idx0", "idx1", "idx2", "idx3",
-        "max_num_reqs", "max_num_tokens", "dcp_size", "dcp_rank", "cp_interleave",
+        "idx4", "idx5", "idx6", "idx7", "max_num_reqs", "max_num_tokens", "dcp_size",
+        "dcp_rank", "cp_interleave",
     ]
 )  # fmt: skip
 def _np1_step_prep_kernel(
@@ -983,12 +995,17 @@ def _np1_step_prep_kernel(
     idx1,
     idx2,
     idx3,
+    idx4,
+    idx5,
+    idx6,
+    idx7,
     max_num_reqs,
     max_num_tokens,
     dcp_size,
     dcp_rank,
     cp_interleave,
     Q: tl.constexpr,
+    NR: tl.constexpr,
     BT: tl.constexpr,
     BR: tl.constexpr,
     NG: tl.constexpr,
@@ -1047,7 +1064,7 @@ def _np1_step_prep_kernel(
         seq_lens = tl.load(out_tab + 3).to(tl.pointer_type(tl.int32))
         rr = tl.arange(0, BR)
         rmask = rr < num_reqs
-        req_r = _np1_req(rr, idx0, idx1, idx2, idx3)
+        req_r = _np1_req(rr, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR)
         nc_r = tl.load(nc_ptr + req_r, mask=rmask, other=0)
         tl.store(arena_ptr + A_IDX + rr, req_r.to(tl.int64), mask=rmask)
         cu = (arena_ptr + A_CU).to(tl.pointer_type(tl.int32))
@@ -1062,9 +1079,8 @@ def _np1_step_prep_kernel(
             tl.store(qsl + o, tl.minimum(o, num_reqs) * Q, mask=o < max_num_reqs + 1)
         for i1 in tl.range(0, max_num_reqs, BLOCK):
             o1 = i1 + tl.arange(0, BLOCK)
-            ov = tl.load(
-                nc_ptr + _np1_req(o1, idx0, idx1, idx2, idx3), mask=o1 < num_reqs, other=0
-            )
+            req_o1 = _np1_req(o1, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR)
+            ov = tl.load(nc_ptr + req_o1, mask=o1 < num_reqs, other=0)
             tl.store(
                 seq_lens + o1, tl.where(o1 < num_reqs, ov + Q, 0), mask=o1 < max_num_reqs
             )
@@ -1093,7 +1109,7 @@ def _np1_step_prep_kernel(
         tmask = t < num_tokens
         r = t // Q
         j = t % Q
-        req = _np1_req(r, idx0, idx1, idx2, idx3)
+        req = _np1_req(r, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR)
         nc = tl.load(nc_ptr + req, mask=tmask, other=0)
         plen = tl.load(prefill_len_ptr + req, mask=tmask, other=0)
         lv = tl.load(last + req, mask=tmask & (j == 0), other=0)
@@ -1126,7 +1142,7 @@ def _np1_step_prep_kernel(
             nacc_out = tl.load(out_tab + 8).to(tl.pointer_type(tl.int32))
             rr = tl.arange(0, BR)
             rmask = rr < num_reqs
-            req_r = _np1_req(rr, idx0, idx1, idx2, idx3)
+            req_r = _np1_req(rr, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR)
             mmask = rmask & (req_r >= 0)
             nc_r = tl.load(nc_ptr + req_r, mask=rmask, other=0)
             old = tl.load(sidx_in + req_r, mask=mmask, other=-1)
@@ -1152,7 +1168,7 @@ def _np1_step_prep_kernel(
         gid = tl.load(int_tab + 8 + gi)
         rr = tl.arange(0, BR)
         rmask = rr < num_reqs
-        req_r = _np1_req(rr, idx0, idx1, idx2, idx3)
+        req_r = _np1_req(rr, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR)
         nc_r = tl.load(nc_ptr + req_r, mask=rmask, other=0)
         ss = tl.arange(0, NSLOT_P2)
         first = tl.maximum((nc_r + Q - 1) // ALIGN_BS, 0)
@@ -1160,7 +1176,7 @@ def _np1_step_prep_kernel(
         flat = rr[:, None].to(tl.int64) * mstride + first[:, None] + ss[None, :]
         v = _np1_gathered(
             flat, gid, mstride, num_reqs, num_rows, max_num_reqs, idx0, idx1, idx2,
-            idx3, src_bt_ptrs, dst_bt_ptrs, nb_ptr, nb_stride, amask,
+            idx3, idx4, idx5, idx6, idx7, NR, src_bt_ptrs, dst_bt_ptrs, nb_ptr, nb_stride, amask,
         )  # fmt: skip
         tl.store(
             aligned + gi * a_s0 + rr[:, None] * a_s1 + ss[None, :] * a_s2, v, mask=amask
@@ -1194,7 +1210,7 @@ def _np1_step_prep_kernel(
         tmask = t < num_tokens
         r = t // Q
         j = t % Q
-        req = _np1_req(r, idx0, idx1, idx2, idx3)
+        req = _np1_req(r, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR)
         nc = tl.load(nc_ptr + req, mask=tmask, other=0)
         pos64 = (nc + j).to(tl.int64)
         sid = _np1_slot(
@@ -1216,7 +1232,7 @@ def _np1_step_prep_kernel(
         tmask = t < num_tokens
         r = t // Q
         j = t % Q
-        req = _np1_req(r, idx0, idx1, idx2, idx3)
+        req = _np1_req(r, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR)
         nc = tl.load(nc_ptr + req, mask=tmask, other=0)
         seq = nc + Q
         length = seq - Q + j + 1
@@ -1249,7 +1265,8 @@ def _np1_step_prep_kernel(
             )
             bn = _np1_kernel_table(
                 r, lpos // kbs, gid, kb, ka, num_reqs, num_rows, max_num_reqs, idx0,
-                idx1, idx2, idx3, src_bt_ptrs, dst_bt_ptrs, bt_strides, nb_ptr,
+                idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR,
+                src_bt_ptrs, dst_bt_ptrs, bt_strides, nb_ptr,
                 nb_stride, tmask,
             )  # fmt: skip
             valid = own != PAD_ID
@@ -1280,7 +1297,7 @@ def _np1_step_prep_kernel(
                         mask=oz_b1 < stride_b1,
                     )
             else:
-                req_b1 = _np1_req(row_b1, idx0, idx1, idx2, idx3)
+                req_b1 = _np1_req(row_b1, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR)
                 src_b1 = tl.load(src_bt_ptrs + g_b1).to(tl.pointer_type(tl.int32))
                 nb_b1 = tl.load(nb_ptr + g_b1 * nb_stride + req_b1)
                 src_row_b1 = src_b1 + req_b1 * stride_b1
@@ -1318,7 +1335,8 @@ def _np1_step_prep_kernel(
             mk_b3 = o3_b3 < kcols_b3
             v3_b3 = _np1_kernel_table(
                 row_b3, o3_b3, gid_b3, kb_b3, ka_b3, num_reqs, num_rows,
-                max_num_reqs, idx0, idx1, idx2, idx3, src_bt_ptrs, dst_bt_ptrs,
+                max_num_reqs, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR,
+                src_bt_ptrs, dst_bt_ptrs,
                 bt_strides, nb_ptr, nb_stride, mk_b3,
             )  # fmt: skip
             tl.store(kt_b3 + row_b3.to(tl.int64) * ostride_b3 + o3_b3, v3_b3, mask=mk_b3)
@@ -1339,7 +1357,8 @@ def _np1_step_prep_kernel(
             mk_b4 = o4_b4 < cols_b4
             v4_b4 = _np1_kernel_table(
                 row_b4, o4_b4, gid_b4, kb_b4, ka_b4, num_reqs, num_rows,
-                max_num_reqs, idx0, idx1, idx2, idx3, src_bt_ptrs, dst_bt_ptrs,
+                max_num_reqs, idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, NR,
+                src_bt_ptrs, dst_bt_ptrs,
                 bt_strides, nb_ptr, nb_stride, mk_b4,
             )  # fmt: skip
             tl.store(ebt_b4 + tok_b4.to(tl.int64) * ostride_b4 + o4_b4, v4_b4, mask=mk_b4)

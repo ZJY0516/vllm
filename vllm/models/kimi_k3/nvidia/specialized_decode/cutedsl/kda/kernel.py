@@ -23,6 +23,7 @@ from ..common.primitives import (
     load_words,
     mma_into,
     push_float,
+    scatter_reduce,
     smem_words,
     store_f32x4,
     unpack_bf16,
@@ -159,6 +160,8 @@ class KdaSplit:
         schedule=(0, 0, 0),
         tokens=1,
         record=False,
+        chunked=False,
+        tuned=False,
     ):
         # The gate stage sends decays for tokens 2 * quarter + column (at most 8), while
         # the decay barrier expects 512 bytes per token: more tokens would never arrive.
@@ -185,6 +188,16 @@ class KdaSplit:
         assert not self.gate_staged or self.rows >= 64
         self.evict = bool(evict)  # staged state traffic marked L2 evict-first
         assert self.staged or not self.evict
+        # Chunked (record verify only): the q tokens' delta rule in its chunkwise form
+        # (see `KdaSplitChunk`); one pass of state rows per CTA thread group.
+        self.chunked = bool(chunked)
+        # Tuned (record verify): the record slot read once per launch, and the
+        # query/key convolution windows written by every output owner (a slice each)
+        # instead of token 0's owner alone; the same values and addresses.
+        self.tuned = bool(tuned)
+        assert not self.tuned or (record and tokens > 1)
+        assert not self.chunked or (record and tokens > 1 and not self.staged)
+        assert not self.chunked or (self.passes == 1 and gate_mode != 2)
 
     @cute.jit
     def __call__(self, *args):
@@ -239,6 +252,8 @@ class KdaSplit:
             if cutlass.const_expr(self.staged):
                 staged = alloc(smem, Float32, (self.rows, 128), align=128)
                 state_barrier = smem.allocate(cutlass.Uint64, 8)
+            if cutlass.const_expr(self.chunked):  # [pair slot, warp] partial sums
+                pair_partials = alloc(smem, Float32, (self.pair_slots(), 4), align=16)
             gate_rows = None
             if cutlass.const_expr(self.gate_staged):  # [copy, lane] 16-byte slots
                 gate_rows = alloc(smem, Uint32, (self.rows // 2, 32, 4), align=128)
@@ -297,6 +312,9 @@ class KdaSplit:
                 nw = norm_weight[thread]
 
                 cute.arch.griddepcontrol_wait()
+                hoisted_row = None  # tuned: the record slot, read once
+                if cutlass.const_expr(self.tuned):
+                    hoisted_row = record_row(args, request)
                 inputs = cute.make_rmem_tensor(3 * T, BFloat16)
                 betas, gates = [], []
                 for t in cutlass.range_constexpr(T):
@@ -340,9 +358,12 @@ class KdaSplit:
                     shared_k[advance(thread, 128 * t)] = k
                     if cutlass.const_expr(self.record):  # noqa: SIM102
                         if partition == 0:
-                            args[19][record_row(args, request), head, t, thread] = (
-                                BFloat16(k)
-                            )
+                            if cutlass.const_expr(self.tuned):
+                                args[19][hoisted_row, head, t, thread] = BFloat16(k)
+                            else:
+                                args[19][record_row(args, request), head, t, thread] = (
+                                    BFloat16(k)
+                                )
                     vs.append(v)
                     qks += [q, k]
                     if cutlass.const_expr(t == T - 1):  # noqa: SIM102
@@ -370,7 +391,7 @@ class KdaSplit:
                     value = mul_rn(value, factor)
                     return mul_rn(value, scale) if query else value
 
-                if cutlass.const_expr(T > 1):  # normalize each token's q, k once
+                if cutlass.const_expr(T > 1 and not self.chunked):  # q, k once
                     if cutlass.const_expr(self.lean):  # lanes 2 t, 2 t + 1: q, k of t
                         norm_at = 8 * ((lane // 2) % T) + 4 * (lane % 2)
                         norm_sq = (reductions[norm_at] + reductions[norm_at + 2]) + (
@@ -417,8 +438,110 @@ class KdaSplit:
                         values = cute.make_tensor(pointer, cute.make_layout(self.rows))
                     return kr, qr, decays, values, betas[t]
 
-                ready = operands(0)
-                for t in cutlass.range_constexpr(T):
+                if cutlass.const_expr(self.chunked):
+                    # The q tokens' delta rule in its chunkwise form. Per key channel,
+                    # g_t = prod_{s<=t} d_s and r(i, t) = prod_{i<s<=t} d_s; per state
+                    # row, P_t = S0 . (g_t k_t) and R_t = S0 . (g_t q_t); per head,
+                    # A[t, i] = sum k_t k_i r(i, t) (i < t), B[t, i] = sum q_t k_i r(i, t)
+                    # (i <= t). Then u_t = beta_t (v_t - P_t - sum_{i<t} A[t, i] u_i) are
+                    # the corrections (the records) and o_t = R_t + sum_{i<=t} B[t, i] u_i
+                    # the outputs: one pass over the state rows instead of q.
+                    if cutlass.const_expr(self.lean):  # lanes 2 t, 2 t + 1: q, k of t
+                        norm_at = 8 * ((lane // 2) % T) + 4 * (lane % 2)
+                        norm_sq = (reductions[norm_at] + reductions[norm_at + 2]) + (
+                            reductions[norm_at + 1] + reductions[norm_at + 3]
+                        )
+                        lane_norm = reciprocal(sqrt_approx(norm_sq + 1.0e-6))
+                    q_keys, k_keys = [], []
+                    for t in cutlass.range_constexpr(T):
+                        if cutlass.const_expr(self.lean):
+                            fq = cute.arch.shuffle_sync(lane_norm, 2 * t)
+                            fk = cute.arch.shuffle_sync(lane_norm, 2 * t + 1)
+                        else:
+                            fq, fk = factors(t)
+                        q_keys.append(normalize(qks[2 * t], fq, True))
+                        k_keys.append(normalize(qks[2 * t + 1], fk, False))
+                    wait(gate_barrier)
+                    channel_decays = [
+                        shared_decay[advance(thread, 128 * t)] for t in range(T)
+                    ]
+                    ck_cum = channel_decays[0]
+                    for t in cutlass.range_constexpr(T):
+                        if cutlass.const_expr(t > 0):
+                            ck_cum = mul_rn(ck_cum, channel_decays[t])
+                        shared_k[128 * t + thread] = mul_rn(k_keys[t], ck_cum)
+                        shared_q[128 * t + thread] = mul_rn(q_keys[t], ck_cum)
+                    # This key channel's terms of A and B, summed over the warp (each
+                    # lane keeps one sum per 32 terms) and then over the four warps.
+                    pair_count: cutlass.Constexpr = self.pair_slots()
+                    ck_terms = zeros(pair_count, Float32)
+                    for i in cutlass.range_constexpr(T):
+                        ck_carried = k_keys[i]
+                        ck_terms[self.pair(i, i, True)] = mul_rn(q_keys[i], ck_carried)
+                        for t in cutlass.range_constexpr(i + 1, T):
+                            ck_carried = mul_rn(ck_carried, channel_decays[t])
+                            ck_terms[self.pair(t, i, False)] = mul_rn(k_keys[t], ck_carried)
+                            ck_terms[self.pair(t, i, True)] = mul_rn(q_keys[t], ck_carried)
+                    for ck_block in cutlass.range_constexpr(pair_count // 32):
+                        ck_part = cute.make_rmem_tensor(32, Float32)
+                        for i in cutlass.range_constexpr(32):
+                            ck_part[i] = ck_terms[32 * ck_block + i]
+                        ck_total, ck_owned = scatter_reduce(ck_part, lane, 32)
+                        pair_partials[32 * ck_block + ck_owned, warp] = ck_total
+                    cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                    chunk_dots = cute.make_rmem_tensor(2 * T, Float32)
+                    for t in cutlass.range_constexpr(T):
+                        for ck_which in cutlass.range_constexpr(2):
+                            ck_keys = shared_q if ck_which else shared_k
+                            ck_vec = cute.make_rmem_tensor((self.chunks, 4), Float32)
+                            for j in cutlass.range_constexpr(self.chunks):
+                                ck_column = 4 * (group_lane + self.lanes_per_row * j)
+                                ck_v4 = load_f32x4(
+                                    advance(ck_keys.iterator, 128 * t) + ck_column, shared=True
+                                )
+                                for e in cutlass.range_constexpr(4):
+                                    ck_vec[j, e] = ck_v4[e]
+                            chunk_dots[2 * t + ck_which] = self.row_dot(history, ck_vec, 0)
+                    for shift in reversed(range(self.lanes_per_row.bit_length() - 1)):
+                        for i in cutlass.range_constexpr(2 * T):
+                            chunk_dots[i] += cute.arch.shuffle_sync_bfly(chunk_dots[i], 1 << shift)
+                    ck_comb = []
+                    for ck_block in cutlass.range_constexpr(pair_count // 32):
+                        ck_c4 = load_f32x4(
+                            pair_partials.iterator + 4 * (32 * ck_block + lane), shared=True
+                        )
+                        ck_comb.append((ck_c4[0] + ck_c4[1]) + (ck_c4[2] + ck_c4[3]))
+
+                    def ck_matrix(t, i, query):
+                        ck_index = self.pair(t, i, query)
+                        return cute.arch.shuffle_sync(ck_comb[ck_index // 32], ck_index % 32)
+
+                    ck_row = group  # one pass: the thread group's state row
+                    ck_safe = ck_row % self.rows
+                    ck_send = (ck_row < self.rows) & (group_lane == 0)
+                    if cutlass.const_expr(self.early):
+                        cute.arch.cluster_wait()  # peers armed before the first send
+                    ck_u = []
+                    for t in cutlass.range_constexpr(T):
+                        ck_total = chunk_dots[2 * t]
+                        for i in cutlass.range_constexpr(t):
+                            ck_total = fma(ck_matrix(t, i, False), ck_u[i], ck_total)
+                        ck_v = shared_v[ck_safe + self.rows * t]
+                        ck_u.append((ck_v - ck_total) * betas[t])
+                    for t in cutlass.range_constexpr(T):
+                        ck_o = chunk_dots[2 * t + 1]
+                        for i in cutlass.range_constexpr(t + 1):
+                            ck_o = fma(ck_matrix(t, i, True), ck_u[i], ck_o)
+                        ck_kept = args[18][hoisted_row, head, t, None]
+                        if ck_send:
+                            ck_kept[value_base + ck_safe] = ck_u[t]
+                        ck_o = Float32(BFloat16(ck_o))  # stored BF16
+                        ck_pos = self.output_position(value_base + ck_row)
+                        ck_dst = advance(shared_o.iterator, 128 * t) + ck_pos
+                        ck_bar = advance(barrier, t // self.cluster)
+                        push_float(ck_dst, ck_o, ck_bar, t % self.cluster, when=ck_send)
+                ready = None if self.chunked else operands(0)
+                for t in cutlass.range_constexpr(0 if self.chunked else T):
                     current, ready = ready, operands(t + 1) if t + 1 < T else None
                     # Butterfly order: interleave rows per level, publish before state.
                     dots = cute.make_rmem_tensor(self.passes, Float32)
@@ -430,7 +553,9 @@ class KdaSplit:
                         stop = min(start + self.wave, self.passes)
                         lanes = (group, group_lane)
                         corrections = None
-                        if cutlass.const_expr(self.record):
+                        if cutlass.const_expr(self.record and self.tuned):
+                            corrections = args[18][hoisted_row, head, t, None]
+                        elif cutlass.const_expr(self.record):
                             corrections = args[18][
                                 record_row(args, request), head, t, None
                             ]
@@ -492,7 +617,21 @@ class KdaSplit:
                             gate_t = self.sigmoid(Float32(gate_t))
                         result = raw_o * rstd * nw * gate_t
                         output[advance(token, t), qk_channel] = BFloat16(result)
-                        if cutlass.const_expr(t == 0):
+                        if cutlass.const_expr(self.tuned and t < self.cluster):
+                            # Owner t writes the warp slices w (section * 4 + warp)
+                            # with w % owners == t, after its output barrier (every
+                            # CTA of the cluster has read its taps by then).
+                            owners: cutlass.Constexpr = min(T, self.cluster)
+                            for section in cutlass.range_constexpr(2):
+                                if (section * 4 + warp) % owners == t:
+                                    channel = section * dim + qk_channel
+                                    window = (taps[section, 1], taps[section, 2])
+                                    window += tuple(
+                                        inputs[3 * u + section] for u in range(T)
+                                    )
+                                    for i, value in enumerate(window):
+                                        conv_page[channel, i] = conv_type(value)
+                        if cutlass.const_expr(t == 0 and not self.tuned):
                             for section in cutlass.range_constexpr(2):
                                 channel = section * dim + qk_channel
                                 window = (taps[section, 1], taps[section, 2])
@@ -808,6 +947,16 @@ class KdaSplit:
                 cute.arch.mbarrier_init_fence()
         cute.arch.cluster_arrive_relaxed()
 
+    def pair_slots(self):
+        """Slots of the chunk's A and B key products (q^2), in blocks of 32."""
+        return -(-(self.tokens**2) // 32) * 32
+
+    def pair(self, t, i, query):
+        """Slot of A[t, i] (i < t) or, with `query`, B[t, i] (i <= t)."""
+        if query:
+            return self.tokens * (self.tokens - 1) // 2 + t * (t + 1) // 2 + i
+        return t * (t - 1) // 2 + i
+
     @cute.jit
     def row_dot(self, history, vector, p):
         partial = cute.make_rmem_tensor(self.chunks, Float32)
@@ -822,3 +971,37 @@ class KdaSplit:
     @cute.jit
     def output_position(self, row: Int32):
         return ((row & 7) << 4) | ((row >> 5) << 2) | ((row & 31) >> 3)
+
+
+class KdaSplitB(KdaSplit):
+    """KdaSplit's RecoverSSM verify with the record slot read once per launch and the
+    query/key convolution windows written by every output owner instead of token 0's
+    owner alone: the same values, records and outputs, bit for bit; measured faster
+    in A/B (benchmarks: kda8 chain, in_proj -> core -> o_proj)."""
+
+    def __init__(self, heads, batch, gate_mode, has_bias, schedule=(0, 0, 0), tokens=1):
+        super().__init__(
+            heads, batch, gate_mode, has_bias, schedule, tokens, True, tuned=True
+        )
+
+
+class KdaSplitChunk(KdaSplit):
+    """KdaSplit's RecoverSSM verify with the q tokens' delta rule in chunkwise form:
+    every token's decayed key and query meet the incoming state rows in one pass, and
+    a q x q lower-triangular system per head gives the corrections, so the state
+    rows are walked once instead of q times. Same operands, records and outputs
+    (rounding differs from the token-by-token order); measured faster in A/B
+    (benchmarks: kda8 chain, in_proj -> core -> o_proj)."""
+
+    def __init__(self, heads, batch, gate_mode, has_bias, schedule=(0, 0, 0), tokens=1):
+        super().__init__(
+            heads,
+            batch,
+            gate_mode,
+            has_bias,
+            schedule,
+            tokens,
+            True,
+            chunked=True,
+            tuned=True,
+        )

@@ -236,10 +236,12 @@ def plan_chunk(plan, token, chunk, words, xsf: cutlass.Constexpr = PLAN_XSF):
 
 
 class ExpertsPlanKernel:
-    """Standalone plan writer (no routing kernel in front): one CTA per token."""
+    """Standalone plan writer (no routing kernel in front): one CTA per token.
+    `early`: it releases the experts at entry (as the routing kernel of early-routed
+    batches does)."""
 
-    def __init__(self, batch):
-        self.batch = batch
+    def __init__(self, batch, early=False):
+        self.batch, self.early = batch, early
         self.xsf = plan_xsf(plan_rows(batch))
 
     @cute.jit
@@ -250,6 +252,8 @@ class ExpertsPlanKernel:
     def kernel(self, args):
         x, plan = args
         tid, _, _, token = thread()
+        if cutlass.const_expr(self.early):
+            cute.arch.griddepcontrol_launch_dependents()
         cute.arch.griddepcontrol_wait()
         for i in cutlass.range_constexpr(2):
             chunk = tid + 256 * i
@@ -258,7 +262,8 @@ class ExpertsPlanKernel:
                     x.iterator + token * 3584 + chunk * 8, count=4, mutable=True
                 )
                 plan_chunk(plan, token, chunk, words, self.xsf)
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.early):
+            cute.arch.griddepcontrol_launch_dependents()
 
 
 @asm()
@@ -323,6 +328,15 @@ def claim(pointer, value):
     return code, "=r,l,r,~{memory}", (pointer, Uint32(value))
 
 
+@asm(Uint32)
+def claim_if(pointer, lane):
+    """`claim(pointer, 1)` by the thread whose `lane` is 0 (others: no access, an
+    undefined result), with no branch around it, so nothing waits for the result
+    before its first use."""
+    code = "{ .reg .pred p; setp.eq.u32 p,$2,0; @p atom.relaxed.gpu.global.add.u32 $0,[$1],1; }"
+    return code, "=r,l,r,~{memory}", (pointer, Uint32(lane))
+
+
 def fc2_pairs(tp, capacity, streamed):
     """TP8 FC2 jobs are tile pairs on the incremental producer from capacity 4 (the
     grouped engine always streams): chunks 0-1 of tiles t and t + 1, then both tiles'
@@ -352,9 +366,38 @@ class ExpertsKernel(ExpertsGeometry):
     def __init__(
         self, tp, capacity, experts, grid, publish=False,
         stream=True, pregrouped=False, steal=False, listed=False, prefetch=False,
-        static=True, dynamic=False,
+        static=True, dynamic=False, claimed=0, cut_grid=0,
     ):  # fmt: skip
         super().__init__(tp, capacity)
+        # ``claimed`` (streamed, capacity 8-16): one grid-wide work list, claimed in
+        # order from a counter: FC1(A) tiles, FC1(B) tiles, then FC2(A) and FC2(B)
+        # jobs of ``claimed`` tile pairs (TP16: tiles) each. A CTA computes a whole
+        # FC1 tile, in the K segments the static split over ``cut_grid`` CTAs makes,
+        # each on its own accumulator, and sums them in that order, so every output
+        # is bit-identical to the static engine's. CTA stream rates vary by a few us
+        # per call; claims let faster CTAs take more work, and FC2(A) behind FC1(B)
+        # covers the last FC1 tiles. The grouped engine groups the routes itself.
+        self.claimed = claimed if (stream or capacity > 8) and 8 <= capacity <= 64 else 0
+        self.cut_grid = cut_grid or grid
+        # Claimed grouped SMEM (byte offsets): the unit map [claim_cap] Int16, the FC2
+        # unit rows ring [16, 8] Int16 and the routes: capacity <= 16, [256] Int32 in
+        # the misc block; wider, [16 x capacity] Int16 in a block after it, and a unit
+        # map for the most units 16 x capacity routes make.
+        self.claim_wide = bool(self.claimed) and capacity > 16
+        self.claim_cap = 256
+        self.at_units = self.off_misc + self.CLAIM_UNITS
+        self.at_ring = self.off_misc + self.CLAIM_RING
+        self.at_ids = self.off_misc + self.CLAIM_IDS
+        if self.claim_wide:
+            pairs = 16 * capacity
+            distinct = min(experts, pairs)
+            self.claim_cap = distinct + (pairs - distinct) // 8
+            self.at_ring = self.at_units + (2 * self.claim_cap + 15) // 16 * 16
+            assert self.at_ring + 256 <= self.off_misc + self.CLAIM_QUEUE
+            self.at_ids = self.smem_bytes
+            self.smem_bytes += 2 * pairs
+        if self.claimed:
+            static, dynamic, steal, pregrouped, listed = (False,) * 5
         # ``prefetch``: a trailing [PREFETCH_ROWS, 2] (address, bytes) table of the
         # next weights; each CTA's producer pulls its share into L2 once its last
         # weight stage is issued (the experts' drain leaves HBM idle).
@@ -372,6 +415,9 @@ class ExpertsKernel(ExpertsGeometry):
         # CTAs that stream faster take more of the tail (a pair job is computed
         # alone: bit-identical wherever it runs).
         self.dynamic = dynamic and self.static
+        # Claimed TP8 FC2 pairs: the MMA warp walks each claimed item from its first
+        # slot's metadata (`consume_claimed`).
+        self.walked = bool(self.claimed) and self.paired
         self.jobs = 14 if self.paired else 28  # FC2 jobs per unit
         self.grain, self.zone, self.victims = (1 if self.paired else 3, 8, 3)
         self.threads = 384
@@ -915,12 +961,15 @@ class ExpertsKernel(ExpertsGeometry):
         cute.arch.sync_warp()
 
     @cute.jit
-    def load_hidden(self, sm, workspace, ranges, parity):
+    def load_hidden(self, sm, workspace, ranges, parity, ids=None, batch=None):
+        """`ids` (grouped `claimed`): also each unit's rows into the ring entry of
+        its ordinal (the epilogue's FC2 rows; a ring entry is reused 16 units later,
+        while the epilogue trails the MMA by at most 16 accumulators)."""
         lane = thread()[2]
         full = view(sm.iterator, self.off_misc + self.bar_hfull, Uint64, 2)
         empty = view(sm.iterator, self.off_misc + self.bar_hempty, Uint64, 2)
         ordinal = Int32(-1)
-        queued: cutlass.Constexpr = self.steal or self.dynamic
+        queued: cutlass.Constexpr = self.steal or self.dynamic or bool(self.claimed)
         if cutlass.const_expr(queued):
             unit = self.pop_unit(sm, Int32(0))
             while unit >= 0:
@@ -929,6 +978,11 @@ class ExpertsKernel(ExpertsGeometry):
                 if ordinal >= 2:
                     self.sync(empty.iterator + buffer, (ordinal >> 1) - 1 & 1)
                     cute.arch.fence_proxy("async.shared", space="cta")  # MMA read it
+                if cutlass.const_expr(ids is not None):
+                    units_map = view(sm.iterator, self.at_units, Int16, self.claim_cap)
+                    entry = self.at_ring + (ordinal & 15) * 16
+                    rows = view(sm.iterator, entry, Int16, 8)
+                    self.unit_rows(sm, batch, Int32(units_map[unit]), rows)
                 image = self.image(workspace, parity, unit)
                 self.poll_hidden(sm, image, buffer)
                 if lane == 0:
@@ -1249,6 +1303,493 @@ class ExpertsKernel(ExpertsGeometry):
                 phase += chunks
             row += 1
 
+    # Claimed grouped engine: SMEM (misc) unit map [256] Int16 (expert | v << 12, v
+    # the expert's 8-token group), FC2 unit rows ring [16, 8] Int16 (by hidden
+    # ordinal), the routes [16 x 16] Int32.
+    CLAIM_UNITS, CLAIM_RING, CLAIM_IDS = 1280, 1792, 2080
+
+    @cute.jit
+    def claim_plan(self, distinct: Int32):
+        """(middle, FC1(A) tiles, FC1 tiles, items, FC2 items per unit) of the claimed
+        work list; the groups are `partition`'s."""
+        middle = distinct
+        if distinct > 40:
+            middle = (distinct * 50 + 99) // 100
+        per = (self.jobs + self.claimed - 1) // self.claimed
+        fc1 = self.tiles * distinct
+        return middle, self.tiles * middle, fc1, fc1 + per * distinct, per
+
+    @cute.jit
+    def claimed_units(self, sm, ids, workspace, batch: Int32):
+        """Grouped `claimed`: each expert's token count, then (in expert order) its
+        ceil(n / 8) units into the unit map, and the misc scalars (units, call,
+        grouped call), as `group` numbers them. Scratch at SMEM 0 (the weight ring
+        is not in use yet): a byte per (expert, token), cleared before the
+        dependency wait; each route sets its own byte (no shared atomics, which
+        drain slowly ahead of the loads after them), each expert's count is the
+        popcount of its 16 bytes."""
+        if cutlass.const_expr(self.claim_wide):
+            self.claimed_units_wide(sm, ids, workspace, batch)
+        else:
+            tid, warp, lane, cta = thread()
+            marks = view(sm.iterator, 0, Uint8, 16 * self.experts)
+            totals = view(sm.iterator, 16 * self.experts, Int32, self.threads // 32)
+            units_map = view(sm.iterator, self.at_units, Int16, self.claim_cap)
+            routes = view(sm.iterator, self.at_ids, Int32, 256)
+            scalars = view(sm.iterator, self.off_misc + 1140, Int32, 3)
+            mine = Int32(0)
+            if tid < batch * 16:
+                mine = ids[tid]
+            if tid == 0:
+                scalars[1] = view(workspace.iterator, self.ws_counter, Int32, 160)[cta]
+            if tid == 1:
+                scalars[2] = view(workspace.iterator, self.ws_calls, Int32, 160)[cta]
+            if tid < batch * 16:
+                routes[tid] = mine
+                marks[mine * 16 + (tid >> 4)] = Uint8(1)
+            cute.arch.sync_threads()
+            span: cutlass.Constexpr = (self.experts + self.threads - 1) // self.threads
+            units = cute.make_rmem_tensor(span, Int32)
+            count = Int32(0)
+            for j in cutlass.range_constexpr(span):
+                units[j], e = (Int32(0), span * tid + j)
+                if e < self.experts:
+                    words = smem_words(sm.iterator + e * 16)
+                    n = Int32(0)
+                    for w in cutlass.range_constexpr(4):
+                        n += Int32(cute.arch.popc(words[w]))
+                    units[j] = (n + 7) >> 3
+                count += units[j]
+            total = count
+            for shift in cutlass.range_constexpr(5):
+                other = cute.arch.shuffle_sync_up(total, 1 << shift)
+                if lane >= 1 << shift:
+                    total += other
+            if lane == 31:
+                totals[warp] = total
+            cute.arch.sync_threads()
+            start = total - count
+            for w in cutlass.range_constexpr(self.threads // 32 - 1):
+                if warp > w:
+                    start += totals[w]
+            if tid == self.threads - 1:
+                scalars[0] = start + count
+            for j in cutlass.range_constexpr(span):
+                e = span * tid + j
+                if e < self.experts:
+                    for v in range(units[j]):
+                        units_map[start + v] = Int16(e | v << 12)
+                start += units[j]
+            cute.arch.sync_threads()
+
+
+    @cute.jit
+    def claimed_units_wide(self, sm, ids, workspace, batch: Int32):
+        """`claimed_units` for capacity > 16: a byte per (expert, token) over
+        `capacity` tokens, rounds of 384 pairs; each route is kept as Int16 expert |
+        rank << 10 (rank: the expert's earlier tokens), so `unit_rows_wide` places
+        a unit's pairs without a scan."""
+        tid, warp, lane, cta = thread()
+        cap: cutlass.Constexpr = self.capacity
+        marks = view(sm.iterator, 0, Uint8, cap * self.experts)
+        totals = view(sm.iterator, cap * self.experts, Int32, self.threads // 32)
+        units_map = view(sm.iterator, self.at_units, Int16, self.claim_cap)
+        routes = view(sm.iterator, self.at_ids, Int16, 16 * cap)
+        scalars = view(sm.iterator, self.off_misc + 1140, Int32, 3)
+        if tid == 0:
+            scalars[1] = view(workspace.iterator, self.ws_counter, Int32, 160)[cta]
+        if tid == 1:
+            scalars[2] = view(workspace.iterator, self.ws_calls, Int32, 160)[cta]
+        rounds: cutlass.Constexpr = (16 * cap + self.threads - 1) // self.threads
+        mine = cute.make_rmem_tensor(rounds, Int32)
+        for k in cutlass.range_constexpr(rounds):
+            pair = tid + self.threads * k
+            mine[k] = Int32(0)
+            if pair < batch * 16:
+                mine[k] = ids[pair]
+                marks[mine[k] * cap + (pair >> 4)] = Uint8(1)
+        cute.arch.sync_threads()
+        for k in cutlass.range_constexpr(rounds):
+            pair = tid + self.threads * k
+            if pair < batch * 16:
+                token, rank = (pair >> 4, Int32(0))
+                for q in cutlass.range_constexpr(cap // 16):
+                    if 16 * q < token:
+                        words = smem_words(sm.iterator + mine[k] * cap + 16 * q)
+                        for w in cutlass.range_constexpr(4):
+                            below = token - (16 * q + 4 * w)
+                            if below >= 4:
+                                rank += Int32(cute.arch.popc(words[w]))
+                            elif below > 0:
+                                keep = (Uint32(1) << (8 * below)) - 1
+                                rank += Int32(cute.arch.popc(words[w] & keep))
+                routes[pair] = Int16(mine[k] | rank << 10)
+        span: cutlass.Constexpr = (self.experts + self.threads - 1) // self.threads
+        units = cute.make_rmem_tensor(span, Int32)
+        count = Int32(0)
+        for j in cutlass.range_constexpr(span):
+            units[j], e = (Int32(0), span * tid + j)
+            if e < self.experts:
+                n = Int32(0)
+                for q in cutlass.range_constexpr(cap // 16):
+                    words = smem_words(sm.iterator + e * cap + 16 * q)
+                    for w in cutlass.range_constexpr(4):
+                        n += Int32(cute.arch.popc(words[w]))
+                units[j] = (n + 7) >> 3
+            count += units[j]
+        total = count
+        for shift in cutlass.range_constexpr(5):
+            other = cute.arch.shuffle_sync_up(total, 1 << shift)
+            if lane >= 1 << shift:
+                total += other
+        if lane == 31:
+            totals[warp] = total
+        cute.arch.sync_threads()
+        start = total - count
+        for w in cutlass.range_constexpr(self.threads // 32 - 1):
+            if warp > w:
+                start += totals[w]
+        if tid == self.threads - 1:
+            scalars[0] = start + count
+        for j in cutlass.range_constexpr(span):
+            e = span * tid + j
+            if e < self.experts:
+                for v in range(units[j]):
+                    units_map[start + v] = Int16(e | v << 12)
+            start += units[j]
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def unit_rows(self, sm, batch: Int32, word: Int32, rows):
+        """Warp: the pair indices (token * 16 + slot) of unit `word` (expert | v << 12:
+        the expert's tokens 8v..8v+7 in token order, as `group` fills units) into
+        `rows` (8 x Int16, -1 padded), from the routes in SMEM. Lane l scans pairs
+        8l..8l+7."""
+        if cutlass.const_expr(self.claim_wide):
+            self.unit_rows_wide(sm, batch, word, rows)
+        else:
+            lane = thread()[2]
+            expert, v = (word & 4095, word >> 12)
+            first = lane * 8
+            hits = Uint32(0)
+            if first < batch * 16:
+                for h in cutlass.range_constexpr(2):
+                    routes = sm.iterator + self.at_ids + (first + 4 * h) * 4
+                    words = smem_words(routes)
+                    for i in cutlass.range_constexpr(4):
+                        if Int32(words[i]) == expert:
+                            hits |= Uint32(1) << (4 * h + i)
+            count = Int32(cute.arch.popc(hits))
+            total = count
+            for shift in cutlass.range_constexpr(5):
+                other = cute.arch.shuffle_sync_up(total, 1 << shift)
+                if lane >= 1 << shift:
+                    total += other
+            if lane < 8:
+                rows[lane] = Int16(-1)
+            cute.arch.sync_warp()
+            for i in cutlass.range_constexpr(8):
+                if hits >> i & 1 != 0:
+                    rank = total - count + Int32(cute.arch.popc(hits & (1 << i) - 1))
+                    row = rank - 8 * v
+                    if (row >= 0) & (row < 8):
+                        rows[row] = Int16(first + i)
+            cute.arch.sync_warp()
+
+
+    @cute.jit
+    def unit_rows_wide(self, sm, batch: Int32, word: Int32, rows):
+        """`unit_rows` for capacity > 16: routes hold expert | rank << 10, so each
+        lane places its own pairs (8 per 256-pair pass) at row rank - 8v."""
+        lane = thread()[2]
+        expert, v = (word & 4095, word >> 12)
+        if lane < 8:
+            rows[lane] = Int16(-1)
+        cute.arch.sync_warp()
+        for p in cutlass.range_constexpr((16 * self.capacity + 255) // 256):
+            first = p * 256 + lane * 8
+            if first < batch * 16:
+                words = smem_words(sm.iterator + self.at_ids + first * 2)
+                for i in cutlass.range_constexpr(8):
+                    route = Int32(words[i // 2] >> (16 * (i % 2)) & Uint32(65535))
+                    row = (route >> 10) - 8 * v
+                    if ((route & 1023) == expert) & (row >= 0) & (row < 8):
+                        rows[row] = Int16(first + i)
+        cute.arch.sync_warp()
+
+    # Claimed work queue (misc): two decoded items [2, 8] Int32 (item, unit word,
+    # FC1 segment-close mask or FC2 first job, FC2 end job, FC1 unit rows [8] Int16),
+    # full [2] and started barriers.
+    CLAIM_QUEUE, CLAIM_BARS = 4224, 4288
+
+    @cute.jit
+    def decode(self, sm, item, middle, t0, fc1, per, distinct, experts, batch, rows):
+        """(unit word, a, b) of claimed item `item`: FC1 tiles a = the 14-bit mask of
+        stages that close a K segment (where the static split over `cut_grid` CTAs
+        cuts the tile's group, ``partition``) and grouped, the unit's rows into
+        `rows` (warp); FC2 items (a, b) = their tile-pair (TP16: tile) jobs."""
+        tiles = self.tiles
+        word, a, b = (Int32(0), Int32(0), Int32(0))
+        if item < fc1:
+            word = Int32(experts[item // tiles])
+            local, count = (item, middle)
+            if item >= t0:
+                local, count = (item - t0, distinct - middle)
+            grid = self.cut_grid
+            size = tiles * 14 * count
+            first = 14 * local
+            cut_index = ((first + 1) * grid + size - 1) // size  # first cut past it
+            cut = size
+            if cut_index < grid:
+                cut = cut_index * size // grid
+            mask = Int32(1 << 13)
+            for ks in cutlass.range(13, unroll=1):
+                if first + ks + 1 == cut:
+                    mask |= Int32(1) << ks
+                    while (cut == first + ks + 1) & (cut_index < grid):
+                        cut_index += 1
+                        cut = size
+                        if cut_index < grid:
+                            cut = cut_index * size // grid
+            a = mask
+            if cutlass.const_expr(self.grouped):
+                self.unit_rows(sm, batch, word, rows)
+        else:
+            q = item - fc1
+            unit = q // per
+            word = Int32(experts[unit])
+            a = (q - unit * per) * self.claimed
+            b = a + self.claimed
+            if b > self.jobs:
+                b = Int32(self.jobs)
+        return word, a, b
+
+    @cute.jit
+    def claim_items(self, sm, experts, workspace, batch: Int32, distinct: Int32):
+        """Scheduler warp of the claimed list: once the producer starts item j it
+        claims item j + 1 (lookahead one, as a claim in flight), decodes it into
+        queue entry j & 1 and signals full[j & 1]; an item past the list ends the
+        producer. Every CTA with a first item claims until one claim fails: items
+        claims in all, so the grid's last claim returns items - 2 and its CTA re-arms
+        the counter (-1) for the next call (no CTA touches it again)."""
+        lane, cta = (thread()[2], thread()[3])
+        middle, t0, fc1, total, per = self.claim_plan(distinct)
+        counter = workspace.iterator + self.ws_claim + 4
+        queue = view(sm.iterator, self.off_misc + self.CLAIM_QUEUE, Int32, 16)
+        bars = view(sm.iterator, self.off_misc + self.CLAIM_BARS, Uint64, 3)
+        j, item = (Int32(0), Int32(cta))
+        while item < total:
+            if lane == 0:  # one poller; the warp parks at its barrier
+                self.sync(bars.iterator + 2, j & 1)  # the producer started item j
+            cute.arch.sync_warp()
+            value = shuffle(Int32(claim_if(counter, lane)), 0)
+            if lane == 0:
+                if value == total - 2:
+                    store_words(counter, (Uint32(4294967295),), scope="gpu")
+            item = value + 1 + self.grid
+            entry = (j & 1) * 8
+            rows = view(sm.iterator, self.off_misc + self.CLAIM_QUEUE + entry * 4 + 16, Int16, 8)
+            word, a, b = (Int32(0), Int32(0), Int32(0))
+            if item < total:
+                word, a, b = self.decode(
+                    sm, item, middle, t0, fc1, per, distinct, experts, batch, rows
+                )
+            if lane == 0:
+                queue[entry], queue[entry + 1] = (item, word)
+                queue[entry + 2], queue[entry + 3] = (a, b)
+                cute.arch.mbarrier_arrive(bars.iterator + (j & 1))
+            cute.arch.sync_warp()
+            j += 1
+
+    @cute.jit
+    def stream_claimed(
+        self, sm, maps, w13_scales, w2_scales, experts, plan, ids, workspace,
+        batch: Int32, distinct: Int32, table=None,
+    ):  # fmt: skip
+        """The `claimed` producer: grouped, the whole warp (lane 0 issues the weights,
+        every lane cp.asyncs the FC1 stages' x slices); else lane 0 alone. CTA c's
+        first item is c (decoded here), the next ones come decoded from the
+        scheduler warp (`claim_items`)."""
+        lane, cta = (thread()[2], thread()[3])
+        grouped: cutlass.Constexpr = self.grouped
+        barriers = view(sm.iterator, self.off_misc, Uint64, 2 * self.stages)
+        metadata = view(sm.iterator, self.off_meta, Int32, 4 * self.stages)
+        ring = (sm, barriers, metadata, w2_scales)
+        middle, t0, fc1, total, per = self.claim_plan(distinct)
+        queue = view(sm.iterator, self.off_misc + self.CLAIM_QUEUE, Int32, 16)
+        bars = view(sm.iterator, self.off_misc + self.CLAIM_BARS, Uint64, 3)
+        # Item 0's rows go to entry 1 (item j's are in entry (j - 1) & 1); the
+        # scheduler writes entry 1 once item 1 has started.
+        own = view(sm.iterator, self.off_misc + self.CLAIM_QUEUE + 48, Int16, 8)
+        item = Int32(cta)
+        # Item 0 (an FC1 tile when the list has enough): its first ring stages' bytes
+        # are requested before decoding it; their barriers expect them later.
+        early = Int32(0)
+        if item < fc1:
+            first = Int32(experts[item // self.tiles])
+            if cutlass.const_expr(grouped):
+                first = first & 4095
+            r = item % self.tiles
+            row = first * self.w13_rows + r * 128
+            base = Int64(first) * self.w13_scale_bytes + r * 14336
+            if lane == 0:
+                for ks in cutlass.range_constexpr(min(self.stages, 14)):
+                    work = (row, Int32(2 * ks), base + ks * 1024, Int32(1024))
+                    self.fetch(sm, maps.iterator, w13_scales, barriers, Int32(ks), *work)
+            early = Int32(min(self.stages, 14))
+        word, a, b = (Int32(0), Int32(0), Int32(0))
+        if item < total:
+            word, a, b = self.decode(
+                sm, item, middle, t0, fc1, per, distinct, experts, batch, own
+            )
+        slot, phase, issued = (Int32(0), Int32(0), Int32(0))
+        pushed, current, j = (Int32(0), Int32(-1), Int32(0))
+        while item < total:
+            sources = None
+            if cutlass.const_expr(grouped):  # this lane's x rows of an FC1 tile
+                entry = self.off_misc + self.CLAIM_QUEUE + ((j - 1) & 1) * 32 + 16
+                rows = view(sm.iterator, entry, Int16, 8)
+                sources = cute.make_rmem_tensor(5, Int32)
+                for k in cutlass.range_constexpr(5):
+                    row = 2 * k + lane // 16 if k < 4 else lane & 7
+                    pair = Int32(rows[row])
+                    if pair < 0:
+                        pair = Int32(rows[0])
+                    sources[k] = (pair >> 4) * (3584 if k < 4 else 448)
+                cute.arch.sync_warp()
+            if lane == 0:
+                cute.arch.mbarrier_arrive(bars.iterator + 2)  # started item j
+            if item < fc1:
+                slot, phase, issued = self.fc1_tile(
+                    ring, (slot, phase, issued), maps, w13_scales, plan, item,
+                    word & 4095 if grouped else word, a, sources, early,
+                )  # fmt: skip
+                early = Int32(0)
+            else:
+                slot, phase, issued, pushed, current = self.claimed_fc2(
+                    ring, (slot, phase, issued, pushed, current), maps, w2_scales,
+                    word, (item - fc1) // per, a, b,
+                )  # fmt: skip
+            if lane == 0:
+                self.sync(bars.iterator + (j & 1), j >> 1 & 1)  # item j + 1, decoded
+            if cutlass.const_expr(grouped):  # (else lane 0 runs alone)
+                cute.arch.sync_warp()
+            entry = (j & 1) * 8
+            item, word = (queue[entry], queue[entry + 1])
+            a, b = (queue[entry + 2], queue[entry + 3])
+            j += 1
+        if lane == 0:
+            self.push_unit(sm, pushed, Int32(-1))
+            self.end_ring(barriers, metadata, slot, phase, issued)
+            if cutlass.const_expr(table is not None):
+                self.prefetch_next(table)
+
+    @cute.jit
+    def claimed_fc2(self, ring, state, maps, w2_scales, word, unit, lo, hi):
+        """Claimed FC2 item: jobs lo..hi-1 (TP8 tile pairs, TP16 tiles) of `unit`,
+        issued by lane 0 (grouped: the warp then takes its ring)."""
+        sm = ring[0]
+        lane = thread()[2]
+        slot, phase, issued, pushed, current = state
+        expert = word
+        if cutlass.const_expr(self.grouped):
+            expert = word & 4095
+        if lane == 0:
+            if unit != current:
+                pushed = self.push_unit(sm, pushed, unit)
+                current = unit
+            for j in cutlass.range(lo, hi, unroll=1):
+                if cutlass.const_expr(self.paired):
+                    job = (maps.iterator, expert, unit, 2 * j)
+                    slot, phase, issued = self.fc2_pair(ring, slot, phase, issued, *job)
+                else:
+                    row = expert * 3584 + j * 128
+                    offset = Int64(expert) * self.w2_scale_bytes
+                    offset += j * self.w2_tile_scale_bytes
+                    tma = (maps.iterator + 128, w2_scales, row, Int32(0), offset)
+                    tma += (Int32(1024),)
+                    meta = (Int32(1), unit, j, Int32(0))
+                    slot, phase, issued = self.issue(
+                        ring, slot, phase, issued, meta, tma, True
+                    )
+        if cutlass.const_expr(self.grouped):  # the warp follows lane 0's ring
+            slot, phase = (shuffle(slot, 0), shuffle(phase, 0))
+            issued, pushed = (shuffle(issued, 0), shuffle(pushed, 0))
+            current = shuffle(current, 0)
+        return slot, phase, issued, pushed, current
+
+    @cute.jit
+    def fc1_tile(
+        self, ring, state, maps, w13_scales, plan, item, expert, closes, sources=None,
+        early=None,
+    ):  # fmt: skip
+        """FC1 tile `item` (unit item // tiles, row tile item % tiles) whole: 14
+        stages; `closes` marks the stages that close a K segment (`decode`). Stage
+        flags: bit 0 opens a segment, bit 1 closes it, bit 2 the tile's first
+        segment, bit 3 its last stage. `sources`: grouped, the warp gathers each
+        stage's x slice. `early`: its first `early` stages' bytes were requested
+        already (the CTA's first item)."""
+        slot, phase, issued = state
+        r = item % self.tiles
+        row = expert * self.w13_rows + r * 128
+        base = Int64(expert) * self.w13_scale_bytes + r * 14336
+        for ks in cutlass.range(14, unroll=1):
+            flags = closes  # the walker (`consume_claimed`) reads the tile's mask
+            if cutlass.const_expr(not self.walked):  # `consume` reads stage flags
+                before = closes & ((Int32(1) << ks) - 1)
+                close = closes >> ks & 1
+                opens = Int32(ks == 0) | ((closes << 1) >> ks & 1)
+                flags = opens | close << 1 | Int32(before == 0) << 2
+                flags |= Int32(ks == 13) << 3
+            tma = (maps.iterator, w13_scales, row, 2 * ks, base + ks * 1024)
+            tma += (Int32(1024),)
+            meta = (Int32(0), item, ks, flags)
+            loaded = ks < early
+            if cutlass.const_expr(sources is not None):
+                slot, phase, issued = self.issue_x(
+                    ring, slot, phase, issued, meta, tma, plan, sources, ks, loaded
+                )
+            else:
+                slot, phase, issued = self.issue(
+                    ring, slot, phase, issued, meta, tma, False, None, loaded
+                )
+        return slot, phase, issued
+
+    @cute.jit
+    def issue_x(self, ring, slot, phase, issued, meta, tma, plan, sources, ks, loaded):
+        """One grouped FC1 stage from the whole producer warp: lane 0 publishes the
+        metadata and issues the weight box and scales, every lane cp.asyncs its share
+        of the stage's 8-row x slice and scale rows (as `gather_x`) and arrives once
+        (full: 32 + 1 arrivals and the TMA bytes)."""
+        sm, barriers, metadata = ring[:3]
+        desc, scales, row, chunk, offset, size = tma
+        lane = thread()[2]
+        if issued >= self.stages:
+            if lane == 0:  # one poller; the warp parks at its barrier
+                self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
+            cute.arch.sync_warp()
+        full = barriers.iterator + slot
+        if lane == 0:
+            for i in cutlass.range_constexpr(4):
+                metadata[4 * slot + i] = meta[i]
+            cute.arch.mbarrier_arrive_and_expect_tx(full, 16384 + size)
+            if not loaded:
+                self.fetch(sm, desc, scales, barriers, slot, row, chunk, offset, size)
+        part, half = (lane & 15, lane // 16)
+        for j in cutlass.range_constexpr(4):
+            dst = self.off_x + swizzled(part, 2 * j + half) + slot * 2048
+            src = sources[j] + ks * 256 + part * 16
+            copy_g2s(sm.iterator + dst, plan.iterator + src)
+        if lane < 16:
+            dst = self.off_xsf + lane // 8 * 128 + (lane & 7) * 16 + slot * 256
+            src = self.plan_xsf + sources[4] + (2 * ks + lane // 8) * 16
+            copy_g2s(sm.iterator + dst, plan.iterator + src)
+        cute.arch.cp_async_mbarrier_arrive_noinc(full)
+        slot += 1
+        if slot == self.stages:
+            slot, phase = (Int32(0), phase ^ 1)
+        return slot, phase, issued + 1
+
     @cute.jit
     def fc2_pair(self, ring, slot, phase, issued, maps, expert, unit, tile):
         """The three 16 KB stages of FC2 tiles `tile` and `tile + 1`: chunks 0-1 of
@@ -1267,11 +1808,13 @@ class ExpertsKernel(ExpertsGeometry):
 
     @cute.jit
     def issue(
-        self, ring, slot, phase, issued, meta, tma, fc2: cutlass.Constexpr, more=None
-    ):
+        self, ring, slot, phase, issued, meta, tma, fc2: cutlass.Constexpr, more=None,
+        loaded=None,
+    ):  # fmt: skip
         """One grouped stage: wait for its slot, publish the metadata, expect and issue
         the weight box and scales (FC2: standing in for the gather warp's 32
-        arrivals); returns the advanced (slot, phase, issued)."""
+        arrivals); returns the advanced (slot, phase, issued). `loaded` (claimed):
+        the box and scales were already requested (`stream_claimed`)."""
         sm, barriers, metadata = ring[:3]
         desc, scales, row, chunk, offset, size = tma
         if issued >= self.stages:
@@ -1282,7 +1825,11 @@ class ExpertsKernel(ExpertsGeometry):
         full = barriers.iterator + slot
         total = 16384 + size if more is None else 16384 + 2 * size
         cute.arch.mbarrier_arrive_and_expect_tx(full, total)
-        self.fetch(sm, desc, scales, barriers, slot, row, chunk, offset, size, more)
+        if cutlass.const_expr(loaded is not None):
+            if not loaded:
+                self.fetch(sm, desc, scales, barriers, slot, row, chunk, offset, size)
+        else:
+            self.fetch(sm, desc, scales, barriers, slot, row, chunk, offset, size, more)
         if cutlass.const_expr(fc2 and self.grouped):
             cute.arch.mbarrier_arrive(full, arrive_count=32)
         slot += 1
@@ -1424,6 +1971,8 @@ class ExpertsKernel(ExpertsGeometry):
                         ready = (hfull.iterator + hbuffer, ordinal >> 1 & 1, True)
                         self.sync(*ready)
                         copy_scales = Uint32(1)
+                    if cutlass.const_expr(self.claimed and self.grouped):
+                        c = ordinal  # the epilogue's index into the unit rows ring
                     hd = h0 + hbuffer * (self.h_image_bytes // 16)
                     hs = hsf0 + hbuffer * (self.h_scale_bytes // 16)
                     sfbc = tmem + 128 + 8 * stages + hbuffer * self.w2_scale_columns
@@ -1491,6 +2040,14 @@ class ExpertsKernel(ExpertsGeometry):
                     self.signal(accmeta, accfull, acc, (kind, a, b, c))
                     uses += 1
                     acc = uses % 16
+                if cutlass.const_expr(self.claimed):
+                    # A closed FC1 K segment short of its tile's end: one empty use,
+                    # so the tile's next segment reaches the same epilogue group.
+                    if (kind == 0) & (c & 10 == 2):
+                        self.acquire(accempty, acc, uses)
+                        self.signal(accmeta, accfull, acc, (Int32(6), a, b, c), 2)
+                        uses += 1
+                        acc = uses % 16
                 count += 1
 
     @cute.jit
@@ -1605,10 +2162,118 @@ class ExpertsKernel(ExpertsGeometry):
             uses += 1
 
     @cute.jit
-    def pair_job(self, ctx, state, unit, job):
+    def consume_claimed(self, sm, tmem):
+        """`consume` for the claimed list (TP8 FC2 pairs): the MMA warp reads each
+        item's first slot metadata (FC1: tile, segment-close mask; FC2: unit, first
+        tile pair; end: kind 2) and walks the item's stages (`walk_tile`,
+        `pair_job`) with no per-slot metadata: the MMAs, scale copies, commits and
+        published accumulator metadata are `consume`'s, in the same order."""
+        lane = thread()[2]
+        stages = self.stages
+        bars: tuple = (self.bar_full, self.bar_empty, self.bar_accfull)
+        bars += (self.bar_accempty, self.bar_hfull, self.bar_hempty, self.bar_xready)
+        full, empty, accfull, accempty, hfull, hempty, xready = (
+            view(sm.iterator, self.off_misc + o, Uint64, n)
+            for o, n in zip(bars, (stages, stages, 16, 16, 2, 2, 14))
+        )
+        accmeta = view(sm.iterator, self.off_misc + 600, Int32, 64)
+        meta = view(sm.iterator, self.off_meta, Int32, 4 * stages)
+        offsets = (0, self.off_sfa, self.off_x, self.off_xsf, self.off_h, self.off_hsf)
+        a0, asf0, x0, xsf0, h0, hsf0 = (
+            smem_desc(sm.iterator + o, i % 2 == 0) for i, o in enumerate(offsets)
+        )
+        walk = ((full, empty, accfull, accempty, xready, accmeta), (a0, asf0, x0, xsf0))
+        ctx = (full, empty, accfull, accempty, hfull, hempty, accmeta)
+        ctx += (a0, asf0, h0, hsf0, tmem)  # type: ignore[assignment]
+        slot, phase, uses, xmask = (Int32(0), Int32(0), Int32(0), Uint32(0))
+        current, ordinal, hbuffer = (Int32(-1), Int32(-1), Int32(0))
+        ended = False
+        while not ended:
+            self.sync(full.iterator + slot, phase, True)
+            kind, a = (meta[4 * slot], meta[4 * slot + 1])
+            b, c = (meta[4 * slot + 2], meta[4 * slot + 3])
+            ended = kind == 2
+            if kind == 0:
+                state = (slot, phase, uses, xmask)
+                slot, phase, uses, xmask = self.walk_tile(*walk, tmem, state, a, c)
+            elif kind == 1:
+                hi = (b >> 1) + self.claimed
+                if hi > self.jobs:
+                    hi = Int32(self.jobs)
+                for job in cutlass.range(b >> 1, hi, unroll=1):
+                    state = (slot, phase, uses, current, ordinal, hbuffer)
+                    state = self.pair_job(ctx, state, a, job, self.grouped)
+                    slot, phase, uses, current, ordinal, hbuffer = state
+        if (lane == 0) & (current >= 0):
+            commit(hempty.iterator + hbuffer)
+        for _ in cutlass.range(2, unroll=1):
+            self.acquire(accempty, uses % 16, uses)
+            self.signal(accmeta, accfull, uses % 16, (Int32(2), 0, 0, 0), 2)
+            uses += 1
+
+    @cute.jit
+    def walk_tile(self, bars, descs, tmem, state, tile, closes):
+        """The MMA warp's 14 stages of claimed FC1 tile `tile` (its first slot's
+        bytes already waited for): `consume`'s kind-0 handling with the stage
+        flags `fc1_tile` derives from the segment-close mask `closes`, then an
+        empty accumulator use after every segment short of the tile's end."""
+        full, empty, accfull, accempty, xready, accmeta = bars
+        a0, asf0, x0, xsf0 = descs
+        slot, phase, uses, xmask = state
+        stages, wsf = (self.stages, tmem + 128)
+        acc = uses % 16
+        for ks in cutlass.range(14, unroll=1):
+            if ks > 0:
+                self.sync(full.iterator + slot, phase, True)
+            before = closes & ((Int32(1) << ks) - 1)
+            close = closes >> ks & 1
+            opens = Int32(ks == 0) | ((closes << 1) >> ks & 1)
+            flags = opens | close << 1 | Int32(before == 0) << 2 | Int32(ks == 13) << 3
+            if opens != 0:
+                self.acquire(accempty, acc, uses)
+            xi, copy_scales = (slot, Uint32(0))
+            if cutlass.const_expr(self.grouped):
+                # The slot's own image (its cp.async completed full[slot]).
+                cute.arch.fence_proxy("async.shared", space="cta")
+                copy_scales = Uint32(1)
+            else:
+                xi = ks
+                if xmask >> ks & 1 == 0:
+                    self.sync(xready.iterator + ks, 0, True)
+                    xmask |= Uint32(1) << ks
+                    copy_scales = Uint32(1)
+            completion = Uint32(0)
+            if close != 0:
+                completion = shared_address(accfull.iterator + acc)
+            stage(
+                (tmem + acc * 8, a0 + slot * 2048, x0 + xi * 128),
+                (wsf + slot * 8, asf0 + slot * 64),
+                (tmem + 256 + xi * 8, xsf0 + xi * 16, copy_scales),
+                (Uint32(opens == 0), shared_address(empty.iterator + slot)),
+                completion,
+                kind="fc1",
+            )
+            cute.arch.sync_warp()
+            if close != 0:
+                self.signal(accmeta, accfull, acc, (Int32(0), tile, ks, flags))
+                uses += 1
+                acc = uses % 16
+                if ks < 13:  # empty use: the next segment reaches the same group
+                    self.acquire(accempty, acc, uses)
+                    self.signal(accmeta, accfull, acc, (Int32(6), tile, ks, flags), 2)
+                    uses += 1
+                    acc = uses % 16
+            slot += 1
+            if slot == stages:
+                slot, phase = (Int32(0), phase ^ 1)
+        return slot, phase, uses, xmask
+
+    @cute.jit
+    def pair_job(self, ctx, state, unit, job, tagged=False):
         """The MMA warp's three stages of FC2 tile pair `job` of `unit` (chunks
         0-1 of tiles 2 job and 2 job + 1, then chunk 2 of both); returns the state
-        (slot, phase, accumulator uses, current unit, hidden ordinal, buffer)."""
+        (slot, phase, accumulator uses, current unit, hidden ordinal, buffer).
+        `tagged`: the published metadata carries the hidden ordinal."""
         full, empty, accfull, accempty, hfull, hempty, accmeta = ctx[:7]
         a0, asf0, h0, hsf0, tmem = ctx[7:]
         slot, phase, uses, current, ordinal, hbuffer = state
@@ -1655,7 +2320,8 @@ class ExpertsKernel(ExpertsGeometry):
                 kind="fc2b" if t else "fc2p",
             )
             cute.arch.sync_warp()
-            self.signal(accmeta, accfull, acc, (Int32(1), unit, 2 * job + t, 0))
+            tag = ordinal if tagged else 0
+            self.signal(accmeta, accfull, acc, (Int32(1), unit, 2 * job + t, tag))
             cute.arch.sync_warp()
         uses += 2
         slot += 1
@@ -1741,15 +2407,36 @@ class ExpertsKernel(ExpertsGeometry):
                 byte[self.h_image_bytes + lane * 16 + 2 * chunk + ew // 2] = value
         group_barrier(eg)
 
+    @cute.jit
+    def segment(self, sm, workspace, values, tile_sum, tile, c, batch, parity, scalars):
+        """`claimed`: one FC1 K segment of `tile` (flags `c`, bit 2 the tile's first
+        segment, bit 3 its last) into the tile's running sum, in segment order: the
+        same FP32 adds as the static owner's `partials` (live token columns only);
+        the last segment stores the hidden."""
+        live = 8 if self.grouped else batch
+        if c & 4 != 0:
+            for t in cutlass.range_constexpr(self.width):
+                tile_sum[t] = values[t]
+        else:
+            for t in cutlass.range_constexpr(self.width):
+                if t < live:
+                    tile_sum[t] += values[t]
+        if c & 8 != 0:
+            self.store_hidden(sm, workspace, tile_sum, tile, parity, scalars)
+
     def pair(self, t, slot):
         """Expanded row of unit row `t`: its pair (grouped), or token t's `slot`."""
         return Int64(slot) if self.grouped else Int64(t) * 16 + slot
 
     @cute.jit
-    def fc2(self, sm, workspace, output, values, unit, tile, ranges):
-        """Rows of `unit`: slots of tokens 0..7, or grouped pair indices."""
+    def fc2(self, sm, workspace, output, values, unit, tile, ranges, ordinal=None):
+        """Rows of `unit`: slots of tokens 0..7, or grouped pair indices (`ordinal`:
+        the claimed engine's ring entry)."""
         _, warp, lane, _ = thread()
-        if cutlass.const_expr(self.grouped):
+        if cutlass.const_expr(ordinal is not None):
+            slots = view(sm.iterator, self.at_ring, Int16, 128)
+            unit = ordinal & 15
+        elif cutlass.const_expr(self.grouped):
             slots = self.tables(sm)[1]
             unit = self.local(ranges, unit, 1, Int32(unit >= ranges[1, 0]))
         else:
@@ -1815,9 +2502,14 @@ class ExpertsKernel(ExpertsGeometry):
         empty = view(sm.iterator, self.off_misc + self.bar_accempty, Uint64, 16)
         meta = view(sm.iterator, self.off_misc + 600, Int32, 64)
         acc, phase, ended = (eg, Int32(0), False)
+        tile_sum = None
+        if cutlass.const_expr(self.claimed):  # an FC1 tile's sum over its segments
+            tile_sum = cute.make_rmem_tensor(self.width, Float32)
         while not ended:
             self.sync(full.iterator + acc, phase, True)
             kind, a, b = (meta[4 * acc], meta[4 * acc + 1], meta[4 * acc + 2])
+            if cutlass.const_expr(self.claimed):
+                c = meta[4 * acc + 3]
             if kind == 2:
                 ended = True
             else:
@@ -1833,7 +2525,14 @@ class ExpertsKernel(ExpertsGeometry):
                 if acc >= 16:
                     acc -= 16
                     phase ^= 1
-                if kind == 0:
+                if cutlass.const_expr(self.claimed):
+                    if kind == 0:
+                        work = (tile_sum, a, c, batch, parity, scalars[:4])
+                        self.segment(sm, workspace, values, *work)
+                    elif kind == 1:  # 6: an empty use between a tile's segments
+                        ordinal = c if self.grouped else None
+                        self.fc2(sm, workspace, output, values, a, b, ranges, ordinal)
+                elif kind == 0:
                     if self.partials(workspace, values, a, ranges, batch):
                         self.store_hidden(sm, workspace, values, a, parity, scalars[:4])
                 else:
@@ -1859,10 +2558,14 @@ class ExpertsKernel(ExpertsGeometry):
                 if self.grouped and i < self.stages:
                     count = 33
                 cute.arch.mbarrier_init(barriers.iterator + i, count)
-            if cutlass.const_expr(self.steal or self.dynamic):
+            if cutlass.const_expr(self.steal or self.dynamic or bool(self.claimed)):
                 queue = view(sm.iterator, self.off_misc + self.bar_queue, Uint64, 16)
                 for i in cutlass.range_constexpr(16):
                     cute.arch.mbarrier_init(queue.iterator + i, 1)
+            if cutlass.const_expr(self.claimed):  # decoded items full [2], started
+                items = view(sm.iterator, self.off_misc + self.CLAIM_BARS, Uint64, 3)
+                for i in cutlass.range_constexpr(3):
+                    cute.arch.mbarrier_init(items.iterator + i, 1)
             cute.arch.mbarrier_init_fence()
             acquire_tensormap(maps.iterator)
             acquire_tensormap(maps.iterator + 128)
@@ -1920,12 +2623,36 @@ class ExpertsKernel(ExpertsGeometry):
         tmem_base = self.initialize(sm, maps, batch)
         if cutlass.const_expr(not self.grouped):
             self.clear_table(sm)
+        if cutlass.const_expr(self.claimed and not self.grouped):
+            distinct_table = view(sm.iterator, self.off_misc + 1140, Int32, 128)
+            if tid == 0:  # the decode's first run in a launch, before the wait
+                one, tiles = (Int32(1), Int32(self.tiles))
+                work = (one, tiles, tiles, one, one, distinct_table, one, None)
+                self.decode(sm, Int32(0), *work)
+        if cutlass.const_expr(self.claimed and self.grouped):
+            zero = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+            marked: cutlass.Constexpr = self.experts * max(self.capacity, 16) // 16
+            for i in range(tid, marked, 384):  # `claimed_units`' token marks
+                store_shared_words(sm.iterator + i * 16, zero)
+            cute.arch.sync_threads()
+            # A routeless pass of the grouping and of an FC1 item's decode before the
+            # dependency wait: their first run in a launch is slower than a repeat
+            # (measured in A/B, stamped bench), and early-released
+            # launches hide it behind routing. Its outputs are rewritten after it.
+            self.claimed_units(sm, ids, workspace, Int32(0))
+            if warp == 0:
+                units = view(sm.iterator, self.at_units, Int16, self.claim_cap)
+                rows = view(sm.iterator, self.off_misc + self.CLAIM_QUEUE + 16, Int16, 8)
+                one = Int32(1)
+                self.decode(sm, Int32(0), one, Int32(self.tiles), Int32(self.tiles), one, one, units, Int32(0), rows)
         cute.arch.griddepcontrol_wait()
         counters = view(workspace.iterator, self.ws_counter, Int32, 160)
         if cutlass.const_expr(self.grouped):
             # Images and rearm alternate over grouped calls; ``x`` is the plan.
             routed = view(sm.iterator, self.off_misc + 1140, Int32, 3)
-            if cutlass.const_expr(self.listed):
+            if cutlass.const_expr(self.claimed):
+                self.claimed_units(sm, ids, workspace, batch)
+            elif cutlass.const_expr(self.listed):
                 self.list_windows(sm, workspace, ids)
             elif cutlass.const_expr(self.pregrouped):
                 self.fetch_windows(sm, workspace)
@@ -1937,6 +2664,8 @@ class ExpertsKernel(ExpertsGeometry):
             cute.arch.sync_threads()
             distinct, call_count, generation = (routed[0], routed[1], routed[2])
             experts = self.tables(sm)[0]
+            if cutlass.const_expr(self.claimed):
+                experts = view(sm.iterator, self.at_units, Int16, self.claim_cap)
         else:
             distinct, call_count, experts = self.route(sm, ids, counters, batch)
             generation = call_count
@@ -1948,10 +2677,15 @@ class ExpertsKernel(ExpertsGeometry):
         tmem = tmem_base[0]
         cute.arch.griddepcontrol_launch_dependents()
         ranges = self.partition(distinct, cta)
+        claims = (sm, maps, w13_scales, w2_scales, experts, x, ids, workspace, batch)
         if warp == 0:
-            if lane == 0:
+            if cutlass.const_expr(self.claimed and self.grouped):
+                self.stream_claimed(*claims, distinct, table)
+            elif lane == 0:
                 weights = (sm, maps, w13_scales, w2_scales, ranges, experts)
-                if cutlass.const_expr(self.steal or self.dynamic):
+                if cutlass.const_expr(self.claimed):
+                    self.stream_claimed(*claims, distinct, table)
+                elif cutlass.const_expr(self.steal or self.dynamic):
                     self.stream(*weights, (workspace, generation & 1), table)
                 elif cutlass.const_expr(self.streamed):
                     self.stream(*weights, None, table)
@@ -1965,14 +2699,19 @@ class ExpertsKernel(ExpertsGeometry):
             if warp == 1:
                 if cutlass.const_expr(self.static):
                     self.consume_static(sm, tmem, ranges)
+                elif cutlass.const_expr(self.walked):
+                    self.consume_claimed(sm, tmem)
                 else:
                     self.consume(sm, tmem)
             elif warp == 2:
-                self.load_hidden(sm, workspace, ranges, generation & 1)
+                rows = (ids, batch) if self.claimed and self.grouped else ()
+                self.load_hidden(sm, workspace, ranges, generation & 1, *rows)
             elif warp == 3:
-                if cutlass.const_expr(self.grouped):
+                if cutlass.const_expr(self.grouped and not self.claimed):
                     self.gather_x(sm, x, ranges, batch)
                 self.rearm(workspace, generation)
+                if cutlass.const_expr(self.claimed):
+                    self.claim_items(sm, experts, workspace, batch, distinct)
             else:
                 self.epilogue(
                     sm, workspace, output, tmem, ranges, batch, generation & 1, scalars

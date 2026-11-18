@@ -64,15 +64,43 @@ class KDARecoverSSMDeferred:
     context: "KDADeferredCommitContext" = field(repr=False, compare=False)
     state_indices: torch.Tensor = field(repr=False, compare=False)
     flushed: bool = False
+    # K31_S24FM: the step's deferred RecoverSSM of every KDA cache group (this one
+    # included), flushed together by the first flush of the step.
+    peers: list | None = field(default=None, repr=False, compare=False)
 
     def flush(self) -> None:
         """Fold the step's pending replays into the checkpoints (every KDA layer,
         once per step) before a verify that does not replay them."""
         if self.flushed:
             return
+        if self.peers and len(self.peers) > 1 and self._flush_peers():
+            return
         self.flushed = True
         rows = self.state_indices.shape[0]
         self.context.flush(self.state_indices, self.record_rows[:rows], self.pending)
+
+    def _flush_peers(self) -> bool:
+        """Every peer's flush in one launch (`commit.KdaFlushF32`, the same values as
+        each group's flush); measured faster in A/B (sol24 chain, 68 layers with the
+        step's flushes). False (nothing launched) if the peers cannot merge."""
+        from ..cutedsl.kda import commit as sdec_commit
+
+        peers = self.peers
+        if any(p.flushed for p in peers):
+            return False
+        rows = self.state_indices.shape[0]
+        if any(
+            p.state_indices.shape[0] != rows or p.pending is not self.pending
+            for p in peers
+        ):
+            return False
+        contexts = [p.context for p in peers]
+        slots = [p.state_indices for p in peers]
+        if not sdec_commit.flush_merged(contexts, slots, self.record_rows, self.pending):
+            return False
+        for p in peers:
+            p.flushed = True
+        return True
 
 
 @dataclass

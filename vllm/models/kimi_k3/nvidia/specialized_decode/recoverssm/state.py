@@ -324,13 +324,52 @@ def _build_deferred(
             near = (low < 0) | (low.clamp(min=0) // block != high // block)
         if bool(near.any()):
             eager = async_tensor_h2d(near.to(torch.int32), device=state_indices.device)
-    return KDARecoverSSMDeferred(
+    deferred = KDARecoverSSMDeferred(
         record_rows=rows,
         pending=pending,
         eager=eager,
         context=context,
         state_indices=state_indices[:num_spec_decodes],
     )
+    _join_step_peers(builder, deferred)
+    return deferred
+
+
+# K31_S24FM: the deferred RecoverSSM of the current step's KDA cache groups.
+_STEP_PEERS: dict = {"step": None, "peers": []}
+
+
+def _join_step_peers(builder, deferred) -> None:
+    """K31_S24FM=1: record `deferred` with the other KDA cache groups of its step
+    (the builders bound with the same step id) and prepare their one-launch flush
+    (concatenated operands, compiled kernel) now, outside graph capture. Records
+    from different record-row buffers are not merged."""
+    from ..cutedsl.kda import commit as sdec_commit
+
+    if not sdec_commit.merge_enabled():
+        return
+    step = getattr(builder, "_record_rows_step", None)
+    if step is None or deferred.state_indices.shape[0] == 0:
+        return
+    # Only the staged (graph) slot buffer: its address is the same every step.
+    staged = getattr(builder, "spec_state_indices_tensor", None)
+    if staged is None or deferred.state_indices.data_ptr() != staged.data_ptr():
+        return
+    if _STEP_PEERS["step"] != step:
+        _STEP_PEERS["step"], _STEP_PEERS["peers"] = step, []
+    peers = _STEP_PEERS["peers"]
+    if peers and (
+        peers[0].record_rows is not deferred.record_rows
+        or peers[0].pending is not deferred.pending
+    ):
+        return
+    peers.append(deferred)
+    for peer in peers:
+        peer.peers = peers
+    contexts = [p.context for p in peers]
+    slots = [p.state_indices for p in peers]
+    if len(peers) > 1:
+        sdec_commit.prepare_merged(contexts, slots)
 
 
 def install_layers(layers) -> None:

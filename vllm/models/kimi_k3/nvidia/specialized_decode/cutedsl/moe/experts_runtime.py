@@ -7,6 +7,7 @@ the predecessor (incl. workspace rearm/counters) before shared state is read; ou
 rows keep the caller's top16 order."""
 
 import functools
+import os
 
 import cuda.bindings.driver as cuda
 import cutlass as c
@@ -88,17 +89,52 @@ def dynamic(batch):
 DYNAMIC = "4-8:1"
 
 
+def tables(spec, default):
+    """Per-TP batch tables from "<tp>=<table>;..." ("1": `default`)."""
+    out: dict[int, dict] = {8: {}, 16: {}}
+    spec = default if spec == "1" else "" if spec == "0" else spec
+    for part in filter(None, spec.split(";")):
+        tp, _, table = part.partition("=")
+        out[int(tp)] = batch_table(table)
+    return out
+
+
+# K31_EXP8: batches whose experts run the claimed work list (`ExpertsKernel.claimed`:
+# FC2 tile pairs (TP16: tiles) per claim; bit-identical outputs); "1" = CLAIMED, the
+# TP8 verify batches of two and three requests at k = 4 (measured faster in A/B:
+# exp8 1-GPU bench and 8-rank layer chain). Opt-in; default off.
+# K31_EXP8_GRID: their launch grids (default: the static engine's grid, whose split
+# cuts the FC1 tiles either way).
+CLAIMED = "8=10:1,15:2"
+EXP8 = tables(os.environ.get("K31_EXP8", ""), CLAIMED)
+EXP8_GRID = tables(os.environ.get("K31_EXP8_GRID", ""), "")
+# K31_EXP8W: more claimed batches, added to K31_EXP8's tables ("1" = CLAIMED_WIDE, the
+# TP8 verify batches of four to nine requests at k = 4, measured faster in A/B: exp8
+# 1-GPU bench and 8-rank layer chain). Opt-in; default off.
+CLAIMED_WIDE = "8=20:1,25:2,30:1,35:2,40:2,45:2"
+for _tp, _table in tables(os.environ.get("K31_EXP8W", ""), CLAIMED_WIDE).items():
+    EXP8[_tp].update(_table)
+# Claimed grouped batches release the experts at the routing kernel's entry
+# (front.EARLY_ROUTE; here the standalone plan writer's), so their launch and the
+# prologue's pre-wait pass overlap routing as they did the unit-table kernel.
+# K31_EXP8_EARLY=0 keeps the late release.
+EXP8_EARLY = os.environ.get("K31_EXP8_EARLY", "1") == "1"
+
+
 @functools.cache
 def compile_experts(tp, experts, batch, grid, device, publish=False, *knobs):
     """Only code and geometry are cached; no owner tensors or descriptors. `knobs`:
-    (B<=8 stream, pregrouped, steal, listed, ahead, static, dynamic)."""
+    (B<=8 stream, pregrouped, steal, listed, ahead, static, dynamic[, claimed, the
+    static grid that cuts FC1 tiles])."""
     defaults: tuple = (streamed(batch), False, False, False, False, static(batch))
-    defaults += (dynamic(batch),)
-    stream, grouped, steal, listed, ahead, walk, claims = knobs + defaults[len(knobs) :]
+    defaults += (dynamic(batch), 0, 0)
+    stream, grouped, steal, listed, ahead, walk, claims, claimed, cuts = (
+        knobs + defaults[len(knobs) :]
+    )
     capacity = 1 << (batch - 1).bit_length()
     moe = ExpertsKernel(
         tp, capacity, experts, grid, publish, stream, grouped, steal, listed, ahead,
-        walk, claims,
+        walk, claims, claimed, cuts,
     )  # fmt: skip
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()
@@ -131,12 +167,13 @@ def compile_group(tp, experts, batch, grid, device, early=False):
 
 
 @functools.cache
-def compile_plan(batch, device):
+def compile_plan(batch, device, early=False):
     """Plan writer for callers without the routing kernel's copy role in front."""
     plan = fake((plan_bytes(plan_rows(batch)),), (1,), c.Uint8)
     args = (fake((batch, 3584)), plan, make_fake_stream())
+    kernel = ExpertsPlanKernel(batch, early) if early else ExpertsPlanKernel(batch)
     with torch.accelerator.device_index(device):
-        return cute.compile(ExpertsPlanKernel(batch), *args)
+        return cute.compile(kernel, *args)
 
 
 def scratch(tp, device, wide=False):
@@ -201,7 +238,7 @@ class PersistentExperts:
 
     def prepare(
         self, batch, buffers, out, publish=(), planned=False, twoshot=False,
-        early=False, ahead=False, listed=False,
+        early=False, ahead=False, listed=False, claimed=None, release=None,
     ):  # fmt: skip
         """`publish`: (multicast, parity, rank) of the WaveMoeTail latent slot to
         publish (`twoshot`: the `common.twoshot` push box); `planned`: B>8 calls
@@ -209,14 +246,26 @@ class PersistentExperts:
         `early`: the caller runs `group` (pregrouped batches) before `run`;
         `listed` (wide): the routing kernel appended the routing lists
         (`buffers["lists"]`, passed to `run` as `ids`) and wrote the plan; no
-        unit-table kernel runs."""
+        unit-table kernel runs. `claimed`: FC2 tile pairs per claim of the claimed
+        work list (default: K31_EXP8; 0: the static engine); `release`: claimed
+        grouped batches' plan writer releases them at entry (default K31_EXP8_EARLY)."""
         mode = "twoshot" if twoshot else bool(publish)
         grouped = pregrouped(self.tp, batch)
         listed = listed and batch > 64
         args: tuple = (batch, self.grid_for(batch), self.device.index, mode)
         ahead = ahead and (batch > 8 or streamed(batch))  # the stream() producer
-        args += (streamed(batch), grouped, stealing(batch), listed, ahead)
-        args += (static(batch), dynamic(batch))
+        if claimed is None:
+            claimed = EXP8[self.tp].get(batch, 0)
+        claimed = claimed if (batch > 8 or streamed(batch)) and batch <= 64 else 0
+        if claimed:
+            # The grouped batches group the routes in the experts kernel itself.
+            grouped, cuts = (False, args[1])
+            grid = EXP8_GRID[self.tp].get(batch, cuts)
+            args = (batch, grid, self.device.index, mode, streamed(batch), False)
+            args += (False, False, ahead, False, False, claimed, cuts)
+        else:
+            args += (streamed(batch), grouped, stealing(batch), listed, ahead)
+            args += (static(batch), dynamic(batch))
         code = compile_experts(self.tp, self.experts, *args)
         # CTAs wait on other clusters' partials: the whole grid must be resident.
         check_residency(code, self.device.index, args[1], 384, "Kimi K3 MoE experts")
@@ -231,6 +280,8 @@ class PersistentExperts:
             if buffers["plan"].numel() < need:
                 raise ValueError(f"B{batch} needs the wide expert scratch")
             plan = (tensor(buffers["plan"]), compile_plan(batch, self.device.index))
+            if claimed and (EXP8_EARLY if release is None else release):
+                plan = (plan[0], compile_plan(batch, self.device.index, True))
             plan = plan[:1] if planned else plan
         if grouped and not listed:
             release = early_group(self.tp, batch)

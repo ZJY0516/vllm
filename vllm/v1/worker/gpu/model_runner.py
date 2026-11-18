@@ -2709,7 +2709,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 # K31_NP1=1 serves every eligible step with it; K31_NP1_CHECK=1 instead runs
 # it into copies beside the stock path and compares every output bit for bit.
 # K31_NP1_SWITCH=<file> (with either) re-reads off / on / check from that file
-# between steps. Default off: none of this runs.
+# between steps. Default off: none of this runs. K31_S21N8=1 raises the cap on
+# the request count of a served step from 4 to 8 (K31_NP1_MAX_REQS still sets
+# the count) when the tensor-parallel size is at most 8.
 # ---------------------------------------------------------------------------
 
 
@@ -2791,7 +2793,7 @@ class _Np1Layout:
     """The tables of `_np1_step_prep_kernel` for this runner's buffers and
     metadata builders (built once the builders are bound)."""
 
-    def __init__(self, runner) -> None:
+    def __init__(self, runner, max_reqs: int = 4) -> None:
         from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadataBuilder
         from vllm.model_executor.layers.attention.sparse_mla_attention import (
             SparseMLACommonMetadataBuilder,
@@ -2805,6 +2807,7 @@ class _Np1Layout:
         ms = runner.model_state
         q = runner.decode_query_len
         self.q = q
+        self.maxr = max_reqs
         self.ok = False
         self.reason = ""
         ng = bt.num_kv_cache_groups
@@ -3006,7 +3009,7 @@ class _Np1Layout:
         self.out_tab = torch.tensor(out, dtype=torch.int64, device=dev)
         self.in_tab = torch.tensor(inp, dtype=torch.int64, device=dev)
         self.int_tab = torch.tensor(ints, dtype=torch.int64, device=dev)
-        arena = ib.np1_arena_layout(q)
+        arena = ib.np1_arena_layout(q, self.maxr)
         self.arena = arena
         chunk = 4096
         cap = max(
@@ -3032,8 +3035,9 @@ class _Np1Layout:
 
         self.consts = dict(
             Q=q,
-            BT=triton.next_power_of_2(ib.NP1_MAX_REQS * q),
-            BR=triton.next_power_of_2(ib.NP1_MAX_REQS + 1),
+            NR=self.maxr,
+            BT=triton.next_power_of_2(self.maxr * q),
+            BR=triton.next_power_of_2(self.maxr + 1),
             NG=ng,
             NMG=nmg,
             NSLOT=nslot,
@@ -3079,7 +3083,8 @@ class _Np1Layout:
             f"({self.consts['NMG']} groups, {self.consts['NSLOT']} slots), "
             f"{len(self.kda)} KDA builders, {self.nib} indexer builders "
             f"(slots {self.idx_slots}, dcp {self.idx_dcp}), {self.nkt} kernel "
-            f"tables, record rows {self.has_rec_rows}, req-per-token {self.has_rpt}"
+            f"tables, record rows {self.has_rec_rows}, req-per-token {self.has_rpt}, "
+            f"request slots {self.maxr}"
         )
 
     def claims(self, runner, num_reqs: int, idx_ptr: int) -> dict:
@@ -3194,8 +3199,9 @@ class _Np1Runner:
 
         self.env_mode = _np1_env_mode()
         self.switch = os.environ.get("K31_NP1_SWITCH") or None
+        self.wide = os.environ.get("K31_S21N8", "0") == "1"
         self.max_reqs = min(
-            max(_env_int("K31_NP1_MAX_REQS", 3), 1), 4
+            max(_env_int("K31_NP1_MAX_REQS", 3), 1), 8 if self.wide else 4
         )
         self.neg = os.environ.get("K31_NP1_CHECK_NEG", "0") not in ("", "0")
         self.fast_launch = os.environ.get("K31_NP1_FAST_LAUNCH", "1") not in ("", "0")
@@ -3268,7 +3274,10 @@ class _Np1Runner:
         lay = self.layout
         if lay is not None or self.layout_failed:
             return lay
-        lay = _Np1Layout(runner)
+        from vllm.v1.worker.gpu import input_batch as ib
+
+        wide = self.wide and runner.parallel_config.tensor_parallel_size <= 8
+        lay = _Np1Layout(runner, ib.NP1_MAX_REQS_WIDE if wide else ib.NP1_MAX_REQS)
         if not lay.ok:
             if lay.reason == "KDA builder not served" and self.stats["ineligible"] < 64:
                 return None  # builders not bound yet: retry on a later step
@@ -3292,6 +3301,9 @@ class _Np1Runner:
         lay = self._get_layout(runner, mode)
         if lay is None:
             return None
+        if nreq > lay.maxr:
+            self.stats["ineligible"] += 1
+            return None
         shadow = mode == "check"
         dev = runner.device
         arena = torch.empty(lay.arena["len"], dtype=torch.int64, device=dev)
@@ -3310,14 +3322,15 @@ class _Np1Runner:
                 dtype=torch.uint64,
                 device=dev,
             )
-        idx = [int(x) for x in brs.idx_mapping_np] + [-1] * (4 - nreq)
+        idx = [int(x) for x in brs.idx_mapping_np] + [-1] * (8 - nreq)
         nb = bt.num_blocks.gpu
         args = (
             out_tab, lay.in_tab, lay.int_tab, arena, nb, nb.stride(0),
             runner.req_states.prefill_len.gpu, bt.block_table_ptrs, dst_ptrs,
             bt.block_table_strides, bt.block_sizes_tensor, bt.slot_mapping_enabled,
-            bt.dcp_sharded, nreq, num_rows, idx[0], idx[1], idx[2], idx[3],
-            runner.input_buffers.seq_lens.shape[0], bt.slot_mappings.shape[1],
+            bt.dcp_sharded, nreq, num_rows, idx[0], idx[1], idx[2], idx[3], idx[4],
+            idx[5], idx[6], idx[7], runner.input_buffers.seq_lens.shape[0],
+            bt.slot_mappings.shape[1],
             runner.dcp_size, runner.dcp_rank, runner.cp_interleave,
         )  # fmt: skip
         grid = _np1_grid(lay, nreq, num_rows)

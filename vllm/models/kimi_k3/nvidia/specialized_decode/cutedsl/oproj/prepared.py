@@ -9,6 +9,7 @@ At `twoshot_batches`, given `TwoShot` buffers, the all-reduce is `common.twoshot
 each GPU receives ~2 x 14 KB per token instead of TP x 14 KB. `bind_ahead`: fused
 rows that also compute the next layer's AttnRes statistics (`consumer` ahead)."""
 
+import os
 from functools import cache
 from typing import Any
 
@@ -65,11 +66,28 @@ def twoshot_batches(tp):
     return {batch for batch, on in table.items() if on}
 
 
+# K31_S20OPU=1: TP8 verify batches of 17-24 rows take the tcgen05 engine, as 25-40
+# rows do. Not bit-identical to the grouped mma.sync engine (another order of the K
+# partial sums). Opt-in; default off.
+OPU17 = os.environ.get("K31_S20OPU") == "1"
+
+
+# K31_S23G4=1: TP8 consumers of 33-36 rows (seven requests at k = 4) poll with four
+# groups, summing every rank in rank order as one group does (the same bits); measured
+# faster in A/B (chain bench: input projection -> core -> o-projection and all-reduce)
+# at 35 rows, slower at 40. Default off.
+G4 = {8: "33-36:1"} if os.environ.get("K31_S23G4") == "1" else {}
+
+
+def ordered_groups(batch, tp):
+    return bool(batch_table(G4.get(tp, "")).get(batch, 0))
+
+
 def engine(batch, tp):
     """Producer engine above B8 (GB300): grouped mma.sync for TP8 up to B24, else
     tcgen05. TP8 verify steps at k = 4, decode-step A/B at 131K context, per token:
     mma.sync -2.3% at 20 rows (four requests), +2.1% at 25-30 rows."""
-    default = "mma" if tp == 8 and batch <= 24 else "umma"
+    default = "mma" if tp == 8 and batch <= (16 if OPU17 else 24) else "umma"
     return default
 
 
@@ -122,6 +140,8 @@ def compile_oproj(
     if kind == "consumer":  # B64: one 128-thread group per CTA polls every rank
         options = dict(has_delta=has_delta)
         groups = 4 if batch <= 32 and not twoshot else 1
+        if not twoshot and ordered_groups(batch, tp):
+            groups, options["ordered"] = 4, True
         kernel = OprojConsumer(nb, groups=groups, twoshot=twoshot, **options)
         extra = (recv, mc, slot) if twoshot else ()
         return cute.compile(kernel, box, *rows, *extra, make_fake_stream())

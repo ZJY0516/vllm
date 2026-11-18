@@ -33,6 +33,7 @@ from ..common.primitives import (
 from ..gemm.projection import PreparedProjection
 from ..gemm.ws_gemm import WsGemm
 from .experts import PLAN_BYTES, plan_chunk
+from .experts_runtime import EXP8, EXP8_EARLY
 from .shared import compile_down, compile_shared, weight_maps
 from .tail_runtime import CAP, PUB8
 
@@ -369,6 +370,14 @@ SPLITS = {
     8: ("25-32:3", "9-12:12,13-16:6,17-24:8,25-40:6,41-64:3"),
     16: ("", "25-32:3"),
 }
+# K31_T8T_SD15=1: TP8 verify 13-16 rows (three requests at k = 4) run SharedDown on 12
+# SMs, as 9-12 rows do. On 6 SMs it outlasts the routed
+# experts whenever they take less, and the tail, launched after the side stream's last
+# kernel, starts only then (2-node TP8 + DCP8 131K profile windows: 34-54% of layers).
+# SharedDown computes each 64-row tile whole on one CTA, so the SM count does not
+# change its output.
+if os.environ.get("K31_T8T_SD15") == "1":
+    SPLITS[8] = (SPLITS[8][0], SPLITS[8][1].replace("13-16:6", "13-16:12"))
 # Split-K shared-expert batches whose routing kernel releases the persistent experts
 # at entry (``RouteSitu.early``): their launch and prologue (mbarriers, tensor maps,
 # TMEM, x image; ~3.8 us after a late release at TP8 B5, all after the ids exist)
@@ -506,6 +515,11 @@ class SharedFront:
         self.plans: dict[int, tuple] = {}
         early = batch_table(EARLY_ROUTE[tp])
         self.early = {b for b in batches if early.get(b) and b <= 8 and b not in fused}
+        # K31_EXP8: the claimed grouped batches (experts_runtime.EXP8), which run no
+        # unit-table kernel, release the experts at the routing kernel's entry so
+        # their launch and prologue overlap routing (experts_runtime.EXP8_EARLY;
+        # the tail joins are unchanged).
+        release = {b for b in batches if b > 8 and EXP8_EARLY and EXP8[tp].get(b)}
         push = batch_table(DOWN_PUSH[tp])
         pushed = [b for b in batches if push.get(b) and b not in fused]
         self.pushed = {b: self.down.push_kernel(b, tp) for b in pushed}
@@ -515,7 +529,7 @@ class SharedFront:
             front = compile_publish(n, n - shard, valid, b, dev, front_ks(b, n))
             planned = plan is not None and b > 8
             roles = (True, True, False)
-            released = b in self.early or None
+            released = b in self.early or b in release or None
             route = compile_route(
                 b, shared, renorm, roles, dev, True, planned, released
             )

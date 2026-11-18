@@ -239,6 +239,328 @@ class KdaCommitF32:
         cute.arch.griddepcontrol_launch_dependents()
 
 
+class KdaFlushF32:
+    """The deferred RecoverSSM flush in one launch, per (head, request, layer): the
+    flush plan (`_prepare_flush_plan_kernel`: n = the pending count of the request's
+    record slot, clamped to [0, window], live for a state slot past the null slot),
+    the conv compaction of the head's q, k and v channels
+    (`_compact_conv_state_kernel`: the `history` taps from n - 1 moved to 0) and the
+    fold of `KdaCommitF32` in place (its operands, association and stores): the same
+    values in one kernel instead of three. The CTA's state page is prefetched to L2
+    at entry; the conv taps are loaded before the fold and stored after it. Args:
+    KdaCommitF32's base
+    addresses, strides, a_log and dt_bias, then the state slots, record rows and
+    pending counts [B], the conv state base addresses and block / dim / token
+    strides [L], the lower bound and the null slot; `grouped`: layers of several
+    KDA cache groups in one launch, a trailing slot_addrs [L] operand giving each
+    layer's state-slot tensor ([B] int32, unit stride; `slots` sizes the grid)."""
+
+    def __init__(self, heads, window, history, conv_dtype, grouped=False):
+        assert 1 <= window <= 8 and 1 <= history
+        self.heads, self.window, self.history = heads, window, history
+        self.conv_dtype, self.grouped = conv_dtype, grouped
+
+    @cute.jit
+    def __call__(self, *args):
+        grid = (self.heads, args[8].shape[0], args[0].shape[0])
+        launch(self.kernel, args, grid, THREADS)
+
+    @cute.kernel
+    def kernel(self, args):
+        state_addrs, corr_addrs, kg_addrs = args[:3]
+        state_strides, corr_strides, kg_strides, a_log, dt_bias = args[3:8]
+        slots, record_rows, pending = args[8:11]
+        conv_addrs, conv_blocks, conv_dims, conv_tokens = args[11:15]
+        lower_bound, null_slot = args[15:17]
+        Q: cutlass.Constexpr = self.window
+        H: cutlass.Constexpr = self.history
+        tid, _, _ = cute.arch.thread_idx()
+        head, request, layer = cute.arch.block_idx()
+        warp, lane = tid // 32, tid % 32
+        smem = cutlass.utils.SmemAllocator()
+        keys = alloc(smem, Float32, (Q, K))  # kn_t
+        suffix = alloc(smem, Float32, (Q + 1, K))  # P_t; row Q: D_n
+        norms = alloc(smem, Float32, (Q, 4))
+
+        cute.arch.griddepcontrol_wait()
+        source = Int64(0)
+        if cutlass.const_expr(self.grouped):
+            slot_at = Int64(args[17][layer]) + Int64(request) * 4
+            slot_ptr = cute.make_ptr(Int32, slot_at, cute.AddressSpace.gmem)
+            source = Int64(cute.make_tensor(slot_ptr, cute.make_layout(1))[0])
+        else:
+            source = Int64(slots[request])
+        record = record_rows[request]
+        n = Int32(0)
+        if record >= 0:
+            n = pending[record]
+        if n > Q:
+            n = Int32(Q)
+        if n < 0:
+            n = Int32(0)
+        live = (n > 0) & (source > Int64(null_slot))
+        if live:
+            state_base = Int64(state_addrs[layer])
+            stride = Int64(state_strides[layer]) * 4  # bytes per slot
+            page = Int64(head) * PAGE_BYTES
+            row, half = tid // 2, tid % 2
+            address = state_base + source * stride + page
+            pointer = cute.make_ptr(
+                Float32, address, cute.AddressSpace.gmem, assumed_align=16
+            )
+            src = cute.make_tensor(pointer, cute.make_layout((K, K), stride=(K, 1)))
+            if tid == 0:
+                prefetch_bytes(src.iterator, PAGE_BYTES)
+
+            # The conv compaction of this head's q, k and v channels: loads now,
+            # stores after the state's.
+            conv_bytes: cutlass.Constexpr = self.conv_dtype.width // 8
+            dim: cutlass.Constexpr = self.heads * K
+            parts: cutlass.Constexpr = -(-3 * K // THREADS)
+            conv_base = Int64(conv_addrs[layer])
+            conv_block = Int64(conv_blocks[layer])
+            conv_dim = Int64(conv_dims[layer])
+            conv_token = Int64(conv_tokens[layer]) * conv_bytes
+            conv_taps = cute.make_rmem_tensor((parts, H), self.conv_dtype)
+            conv_rows = []
+            for i in cutlass.range_constexpr(parts):
+                conv_part = tid + THREADS * i
+                conv_safe = conv_part % (3 * K)
+                conv_channel = (conv_safe // K) * dim + head * K + conv_safe % K
+                conv_row = conv_base + (
+                    source * conv_block + Int64(conv_channel) * conv_dim
+                ) * conv_bytes
+                conv_rows.append(conv_row)
+                if conv_part < 3 * K:
+                    for h in cutlass.range_constexpr(H):
+                        conv_at = conv_row + Int64(n - 1 + h) * conv_token
+                        conv_ptr = cute.make_ptr(
+                            self.conv_dtype, conv_at, cute.AddressSpace.gmem
+                        )
+                        conv_taps[i, h] = cute.make_tensor(conv_ptr, cute.make_layout(1))[0]
+
+            corr_ptr = cute.make_ptr(
+                Float32, corr_addrs[layer], cute.AddressSpace.gmem, assumed_align=16
+            )
+            kg_ptr = cute.make_ptr(
+                cutlass.BFloat16,
+                kg_addrs[layer],
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            record64 = Int64(record)
+            corr_slot = corr_ptr + record64 * Int64(corr_strides[layer])
+            kg_slot = kg_ptr + record64 * Int64(kg_strides[layer])
+            corr = cute.make_tensor(
+                corr_slot + head * Q * K, cute.make_layout((Q, K), stride=(K, 1))
+            )
+            kg = cute.make_tensor(
+                kg_slot + head * Q * 2 * K,
+                cute.make_layout((Q, 2 * K), stride=(2 * K, 1)),
+            )
+            u = cute.make_rmem_tensor(Q, Float32)
+            for t in cutlass.range_constexpr(Q):
+                u[t] = Float32(0)
+                if t < n:
+                    u[t] = corr[t, row]
+
+            channel = tid % K
+            kv = cute.make_rmem_tensor(Q, Float32)
+            decays = cute.make_rmem_tensor(Q, Float32)
+            if tid < K:
+                bias = Float32(dt_bias[layer, head, channel])
+                a = triton_exp(Float32(a_log[layer, head]))
+                for t in cutlass.range_constexpr(Q):
+                    kv[t], decays[t] = Float32(0), Float32(1)
+                    if t < n:
+                        kv[t] = Float32(kg[t, channel])
+                        raw_g = Float32(kg[t, K + channel])
+                        gate = lower_bound * triton_sigmoid(a * (raw_g + bias))
+                        decays[t] = triton_exp(gate)
+                for t in cutlass.range_constexpr(Q):
+                    total = warp_sum(kv[t] * kv[t])
+                    if lane == 0:
+                        norms[t, warp] = total
+            cute.arch.barrier()
+            if tid < K:
+                fd = Float32(1)
+                for r in cutlass.range_constexpr(Q):
+                    t = Q - 1 - r  # reverse: the stock accumulation order
+                    total = (norms[t, 0] + norms[t, 1]) + (norms[t, 2] + norms[t, 3])
+                    keys[t, channel] = kv[t] * cute.math.rsqrt(total + Float32(1e-6))
+                    suffix[t, channel] = fd
+                    fd = fd * decays[t]  # 1 past n
+                suffix[Q, channel] = fd
+            cute.arch.barrier()
+
+            load_shared = lambda tensor, t, column: load_words(
+                tensor.iterator + t * K + column,
+                count=4,
+                shared=True,
+                mutable=True,
+                result_type=Float32,
+                word_type="f32",
+            )
+            for c in cutlass.range_constexpr(CHUNKS):
+                column = 8 * c + 4 * half
+                initial = load_f32x4(src.iterator + row * K + column)
+                final = [Float32(0) for _ in range(4)]
+                for r in cutlass.range_constexpr(Q):
+                    t = Q - 1 - r
+                    kn = load_shared(keys, t, column)
+                    p = load_shared(suffix, t, column)
+                    for e in cutlass.range_constexpr(4):
+                        update = u[t] * kn[e]  # 0 past n
+                        final[e] = fma(update, p[e], final[e])
+                decay_n = load_shared(suffix, Q, column)
+                values = [fma(initial[e], decay_n[e], final[e]) for e in range(4)]
+                store_f32x4(src.iterator + row * K + column, values)
+            for i in cutlass.range_constexpr(parts):
+                if tid + THREADS * i < 3 * K:
+                    for h in cutlass.range_constexpr(H):
+                        conv_at = conv_rows[i] + Int64(h) * conv_token
+                        conv_ptr = cute.make_ptr(
+                            self.conv_dtype, conv_at, cute.AddressSpace.gmem
+                        )
+                        conv_dst = cute.make_tensor(conv_ptr, cute.make_layout(1))
+                        conv_dst[0] = conv_taps[i, h]
+        cute.arch.griddepcontrol_launch_dependents()
+
+
+@cache
+def _flush_compiled(heads: int, window: int, history: int, arch: str, param_dtype, conv_dtype):
+    from cutlass.cute.runtime import make_fake_stream
+
+    i32, i64 = torch.int32, torch.int64
+    fakes = (
+        *(dynamic_fake(1, i64) for _ in range(6)),  # base addresses, strides [L]
+        dynamic_fake(2, param_dtype),  # A_log [L, H]
+        dynamic_fake(3, param_dtype),  # dt_bias [L, H, K]
+        *(dynamic_fake(1, i32) for _ in range(3)),  # slots, record rows [B], pending
+        *(dynamic_fake(1, i64) for _ in range(4)),  # conv addresses, strides [L]
+    )
+    cute_conv = {torch.float32: Float32, torch.bfloat16: cutlass.BFloat16}[conv_dtype]
+    return cute.compile(
+        KdaFlushF32(heads, window, history, cute_conv, grouped=True),
+        *fakes,
+        cutlass.Float32(0),
+        cutlass.Int32(0),
+        dynamic_fake(1, i64),  # slot_addrs [L]
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        options=f"--gpu-arch={arch} --enable-tvm-ffi",
+    )
+
+
+def merge_enabled() -> bool:
+    """K31_S24FM=1: a step's deferred flushes of every KDA cache group in one launch
+    (KdaFlushF32), for the heads per rank in K31_S24FL_HEADS (default TP8's 12)."""
+    import os
+
+    return os.environ.get("K31_S24FM") == "1"
+
+
+def merge_heads() -> set:
+    import os
+
+    spec = os.environ.get("K31_S24FL_HEADS", "12")
+    return {int(h) for h in spec.split(",") if h.strip()}
+
+
+_MERGED: dict = {}  # (context ids, slot tensor addresses) -> merged operands
+
+
+def _merge_key(contexts, slots):
+    return tuple(id(c) for c in contexts), tuple(s.data_ptr() for s in slots)
+
+
+def prepare_merged(contexts, slots) -> bool:
+    """Concatenate the per-layer flush operands of `contexts` (the KDA cache groups
+    of one step, with their [B] state-slot tensors `slots`) and compile the grouped
+    KdaFlushF32: at metadata build (outside graph capture), once per combination."""
+    key = _merge_key(contexts, slots)
+    if key in _MERGED:
+        return _MERGED[key] is not None
+    first = contexts[0]
+    state = first.checkpoints[0]
+    same = all(
+        c.checkpoints[0].shape[1:] == state.shape[1:]
+        and c.checkpoints[0].dtype == state.dtype
+        and supported(c.checkpoints[0], c.lower_bound)
+        and c.spec_query_len == first.spec_query_len
+        and c.conv_history_len == first.conv_history_len
+        and c.conv_states[0].dtype == first.conv_states[0].dtype
+        and c.conv_states[0].dtype in (torch.float32, torch.bfloat16)
+        and c.A_log.dtype == first.A_log.dtype
+        and c.lower_bound == first.lower_bound
+        for c in contexts
+    )
+    if (
+        not same
+        or state.shape[1] not in merge_heads()
+        or any(s.dim() != 1 or s.stride(0) != 1 for s in slots)
+    ):
+        _MERGED[key] = None
+        return False
+    cat = lambda name: torch.cat([getattr(c, name) for c in contexts]).contiguous()
+    counts = [len(c.checkpoints) for c in contexts]
+    addrs = [s.data_ptr() for s, n in zip(slots, counts) for _ in range(n)]
+    operands = tuple(
+        cat(name)
+        for name in (
+            "state_base_addrs",
+            "correction_cache_base_addrs",
+            "kg_cache_base_addrs",
+            "state_block_strides",
+            "correction_cache_block_strides",
+            "kg_cache_block_strides",
+            "A_log",
+            "dt_bias",
+        )
+    )
+    convs = tuple(
+        cat(name)
+        for name in (
+            "conv_state_base_addrs",
+            "conv_state_block_strides",
+            "conv_state_dim_strides",
+            "conv_state_token_strides",
+        )
+    )
+    slot_addrs = torch.tensor(addrs, dtype=torch.int64, device=state.device)
+    compiled = _flush_compiled(
+        state.shape[1],
+        first.spec_query_len,
+        first.conv_history_len,
+        architecture(state.device),
+        first.A_log.dtype,
+        first.conv_states[0].dtype,
+    )
+    _MERGED[key] = (compiled, operands, convs, slot_addrs, first.lower_bound)
+    return True
+
+
+def flush_merged(contexts, slots, record_rows, pending) -> bool:
+    """The grouped KdaFlushF32 over every layer of `contexts` (prepared by
+    `prepare_merged`), request b's record slot `record_rows[b]`; False if not
+    prepared."""
+    entry = _MERGED.get(_merge_key(contexts, slots))
+    if entry is None:
+        return False
+    compiled, operands, convs, slot_addrs, lower_bound = entry
+    batch = slots[0].shape[0]
+    compiled(
+        *operands,
+        slots[0],
+        record_rows[:batch],
+        pending,
+        *convs,
+        lower_bound,
+        NULL_BLOCK_ID,
+        slot_addrs,
+    )
+    return True
+
+
 @cache
 def _compiled(
     heads: int, window: int, arch: str, param_dtype, align: bool, indexed=False

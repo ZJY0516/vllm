@@ -31,6 +31,28 @@ logger = init_logger(__name__)
 # TP16 x DCP16 serves DSpark verify steps of one request up to 7 draft tokens
 # (chosen by an end-to-end A/B there); other pairs are not measured yet.
 HEAD_GATHER = {(16, 16): "1-8:1"}
+# TP8 x DCP8 verify steps of one to three requests (5 / 10 / 15 rows at k = 4) when
+# K31_T8M=1: measured faster than NCCL's ring all-gather in A/B (2-node microbench).
+HEAD_GATHER_ENV = "K31_T8M"
+HEAD_GATHER_OPT = {(8, 8): "1-16:1"}
+# With K31_T8M=1, K31_S21T8M=1 extends that entry to 32 rows (four to six requests),
+# and with K31_S21W40=1 to 40 rows (eight requests).
+HEAD_GATHER_WIDE_ENV = "K31_S21T8M"
+HEAD_GATHER_WIDE = {(8, 8): "1-32:1"}
+HEAD_GATHER_WIDE40 = {(8, 8): "1-40:1"}
+
+
+def head_gather_rows(tp, dcp):
+    """The HEAD_GATHER spec of this (TP, DCP) pair (with the optional entries)."""
+    import os
+
+    table = dict(HEAD_GATHER)
+    if os.environ.get(HEAD_GATHER_ENV, "0") == "1":
+        table.update(HEAD_GATHER_OPT)
+        if os.environ.get(HEAD_GATHER_WIDE_ENV, "0") == "1":
+            wide40 = os.environ.get("K31_S21W40", "0") == "1"
+            table.update(HEAD_GATHER_WIDE40 if wide40 else HEAD_GATHER_WIDE)
+    return table.get((tp, dcp), "")
 
 
 def install_logits_gather(model, group, tp, rank, device, dcp=1):
@@ -56,7 +78,7 @@ def install_logits_gather(model, group, tp, rank, device, dcp=1):
         or getattr(head, "tp_size", 1) != tp
     ):
         return ()
-    table = batch_table(HEAD_GATHER.get((tp, dcp), ""))
+    table = batch_table(head_gather_rows(tp, dcp))
     rows = tuple(sorted(r for r, on in table.items() if on))
     if not rows or tp == 1 or not lp.use_all_gather:
         return ()

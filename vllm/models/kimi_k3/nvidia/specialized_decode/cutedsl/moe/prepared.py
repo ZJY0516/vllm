@@ -4,6 +4,8 @@
 """Prepared MoE provider: one model owner serializes its scratch, no tensor pointers
 are rebound at execution, and the side stream joins before the tail."""
 
+import os
+
 import torch
 
 from ..common.policy import batch_table
@@ -49,6 +51,14 @@ class MoEScratch:
 
 # TP8 B16: the experts start beside the split gate/up half (+1% E2E).
 JOIN = {8: "9-16:0", 16: ""}
+# K31_S20J=1: TP8 verify batches of 17-32 rows (four to six requests at k = 4) also
+# launch the routed experts beside the split gate/up half, so the claimed experts'
+# release at the routing kernel's entry (experts_runtime.EXP8_EARLY) is not held
+# behind the shared expert's gate/up kernel. Only the launch dependency changes:
+# the tail still joins the side stream, and every kernel reads and writes the same
+# data. Opt-in; default off.
+if os.environ.get("K31_S20J") == "1":
+    JOIN[8] += ",17-32:0"
 
 
 class PreparedMoE:

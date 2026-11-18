@@ -76,6 +76,16 @@ EXPERTS_AHEAD = {8: "4-7:16", 16: ""}
 # attention prefetch into the experts (no side-stream CTAs), like TP8 B4-7.
 if os.environ.get("K31_PUB8") == "1" and os.environ.get("K31_PUB8_AHEAD"):
     EXPERTS_AHEAD[16] = f"5-8:{int(os.environ['K31_PUB8_AHEAD'])}"
+# TP8 verify batches 9-16: stream 32 MiB of the next layer's weights from the experts
+# tail (measured faster in A/B (chain bench)). Opt-in; default off.
+if os.environ.get("K31_E32") == "1":
+    EXPERTS_AHEAD[8] = EXPERTS_AHEAD[8] + ",9-16:32"
+# K31_S21E32W=<MiB>: TP8 verify batches 17-32 (with K31_S21W40=1: 17-40) stream that
+# many MiB of the next layer's weights from the experts in the same way. Opt-in;
+# default off.
+if os.environ.get("K31_S21E32W"):
+    _hi = 40 if os.environ.get("K31_S21W40") == "1" else 32
+    EXPERTS_AHEAD[8] = EXPERTS_AHEAD[8] + f",17-{_hi}:{int(os.environ['K31_S21E32W'])}"
 
 
 def attention_weights(attention):
