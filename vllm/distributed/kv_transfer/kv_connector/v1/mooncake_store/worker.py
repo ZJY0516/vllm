@@ -102,6 +102,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     group_kernel_blocks,
 )
@@ -109,6 +110,23 @@ from vllm.v1.kv_cache_interface import (
 from .metrics import MooncakeStoreConnectorStats
 
 logger = init_logger(__name__)
+
+
+# DFlash/DSpark drafter tail rule for store lookups (opt-in, VLLM_DFLASH_SWA_TAIL_HITS=1).
+_K31_TAIL_LOOKUP = os.environ.get("VLLM_DFLASH_SWA_TAIL_HITS", "0") == "1"
+
+
+def _k31_draft_swa_reach(spec) -> int | None:
+    """Tokens below the request end that a draft sliding-window group's hit
+    can need (DFlash tail rule), or None for any other group."""
+    if not _K31_TAIL_LOOKUP:
+        return None
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        spec = next(iter(spec.kv_cache_specs.values()))
+    if isinstance(spec, SlidingWindowSpec) and spec.is_draft:
+        return spec.sliding_window - 1 + spec.extra_retained_tokens
+    return None
+
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
 _T = TypeVar("_T")
@@ -1452,7 +1470,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
         # Skip chunks the consumer's per-group spec wouldn't populate
         # locally (e.g. SWA pre-window) even if the producer stored them.
-        load_mask_per_group = self.coord.load_mask(req_meta.block_hashes, token_len)
+        # Same request length as the lookup (a fresh prompt on the producer).
+        load_mask_per_group = self.coord.load_mask(
+            req_meta.block_hashes,
+            token_len,
+            num_request_tokens=req_meta.num_prompt_tokens,
+        )
         tail_key_boundaries = {
             boundary.group_id: boundary.num_tokens
             for boundary in (
@@ -2693,7 +2716,14 @@ class MooncakeStoreWorker:
             max_units = (
                 min(token_len, len(block_hashes) * self.hash_block_size) // unit_size
             )
-            for unit_id in range(max_units):
+            first_unit = 0
+            reach = _k31_draft_swa_reach(self._kv_cache_groups[g_idx].kv_cache_spec)
+            if reach is not None:
+                # Keys of whole pages below the drafter's tail window are never
+                # read by a hit (the coordinator applies the same rule).
+                first_page = max(num_tokens - reach, 0) // spec_block_size
+                first_unit = first_page * spec_block_size // unit_size
+            for unit_id in range(first_unit, max_units):
                 block_id = unit_id * unit_size // spec_block_size
                 if lookup_mask is not None and (
                     block_id >= len(lookup_mask) or not lookup_mask[block_id]
@@ -2812,6 +2842,7 @@ class MooncakeStoreWorker:
             block_hashes,
             token_len,
             cached_block_pool,
+            num_request_tokens=num_tokens,
         )
         if hit_length >= num_tokens:
             usable_length = self.coord.align_lookup_length(num_tokens - 1)
@@ -2821,6 +2852,7 @@ class MooncakeStoreWorker:
                 block_hashes,
                 usable_length,
                 cached_block_pool,
+                num_request_tokens=num_tokens,
             )
         return (
             MooncakeLookupResult(

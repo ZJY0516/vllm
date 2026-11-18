@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
     partial_hash_hits_enabled,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
+    dflash_tail_hit_kwargs,
     CrossAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
@@ -836,6 +837,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         """
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
+        # The request length; max_cache_hit_length + 1 never overestimates it.
+        num_request_tokens = max_cache_hit_length + 1
         longest_hit_length = 0
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
         hit_length_by_group: list[int] = [0] * num_groups
@@ -904,6 +907,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     pcp_world_size=self.single_type_managers[
                         first_group_id
                     ].pcp_world_size,
+                    **dflash_tail_hit_kwargs(manager_cls, num_request_tokens),
                 )
                 if drop_eagle_block:
                     eagle_verified.add(idx)
@@ -986,6 +990,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 alignment_tokens=self._cache_hit_alignment_tokens,
                 dcp_world_size=manager.dcp_world_size,
                 pcp_world_size=manager.pcp_world_size,
+                **dflash_tail_hit_kwargs(manager_cls, max_cache_hit_length + 1),
             )
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks

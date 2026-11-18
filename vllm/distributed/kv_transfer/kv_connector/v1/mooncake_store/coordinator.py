@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_dcp_kv_cache_spec,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
+    dflash_tail_hit_kwargs,
     SingleTypeKVCacheManager,
 )
 from vllm.v1.kv_cache_interface import (
@@ -223,6 +224,7 @@ class MooncakeStoreCoordinator:
         cached_block_pool: ExternalCachedBlockPool,
         *,
         apply_eagle: bool = True,
+        num_request_tokens: int | None = None,
     ) -> tuple[tuple[list[bool], ...], int]:
         """Returns `(load_mask_per_group, hit_length)`. `mask[g][i]` is True iff
         group `g` populates physical block `i` (e.g. SWA and Mamba tail-only);
@@ -235,7 +237,11 @@ class MooncakeStoreCoordinator:
         leave the trailing block unloaded.
         """
         blocks_per_group, hit_length = self._find_hit_blocks(
-            block_hashes, max_length, cached_block_pool, apply_eagle=apply_eagle
+            block_hashes,
+            max_length,
+            cached_block_pool,
+            apply_eagle=apply_eagle,
+            num_request_tokens=num_request_tokens,
         )
         masks = tuple(
             [blk is not cached_block_pool.null_block for blk in blocks]
@@ -247,6 +253,7 @@ class MooncakeStoreCoordinator:
         self,
         block_hashes: Sequence[BlockHash],
         token_len: int,
+        num_request_tokens: int | None = None,
     ) -> tuple[list[bool], ...]:
         """Per-group load masks: `mask[g][i]` is True iff group `g`'s
         spec would populate physical block `i` at length `token_len`
@@ -258,6 +265,7 @@ class MooncakeStoreCoordinator:
             token_len,
             ExternalCachedBlockPool(self.hash_block_size),
             apply_eagle=False,
+            num_request_tokens=num_request_tokens,
         )
         return masks
 
@@ -366,6 +374,7 @@ class MooncakeStoreCoordinator:
         cached_block_pool: ExternalCachedBlockPool,
         *,
         apply_eagle: bool = True,
+        num_request_tokens: int | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         """Converge registered managers' hits as in HybridKVCacheCoordinator."""
         alignment_tokens = (
@@ -383,6 +392,7 @@ class MooncakeStoreCoordinator:
                 kv_cache_spec=spec,
                 drop_eagle_block=apply_eagle and group_eagle,
                 alignment_tokens=alignment_tokens,
+                **dflash_tail_hit_kwargs(manager_cls, num_request_tokens),
             )
             num_groups = len(self.kv_cache_groups)
             blocks_by_group: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
@@ -440,6 +450,7 @@ class MooncakeStoreCoordinator:
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=alignment_tokens,
+                    **dflash_tail_hit_kwargs(manager_cls, num_request_tokens),
                 )
                 if drop_eagle_block:
                     eagle_verified.add(idx)

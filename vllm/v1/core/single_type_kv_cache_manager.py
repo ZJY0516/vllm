@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -264,7 +265,11 @@ class SingleTypeKVCacheManager(ABC):
         num_evictable_blocks = self._get_num_evictable_blocks(
             new_computed_blocks[num_skipped_new_computed_blocks:]
         )
-        if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):
+        if (
+            self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens)
+            and num_local_computed_blocks
+            > num_local_computed_tokens // self.block_size
+        ):
             # Reserve the extra block that allocate_new_blocks pulls for the
             # partial-hit CoW redirect.
             num_new_blocks += 1
@@ -321,7 +326,9 @@ class SingleTypeKVCacheManager(ABC):
         # them so cache_blocks() will not try to re-cache blocks that already
         # have a block_hash set.
         self.num_cached_block[request_id] = len(req_blocks)
-        if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):
+        if self._has_partial_local_hit(
+            new_computed_blocks, num_local_computed_tokens
+        ) and len(req_blocks) > num_local_computed_tokens // self.block_size:
             # Record the partial tail for the CoW redirect in
             # allocate_new_blocks; cap the cached count at the full blocks so
             # cache_blocks() re-caches the private copy once full.
@@ -948,7 +955,51 @@ class RSWAManager(FullAttentionManager):
         self._remove_blocks_in_range(request_id, first_gap_block, last_gap_block)
 
 
+# Backport of the DFlash/DSpark tail hit rule (vLLM #64109) for sliding-window
+# drafter groups; the image's only sliding-window group is the drafter's.
+# Only draft-model sliding-window groups (`is_draft`) take the rule.
+_DFLASH_SWA_TAIL_HITS = os.environ.get("VLLM_DFLASH_SWA_TAIL_HITS", "0") == "1"
+_dflash_tail_logged: set[tuple[bool, bool]] = set()
+
+
+def _log_dflash_tail_rule_once(kv_cache_spec, applied: bool) -> None:
+    key = (bool(kv_cache_spec.is_draft), applied)
+    if key not in _dflash_tail_logged:
+        _dflash_tail_logged.add(key)
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "DFlash tail hit rule: sliding_window=%d block_size=%d is_draft=%s "
+            "applied=%s",
+            kv_cache_spec.sliding_window,
+            kv_cache_spec.block_size,
+            kv_cache_spec.is_draft,
+            applied,
+        )
+
+
+def dflash_tail_hit_kwargs(manager_cls: type, num_request_tokens: int | None) -> dict:
+    """`find_longest_cache_hit` kwargs passing the request length to
+    sliding-window managers when the tail rule is on."""
+    if (
+        _DFLASH_SWA_TAIL_HITS
+        and num_request_tokens is not None
+        and isinstance(manager_cls, type)
+        and issubclass(manager_cls, SlidingWindowManager)
+    ):
+        return {"num_request_tokens": num_request_tokens}
+    return {}
+
+
 class SlidingWindowManager(SingleTypeKVCacheManager):
+    # Opt-in sub-block (hash-unit) prefix-cache hits: the matched window's last
+    # block may be a cached partial block, as in FullAttentionManager. Without
+    # it, a sliding-window group makes the whole hybrid cache fall back to
+    # scheduler-block (LCM) aligned hits.
+    supports_fine_grained_hash_lookup: ClassVar[bool] = (
+        os.environ.get("VLLM_SWA_FINE_GRAINED_HITS", "0") == "1"
+    )
+
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
@@ -982,12 +1033,39 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        num_request_tokens: int | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         assert isinstance(kv_cache_spec, SlidingWindowSpec), (
             "SlidingWindowManager can only be used for sliding window groups"
         )
         assert dcp_world_size == 1, "DCP not support sliding window attn now."
         assert pcp_world_size == 1, "PCP not support sliding window attn now."
+        if _DFLASH_SWA_TAIL_HITS and num_request_tokens is not None:
+            apply_tail_rule = kv_cache_spec.is_draft and not drop_eagle_block
+            _log_dflash_tail_rule_once(kv_cache_spec, apply_tail_rule)
+        else:
+            apply_tail_rule = False
+        if apply_tail_rule:
+            return cls._dflash_tail_hit(
+                block_hashes,
+                max_length,
+                kv_cache_group_ids,
+                block_pool,
+                kv_cache_spec,
+                alignment_tokens,
+                num_request_tokens,
+            )
+        # Fine-grained mode: resolve_block_hashes() keeps the raw hash-unit list;
+        # match whole blocks on a block-size view, then probe the next block's
+        # hash units for a cached partial block (phase 2 below).
+        fine_grained = (
+            cls.supports_fine_grained_hash_lookup
+            and block_pool.hash_block_size < kv_cache_spec.block_size
+            and alignment_tokens < kv_cache_spec.block_size
+            and kv_cache_spec.block_size % alignment_tokens == 0
+            and not isinstance(block_hashes, BlockHashListWithBlockSize)
+        )
+        raw_block_hashes = block_hashes
         # Sliding-window cache hits must stay at the group's physical block
         # granularity. resolve_block_hashes() converts finer-grained hashes to
         # that view when the hybrid-cache alignment is smaller than block_size.
@@ -998,6 +1076,10 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
             alignment_tokens=alignment_tokens,
         )
+        if fine_grained:
+            block_hashes = BlockHashListWithBlockSize(
+                raw_block_hashes, block_pool.hash_block_size, kv_cache_spec.block_size
+            )
 
         # The number of contiguous blocks needed for a prefix cache hit.
         sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(
@@ -1066,6 +1148,149 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 for computed in computed_blocks:
                     computed.pop()
         hit_length = len(computed_blocks[0]) * block_size
+        # Phase 2 (fine-grained only): the window behind any position inside the
+        # next block is covered by the matched run (it needs no block left of the
+        # run), so only the partial block itself must be cached. Probe its hash
+        # units high-to-low (longest hit first). EAGLE's drop keeps block hits.
+        if fine_grained and not drop_eagle_block:
+            assert isinstance(raw_block_hashes, Sequence)
+            scale_factor = block_size // alignment_tokens
+            first_partial_idx = len(computed_blocks[0]) * scale_factor
+            max_partial_idx = min(
+                first_partial_idx + scale_factor - 1,
+                max_length // alignment_tokens,
+                len(raw_block_hashes),
+            )
+            for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
+                cached_tail = block_pool.get_cached_block(
+                    raw_block_hashes[fine_idx], kv_cache_group_ids
+                )
+                if not cached_tail:
+                    continue
+                for computed, cached in zip(computed_blocks, cached_tail):
+                    computed.append(cached)
+                hit_length = (fine_idx + 1) * alignment_tokens
+                break
+        return computed_blocks, hit_length
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
+    ) -> None:
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
+        if (
+            not self.supports_fine_grained_hash_lookup
+            or self.block_size == self.block_pool.hash_block_size
+        ):
+            return
+        # Register the prompt's partial tail block for phase-2 lookups; the
+        # tail lies inside the window, so it is still allocated here.
+        FullAttentionManager._cache_partial_tail_block(self, request, num_tokens)
+
+    @classmethod
+    def _dflash_tail_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: SlidingWindowSpec,
+        alignment_tokens: int,
+        num_request_tokens: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        """Longest hit whose blocks in `[L - reach, hit)` are cached, `L` being
+        `num_request_tokens` (DFlash/DSpark drafter rule, vLLM #64109).
+
+        Drafter context KV at a position is a projection of the target's hidden
+        state and draft attention reads only keys within the window of the
+        positions past the last target token, so a hit needs no drafter KV
+        below `L - reach`; the prefill from the hit rewrites the rest. With
+        hash-unit hits, a hit inside a block needs that block's cached partial
+        only when the block reaches `L - reach`; otherwise the block is left
+        to a fresh allocation (the local prefix cache still reuses a cached
+        partial). Underestimating `L` only asks for more blocks.
+        """
+        block_size = kv_cache_spec.block_size
+        hash_block_size = block_pool.hash_block_size
+        reach = kv_cache_spec.sliding_window - 1 + kv_cache_spec.extra_retained_tokens
+        first_read = max(num_request_tokens - reach, 0)
+        fine_grained = (
+            cls.supports_fine_grained_hash_lookup
+            and hash_block_size < block_size
+            and alignment_tokens == hash_block_size
+            and block_size % alignment_tokens == 0
+            and not isinstance(block_hashes, BlockHashListWithBlockSize)
+        )
+        raw_block_hashes = block_hashes
+        if fine_grained:
+            block_hashes = BlockHashListWithBlockSize(
+                raw_block_hashes, hash_block_size, block_size
+            )
+        else:
+            block_hashes = resolve_block_hashes(
+                block_hashes,
+                hash_block_size,
+                block_size,
+                supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
+                alignment_tokens=alignment_tokens,
+            )
+        max_num_blocks = max_length // block_size
+        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [block_pool.null_block] * max_num_blocks for _ in kv_cache_group_ids
+        )
+        num_blocks = min(first_read // block_size, max_num_blocks)
+        while num_blocks < max_num_blocks and (
+            cached_block := block_pool.get_cached_block(
+                block_hashes[num_blocks], kv_cache_group_ids
+            )
+        ):
+            for computed, cached in zip(computed_blocks, cached_block):
+                computed[num_blocks] = cached
+            num_blocks += 1
+        # Blocks [first_read // block_size, num_blocks) are cached, so any
+        # block-granular hit up to num_blocks is valid; align it.
+        while num_blocks > 0 and num_blocks * block_size % alignment_tokens != 0:
+            num_blocks -= 1
+        for computed in computed_blocks:
+            del computed[num_blocks:]
+        hit_length = num_blocks * block_size
+        if not fine_grained:
+            return computed_blocks, hit_length
+        assert isinstance(raw_block_hashes, Sequence)
+        # Hits inside block `num_blocks`, longest first.
+        scale = block_size // alignment_tokens
+        first_partial_idx = num_blocks * scale
+        max_partial_idx = min(
+            first_partial_idx + scale - 1,
+            max_length // alignment_tokens,
+            len(raw_block_hashes),
+        )
+        reuse_cached_partial = isinstance(block_pool, BlockPool)
+        for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
+            end = (fine_idx + 1) * alignment_tokens
+            needed = end > first_read
+            cached_tail = (
+                block_pool.get_cached_block(
+                    raw_block_hashes[fine_idx], kv_cache_group_ids
+                )
+                if needed or reuse_cached_partial
+                else None
+            )
+            if cached_tail:
+                for computed, cached in zip(computed_blocks, cached_tail):
+                    computed.append(cached)
+                return computed_blocks, end
+            if not needed:
+                return computed_blocks, end
         return computed_blocks, hit_length
 
     @classmethod
