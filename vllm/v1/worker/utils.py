@@ -379,6 +379,17 @@ class AttentionGroup:
         blocks_per_kv_block = self.kv_cache_spec.block_size // self.kernel_block_size
         rows, cols = block_table.shape
         out = self.kernel_block_table[ubatch_idx, :rows, : cols * blocks_per_kv_block]
+        from vllm.v1.worker.gpu.input_batch import np1_claim
+
+        if np1_claim(
+            ("kbt", out.data_ptr()),
+            block_table.data_ptr(),
+            rows,
+            cols,
+            blocks_per_kv_block,
+            self.kernel_block_stride or blocks_per_kv_block,
+        ):
+            return out  # K31_NP1 mapped them.
         torch.add(
             self.kernel_block_offsets,
             block_table.unsqueeze(-1),

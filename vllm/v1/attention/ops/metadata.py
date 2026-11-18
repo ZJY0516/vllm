@@ -40,14 +40,23 @@ def compute_token_to_req_indices(
     Reads only the device `query_start_loc`, so it is safe to record in a
     CUDA graph. Tokens at or past `num_mapped_tokens` are mapped to 0.
     """
-    _token_request_mapping_kernel[((num_tokens + 255) // 256,)](
-        query_start_loc,
-        out,
+    from vllm.v1.worker.gpu.input_batch import np1_claim
+
+    if not np1_claim(
+        ("t2r", out.data_ptr()),
+        query_start_loc.data_ptr(),
         query_start_loc.shape[0] - 1,
         num_mapped_tokens,
         num_tokens,
-        num_warps=4,
-    )
+    ):
+        _token_request_mapping_kernel[((num_tokens + 255) // 256,)](
+            query_start_loc,
+            out,
+            query_start_loc.shape[0] - 1,
+            num_mapped_tokens,
+            num_tokens,
+            num_warps=4,
+        )
     return out[:num_tokens]
 
 

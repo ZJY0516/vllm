@@ -1210,7 +1210,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # One launch for the global copy (if any) and the in-place
             # localization; the same integer formula as get_dcp_local_seq_lens.
             n = seq_lens.numel()
-            if n > 0:
+            from vllm.v1.worker.gpu.input_batch import np1_claim
+
+            if n > 0 and not np1_claim(
+                ("dcploc", seq_lens.data_ptr()),
+                n,
+                (seq_lens if global_out is None else global_out).data_ptr(),
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            ):
                 _fused_dcp_localize_kernel[(triton.cdiv(n, 128),)](
                     seq_lens,
                     seq_lens if global_out is None else global_out,
@@ -1798,23 +1807,38 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     num_decodes,
                     num_decode_tokens + triton.cdiv(capacity - num_decode_tokens, 256),
                 )
-                _indexer_decode_metadata_kernel[(grid,)](
-                    query_start_loc,
-                    seq_lens,
-                    block_table,
-                    self.decode_seq_lens_buffer,
-                    self.expanded_block_table_buffer,
-                    self.decode_lens_buffer,
-                    self.decode_indices_buffer,
-                    self.per_req_decode_lens_buffer,
+                from vllm.v1.worker.gpu.input_batch import np1_claim
+
+                np1_done = np1_claim(
+                    ("idxmd", self.decode_seq_lens_buffer.data_ptr()),
+                    query_start_loc.data_ptr(),
+                    seq_lens.data_ptr(),
+                    block_table.data_ptr(),
                     num_decodes,
                     num_decode_tokens,
                     capacity,
                     block_table.stride(0),
                     self.expanded_block_table_buffer.stride(0),
-                    BLOCK_COLS=block_table.shape[1],
-                    num_warps=4,
+                    block_table.shape[1],
                 )
+                if not np1_done:
+                    _indexer_decode_metadata_kernel[(grid,)](
+                        query_start_loc,
+                        seq_lens,
+                        block_table,
+                        self.decode_seq_lens_buffer,
+                        self.expanded_block_table_buffer,
+                        self.decode_lens_buffer,
+                        self.decode_indices_buffer,
+                        self.per_req_decode_lens_buffer,
+                        num_decodes,
+                        num_decode_tokens,
+                        capacity,
+                        block_table.stride(0),
+                        self.expanded_block_table_buffer.stride(0),
+                        BLOCK_COLS=block_table.shape[1],
+                        num_warps=4,
+                    )
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
                 block_table = self.expanded_block_table_buffer[:num_decode_tokens]
                 decode_lens = self.decode_lens_buffer[:num_decode_tokens]

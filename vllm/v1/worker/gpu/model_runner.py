@@ -42,6 +42,7 @@ from vllm.compilation.wrapper import (
 )
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.triton_utils import triton
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
@@ -133,6 +134,9 @@ from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
+    _np1_step_prep_kernel,
+    np1_grid,
+    np1_set,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
     post_update,
@@ -400,6 +404,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.aux_output_connector: AuxOutputWorkerConnector | None = None
 
         set_offloader(create_offloader(self.vllm_config.offload_config))
+        # K31_NP1 (default off): the next-step preparation in one launch.
+        self._np1 = _Np1Runner() if _np1_env_mode() is not None else None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -686,6 +692,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """
         # GPUWorker finalizes the PD interleave before KV cache initialization.
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
+        if self._np1 is not None:
+            self._np1.layout, self._np1.layout_failed = None, False
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self.extensible_kv_cache: ExtensibleKVCache | None = None
@@ -1992,26 +2000,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
 
         cudagraph_stats = None
+        np1_plan = None
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             if self.observability_config.cudagraph_metrics:
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
             assert batch_req_state is not None
-            input_batch = self.prepare_inputs(
-                scheduler_output, batch_req_state, batch_desc, num_active_loras
-            )
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
-            # Mamba prefix-cache pre-copy: migrate recurrent state across block
-            # boundaries before the forward. Runs only on real batches, and
-            # before model_state.prepare_attn gathers num_accepted_tokens so the
-            # boundary reset is visible to the attention metadata.
-            self.model_state.preprocess_state(
-                input_batch,
-                block_tables,
-                self.kv_cache_config,
-                self.req_states.num_computed_tokens.gpu,
-            )
+            if self._np1 is not None:
+                np1_plan = self._np1.begin(
+                    self, scheduler_output, batch_req_state, batch_desc
+                )
+            if np1_plan is not None and not np1_plan.shadow:
+                # The inputs, block tables, slot mappings and the Mamba align
+                # preprocess are written; the state pre-copy reads them.
+                input_batch = np1_plan.input_batch
+                block_tables = np1_plan.block_tables
+                slot_mappings = np1_plan.slot_mappings
+                self.model_state.np1_precopy(input_batch)
+            else:
+                input_batch = self.prepare_inputs(
+                    scheduler_output, batch_req_state, batch_desc, num_active_loras
+                )
+                block_tables, slot_mappings = self.prepare_attn(input_batch)
+                # Mamba prefix-cache pre-copy: migrate recurrent state across block
+                # boundaries before the forward. Runs only on real batches, and
+                # before model_state.prepare_attn gathers num_accepted_tokens so the
+                # boundary reset is visible to the attention metadata.
+                self.model_state.preprocess_state(
+                    input_batch,
+                    block_tables,
+                    self.kv_cache_config,
+                    self.req_states.num_computed_tokens.gpu,
+                )
+                if np1_plan is not None:
+                    self._np1.stock_inputs_ready(self, np1_plan, input_batch)
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -2065,7 +2088,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         input_block_tables=block_tables,
                     )
 
-        if self.dcp_size > 1 and not (dummy_run and skip_attn_for_dummy_run):
+        if np1_plan is not None and not np1_plan.shadow and self.dcp_size > 1:
+            input_batch.dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
+                : input_batch.num_reqs_after_padding
+            ]
+        elif self.dcp_size > 1 and not (dummy_run and skip_attn_for_dummy_run):
             input_buffers = self.input_buffers
             if self.pcp_manager is not None:
                 input_buffers = self.pcp_manager.input_buffers
@@ -2109,18 +2136,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
-            attn_metadata = self.model_state.prepare_attn(
-                input_batch,
-                batch_desc.cg_mode,
-                block_tables,
-                slot_mappings,
-                attn_groups,
-                self.kv_cache_config,
-                # FULL replay reads capture-time metadata buffers. Re-stage them
-                # from the zeroed dummy block tables instead of retaining state
-                # indices from the previous real batch.
-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
-            )
+            if np1_plan is not None:
+                np1_set(np1_plan)
+            try:
+                attn_metadata = self.model_state.prepare_attn(
+                    input_batch,
+                    batch_desc.cg_mode,
+                    block_tables,
+                    slot_mappings,
+                    attn_groups,
+                    self.kv_cache_config,
+                    # FULL replay reads capture-time metadata buffers. Re-stage
+                    # them from the zeroed dummy block tables instead of retaining
+                    # state indices from the previous real batch.
+                    for_capture=dummy_run
+                    and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                )
+            finally:
+                if np1_plan is not None:
+                    np1_set(None)
+            if np1_plan is not None:
+                self._np1.finish(self, np1_plan, input_batch)
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2666,6 +2702,844 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @property
     def pcp_manager_cls(self) -> type[pcp.PCPManager]:
         return pcp.PCPManager
+
+
+# ---------------------------------------------------------------------------
+# K31_NP1: the next-step preparation in one launch (`_np1_step_prep_kernel`).
+# K31_NP1=1 serves every eligible step with it; K31_NP1_CHECK=1 instead runs
+# it into copies beside the stock path and compares every output bit for bit.
+# K31_NP1_SWITCH=<file> (with either) re-reads off / on / check from that file
+# between steps. Default off: none of this runs.
+# ---------------------------------------------------------------------------
+
+
+def _np1_env_mode() -> str | None:
+    import os
+
+    if os.environ.get("K31_NP1_CHECK", "0") not in ("", "0"):
+        return "check"
+    if os.environ.get("K31_NP1", "0") not in ("", "0"):
+        return "on"
+    return None
+
+
+# A claimed site whose launch reads the output of another claimed site.
+_NP1_COUPLED = {"dcploc": "idxmd"}
+
+
+class _Np1Plan:
+    """One step's claimed launch sites. In comparison mode (`shadow`) nothing
+    is claimed: the stock path runs and the claims are only checked."""
+
+    __slots__ = (
+        "claims",
+        "tensors",
+        "shadow",
+        "granted",
+        "seen",
+        "observed",
+        "problems",
+        "input_batch",
+        "block_tables",
+        "slot_mappings",
+        "check",
+    )
+
+    def __init__(self, claims, tensors, shadow):
+        self.claims = claims
+        self.tensors = tensors
+        self.shadow = shadow
+        self.granted: set = set()
+        self.seen: dict = {}
+        self.observed: dict = {}
+        self.problems: list = []
+        self.input_batch = None
+        self.block_tables = None
+        self.slot_mappings = None
+        self.check = None
+
+    def claim(self, key, params) -> bool:
+        expected = self.claims.get(key)
+        if expected is None:
+            return False
+        if key in self.seen:
+            self.problems.append(("twice", key))
+            return False
+        self.seen[key] = params
+        ok = expected == params
+        if not ok:
+            self.problems.append(("params", key, expected, params))
+        if self.shadow:
+            return False
+        dep = _NP1_COUPLED.get(key[0])
+        if dep is not None:
+            # In-place on the output of `dep`: follows `dep`'s decision.
+            return (dep,) + tuple(key[1:]) in self.granted
+        if ok:
+            self.granted.add(key)
+        return ok
+
+    def observe(self, key, tensor) -> None:
+        if self.shadow:
+            self.observed[key] = tensor
+
+    def unseen(self) -> list:
+        return [k for k in self.claims if k not in self.seen]
+
+
+class _Np1Layout:
+    """The tables of `_np1_step_prep_kernel` for this runner's buffers and
+    metadata builders (built once the builders are bound)."""
+
+    def __init__(self, runner) -> None:
+        from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadataBuilder
+        from vllm.model_executor.layers.attention.sparse_mla_attention import (
+            SparseMLACommonMetadataBuilder,
+        )
+        from vllm.v1.attention.backends.mla import indexer as indexer_mod
+        from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+        from vllm.v1.worker.gpu import input_batch as ib
+
+        dev = runner.device
+        bt = runner.block_tables
+        ms = runner.model_state
+        q = runner.decode_query_len
+        self.q = q
+        self.ok = False
+        self.reason = ""
+        ng = bt.num_kv_cache_groups
+        if ng == 0 or bt.has_sliding_window_groups:
+            self.reason = "no or sliding-window kv cache groups"
+            return
+        out = [0] * ib.NP1_O_LEN
+        inp = [0] * ib.NP1_I_LEN
+        ints = [0] * ib.NP1_N_LEN
+        persist: dict[str, torch.Tensor] = {}
+
+        def put_out(slot, name, t):
+            out[slot] = t.data_ptr()
+            persist[name] = t
+
+        buf = runner.input_buffers
+        put_out(ib.NP1_O_IS_PADDING, "is_padding", buf.is_padding)
+        put_out(ib.NP1_O_QSL, "query_start_loc", buf.query_start_loc)
+        put_out(ib.NP1_O_POSITIONS, "positions", buf.positions)
+        put_out(ib.NP1_O_SEQ_LENS, "seq_lens", buf.seq_lens)
+        put_out(ib.NP1_O_INPUT_IDS, "input_ids", buf.input_ids)
+        put_out(ib.NP1_O_SLOTS, "slot_mappings", bt.slot_mappings)
+        ints[ib.NP1_N_SLOT_STRIDE] = bt.slot_mappings.stride(0)
+        rs = runner.req_states
+        inp[ib.NP1_I_NC] = rs.num_computed_tokens.gpu.data_ptr()
+        inp[ib.NP1_I_LAST] = rs.last_sampled_tokens.data_ptr()
+        inp[ib.NP1_I_DRAFT] = rs.draft_tokens.data_ptr()
+        ints[ib.NP1_N_DRAFT_STRIDE] = rs.draft_tokens.stride(0)
+        if rs.last_sampled_tokens.stride(0) != 1 or rs.draft_tokens.stride(1) != 1:
+            self.reason = "request state layout"
+            return
+        self.has_dcp = runner.dcp_size > 1
+        if self.has_dcp:
+            put_out(ib.NP1_O_DCP_LOCAL, "dcp_local_seq_lens", buf.dcp_local_seq_lens)
+        for g, t in enumerate(bt.input_block_tables):
+            persist[f"input_block_table_{g}"] = t
+
+        # Mamba align state (KDA): preprocess, accepted tokens, aligned indices.
+        self.has_mamba = bool(getattr(ms, "_align_mode", False))
+        nmg, nslot, mamba_bs, align_bs = 0, 1, 1, 1
+        mamba_gids: list[int] = []
+        if self.has_mamba:
+            ctx = getattr(ms, "_mamba_ctx", None)
+            if (
+                ctx is None
+                or not ctx.is_initialized
+                or ctx.replayssm is not None
+                or getattr(ms, "_use_replayssm_trackers", False)
+                or ms._mamba_spec is None
+            ):
+                self.reason = "mamba context"
+                return
+            aligned = ctx.aligned_state_indices
+            mamba_gids = list(ms._mamba_group_ids)
+            nmg = len(mamba_gids)
+            if nmg != ctx.num_groups or nmg > 8:
+                self.reason = "mamba groups"
+                return
+            nslot = aligned.shape[2]
+            mamba_bs = ms._mamba_spec.block_size
+            align_bs = ctx.block_size
+            for i, gid in enumerate(mamba_gids):
+                ints[ib.NP1_N_MAMBA_GID + i] = gid
+            ints[ib.NP1_N_ALIGNED_S0] = aligned.stride(0)
+            ints[ib.NP1_N_ALIGNED_S1] = aligned.stride(1)
+            ints[ib.NP1_N_ALIGNED_S2] = aligned.stride(2)
+            ints[ib.NP1_N_MAMBA_STRIDE] = ctx.block_table_stride_req
+            inp[ib.NP1_I_SIDX] = ms._mamba_state_idx_gpu.data_ptr()
+            inp[ib.NP1_I_NACC] = ms.num_accepted_tokens_gpu.data_ptr()
+            put_out(ib.NP1_O_SIDX, "mamba_state_idx", ms._mamba_state_idx_gpu)
+            put_out(ib.NP1_O_SRC_COL, "mamba_src_col", ms._mamba_src_col_gpu)
+            put_out(ib.NP1_O_SRC_OFF, "mamba_src_off", ms._mamba_src_off_gpu)
+            put_out(ib.NP1_O_NACC, "num_accepted_tokens", ms.num_accepted_tokens_gpu)
+            put_out(ib.NP1_O_ALIGNED, "aligned_state_indices", aligned)
+            self.aligned = aligned
+
+        # The metadata builders, in build order.
+        self.kda: list = []  # (builder, mamba group index)
+        self.indexers: list = []  # (builder, kv group, attention group)
+        self.kernel_tables: list = []  # (attention group, kv group)
+        self.mla_first = None
+        rec_rows = None
+        for gid, groups in enumerate(runner.attn_groups):
+            for ag in groups:
+                b = ag.get_metadata_builder(0)
+                if getattr(ag, "kernel_block_size", None) is not None:
+                    self.kernel_tables.append((ag, gid))
+                if isinstance(b, KimiK3KDAMetadataBuilder):
+                    if (
+                        not self.has_mamba
+                        or gid not in mamba_gids
+                        or not b.use_recoverssm
+                        or not b.use_full_cuda_graph
+                        or b.recoverssm_num_accepted_tokens is None
+                        or getattr(b, "recoverssm_record_rows", None) is None
+                        or b.spec_state_indices_tensor.shape[1] > nslot
+                    ):
+                        self.reason = "KDA builder not served"
+                        return
+                    self.kda.append((b, mamba_gids.index(gid)))
+                    if rec_rows is None:
+                        rec_rows = b.recoverssm_record_rows
+                    elif rec_rows is not b.recoverssm_record_rows:
+                        self.reason = "per-builder record rows"
+                        return
+                elif isinstance(b, indexer_mod.DeepseekV32IndexerMetadataBuilder):
+                    self.indexers.append((b, gid, ag))
+                elif (
+                    isinstance(b, SparseMLACommonMetadataBuilder)
+                    and self.mla_first is None
+                ):
+                    self.mla_first = b
+        if len(self.kda) > 4 or len(self.indexers) > 2 or len(self.kernel_tables) > 8:
+            self.reason = "too many builders"
+            return
+        for k, (b, gi) in enumerate(self.kda):
+            s = b.spec_state_indices_tensor
+            put_out(ib.NP1_O_KDA + 3 * k, f"kda{k}_state", s)
+            put_out(ib.NP1_O_KDA + 3 * k + 1, f"kda{k}_qsl", b.spec_query_start_loc)
+            put_out(ib.NP1_O_KDA + 3 * k + 2, f"kda{k}_accepted", b.num_accepted_tokens)
+            inp[ib.NP1_I_KDA_NACC + k] = b.recoverssm_num_accepted_tokens.data_ptr()
+            ints[ib.NP1_N_KDA + 4 * k] = gi
+            ints[ib.NP1_N_KDA + 4 * k + 1] = s.stride(0)
+            ints[ib.NP1_N_KDA + 4 * k + 2] = s.stride(1)
+            ints[ib.NP1_N_KDA + 4 * k + 3] = s.shape[1]
+        self.has_rec_rows = rec_rows is not None
+        if rec_rows is not None:
+            put_out(ib.NP1_O_REC_ROWS, "record_rows", rec_rows)
+        self.has_rpt = self.mla_first is not None
+        if self.mla_first is not None:
+            put_out(
+                ib.NP1_O_REQ_PER_TOKEN,
+                "req_id_per_token",
+                self.mla_first.req_id_per_token_buffer,
+            )
+        widths = [t.shape[1] for t in bt.input_block_tables]
+        kt_of: dict[int, tuple[int, int]] = {}
+        for m, (ag, gid) in enumerate(self.kernel_tables):
+            nb = ag.kv_cache_spec.block_size // ag.kernel_block_size
+            alpha = ag.kernel_block_stride or nb
+            kt = ag.kernel_block_table[0]
+            put_out(ib.NP1_O_KT + m, f"kernel_table{m}", kt)
+            ints[ib.NP1_N_KT + 5 * m] = gid
+            ints[ib.NP1_N_KT + 5 * m + 1] = nb
+            ints[ib.NP1_N_KT + 5 * m + 2] = alpha
+            ints[ib.NP1_N_KT + 5 * m + 3] = kt.stride(0)
+            ints[ib.NP1_N_KT + 5 * m + 4] = widths[gid] * nb
+            if kt.shape[1] < widths[gid] * nb:
+                self.reason = "kernel table width"
+                return
+            kt_of[id(ag)] = (nb, alpha)
+        self.idx_dcp = False
+        self.idx_slots = False
+        for k, (b, gid, ag) in enumerate(self.indexers):
+            if (
+                not b.supports_varlen
+                or b.compress_ratio != 1
+                or b.use_adaptive_verification
+                or b.use_pcp
+                or b.dcp_world_size != runner.dcp_size
+                or b.cp_kv_cache_interleave_size != runner.cp_interleave
+                or (runner.dcp_size > 1 and not indexer_mod._FUSED_DCP_LOCALIZE)
+            ):
+                self.reason = "indexer builder not served"
+                return
+            nb, alpha = kt_of.get(id(ag), (1, 1))
+            base = ib.NP1_O_IDX + 8 * k
+            put_out(base, f"idx{k}_seq", b.decode_seq_lens_buffer)
+            put_out(base + 1, f"idx{k}_bt", b.expanded_block_table_buffer)
+            put_out(base + 2, f"idx{k}_lens", b.decode_lens_buffer)
+            put_out(base + 3, f"idx{k}_ind", b.decode_indices_buffer)
+            put_out(base + 4, f"idx{k}_perreq", b.per_req_decode_lens_buffer)
+            if runner.dcp_size > 1:
+                put_out(base + 5, f"idx{k}_global", b.global_decode_seq_lens_buffer)
+            sm = getattr(b, "slot_mapping_buffer", None)
+            if sm is not None:
+                put_out(base + 6, f"idx{k}_slots", sm)
+            ints[ib.NP1_N_IDX + 8 * k] = gid
+            ints[ib.NP1_N_IDX + 8 * k + 1] = b.expanded_block_table_buffer.stride(0)
+            ints[ib.NP1_N_IDX + 8 * k + 2] = widths[gid] * nb
+            ints[ib.NP1_N_IDX + 8 * k + 3] = b.decode_seq_lens_buffer.numel()
+            ints[ib.NP1_N_IDX + 8 * k + 4] = nb
+            ints[ib.NP1_N_IDX + 8 * k + 5] = alpha
+            ints[ib.NP1_N_IDX + 8 * k + 6] = b.kv_cache_spec.block_size
+            ints[ib.NP1_N_IDX + 8 * k + 7] = sm.numel() if sm is not None else 0
+            if b.expanded_block_table_buffer.shape[1] < widths[gid] * nb:
+                self.reason = "indexer block table width"
+                return
+            self.idx_dcp = runner.dcp_size > 1
+            if k == 0:
+                self.idx_slots = sm is not None
+            elif self.idx_slots != (sm is not None):
+                self.reason = "indexer slot mappings"
+                return
+        self.persist = persist
+        self.out_list = out
+        self.in_list = inp
+        self.int_list = ints
+        self.out_tab = torch.tensor(out, dtype=torch.int64, device=dev)
+        self.in_tab = torch.tensor(inp, dtype=torch.int64, device=dev)
+        self.int_tab = torch.tensor(ints, dtype=torch.int64, device=dev)
+        arena = ib.np1_arena_layout(q)
+        self.arena = arena
+        chunk = 4096
+        cap = max(
+            [b.decode_seq_lens_buffer.numel() for b, _, _ in self.indexers]
+            + [ints[ib.NP1_N_IDX + 8 * k + 7] for k in range(len(self.indexers))]
+            + [1]
+        )
+        self.nch = triton.cdiv(bt.slot_mappings.shape[1], chunk)
+        self.nch_idx = triton.cdiv(cap, chunk)
+        block = 1024
+        self.kt_ch = max(
+            [triton.cdiv(ints[ib.NP1_N_KT + 5 * m + 4], block) for m in range(len(self.kernel_tables))]
+            + [1]
+        )
+        self.ebt_ch = max(
+            [triton.cdiv(ints[ib.NP1_N_IDX + 8 * k + 2], block) for k in range(len(self.indexers))]
+            + [1]
+        )
+        self.ng = ng
+        self.nkt = len(self.kernel_tables)
+        self.nib = len(self.indexers)
+        import vllm.envs as envs
+
+        self.consts = dict(
+            Q=q,
+            BT=triton.next_power_of_2(ib.NP1_MAX_REQS * q),
+            BR=triton.next_power_of_2(ib.NP1_MAX_REQS + 1),
+            NG=ng,
+            NMG=nmg,
+            NSLOT=nslot,
+            NSLOT_P2=triton.next_power_of_2(nslot),
+            MAMBA_BS=mamba_bs,
+            ALIGN_BS=align_bs,
+            NKB=len(self.kda),
+            NIB=self.nib,
+            NKT=self.nkt,
+            IDX_DCP=self.idx_dcp,
+            IDX_SLOTS=self.idx_slots,
+            SKIP_PADDING=bool(envs.VLLM_MOE_SKIP_PADDING),
+            HAS_MAMBA=self.has_mamba,
+            HAS_DCP=self.has_dcp,
+            HAS_REC_ROWS=self.has_rec_rows,
+            HAS_REQ_PER_TOKEN=self.has_rpt,
+            CP_SIZE=bt.cp_size,
+            CP_INTERLEAVE=bt.cp_interleave,
+            PAD_ID=PAD_SLOT_ID,
+            A_IDX=arena["idx"],
+            A_CU=arena["cu"],
+            A_EIDX=arena["eidx"],
+            A_LOGITS=arena["logits"],
+            A_EPOS=arena["epos"],
+            A_NACC=arena["nacc"],
+            A_NCOMP=arena["ncomp"],
+            CHUNK=chunk,
+            NCH=self.nch,
+            NCH_IDX=self.nch_idx,
+            KT_CH=self.kt_ch,
+            EBT_CH=self.ebt_ch,
+            BLOCK=block,
+            num_warps=4,
+        )
+        self.skip_padding = self.consts["SKIP_PADDING"]
+        self.compiled = None
+        self.const_values: list = []
+        self.ok = True
+
+    def describe(self) -> str:
+        return (
+            f"{self.ng} kv cache groups, mamba {self.has_mamba} "
+            f"({self.consts['NMG']} groups, {self.consts['NSLOT']} slots), "
+            f"{len(self.kda)} KDA builders, {self.nib} indexer builders "
+            f"(slots {self.idx_slots}, dcp {self.idx_dcp}), {self.nkt} kernel "
+            f"tables, record rows {self.has_rec_rows}, req-per-token {self.has_rpt}"
+        )
+
+    def claims(self, runner, num_reqs: int, idx_ptr: int) -> dict:
+        """Each claimed launch site's parameters this step (as the stock call
+        would pass them). Only the request-slot tensor changes between steps
+        of one request count."""
+        cache = self.__dict__.setdefault("_claims_cache", {})
+        base = cache.get(num_reqs)
+        if base is None:
+            base = cache[num_reqs] = self._claims(runner, num_reqs, 0)
+        c = dict(base)
+        if self.has_mamba:
+            c[("nacc",)] = (num_reqs, idx_ptr)
+        if self.has_rec_rows:
+            c[("rows", self.persist["record_rows"].data_ptr())] = (num_reqs, idx_ptr)
+        return c
+
+    def _claims(self, runner, num_reqs: int, idx_ptr: int) -> dict:
+        from vllm.v1.worker.gpu import input_batch as ib
+
+        bt = runner.block_tables
+        buf = runner.input_buffers
+        t = num_reqs * self.q
+        qsl = buf.query_start_loc.data_ptr()
+        seq = buf.seq_lens.data_ptr()
+        c: dict = {}
+        if self.has_mamba:
+            c[("nacc",)] = (num_reqs, idx_ptr)
+            c[("aligned",)] = (num_reqs, seq)
+            a = self.aligned
+            for b, gi in self.kda:
+                s = b.spec_state_indices_tensor
+                c[("stage", s.data_ptr())] = (
+                    num_reqs,
+                    num_reqs,
+                    a.data_ptr() + gi * a.stride(0) * a.element_size(),
+                    a.stride(1),
+                    a.stride(2),
+                    qsl,
+                    b.recoverssm_num_accepted_tokens.data_ptr(),
+                    b.spec_query_start_loc.data_ptr(),
+                    b.num_accepted_tokens.data_ptr(),
+                    s.shape[1],
+                )
+        c[("ncomp",)] = (num_reqs, seq, qsl)
+        if self.has_rec_rows:
+            rows = self.persist["record_rows"]
+            c[("rows", rows.data_ptr())] = (num_reqs, idx_ptr)
+        for ag, gid in self.kernel_tables:
+            src = bt.input_block_tables[gid]
+            nb = ag.kv_cache_spec.block_size // ag.kernel_block_size
+            c[("kbt", ag.kernel_block_table[0].data_ptr())] = (
+                src.data_ptr(),
+                num_reqs,
+                src.shape[1],
+                nb,
+                ag.kernel_block_stride or nb,
+            )
+        sm = self.persist["slot_mappings"]
+        for k, (b, gid, ag) in enumerate(self.indexers):
+            kt = ag.kernel_block_table
+            table = (
+                kt[0] if getattr(ag, "kernel_block_size", None) is not None
+                else bt.input_block_tables[gid]
+            )
+            cols = self.int_list[ib.NP1_N_IDX + 8 * k + 2]
+            if self.idx_slots:
+                c[("cslot", b.slot_mapping_buffer.data_ptr())] = (
+                    t,
+                    sm.data_ptr() + gid * sm.stride(0) * sm.element_size(),
+                    qsl,
+                    seq,
+                    table.data_ptr(),
+                    table.stride(0),
+                    b.kv_cache_spec.block_size,
+                    1,
+                    b.dcp_world_size,
+                    b.cp_kv_cache_interleave_size,
+                )
+            dsl = b.decode_seq_lens_buffer
+            c[("idxmd", dsl.data_ptr())] = (
+                qsl,
+                seq,
+                table.data_ptr(),
+                num_reqs,
+                t,
+                dsl.numel(),
+                table.stride(0),
+                b.expanded_block_table_buffer.stride(0),
+                cols,
+            )
+            if self.idx_dcp:
+                c[("dcploc", dsl.data_ptr())] = (
+                    t,
+                    b.global_decode_seq_lens_buffer.data_ptr(),
+                    b.dcp_world_size,
+                    b.dcp_rank,
+                    b.cp_kv_cache_interleave_size,
+                )
+        if self.has_rpt:
+            out = self.mla_first.req_id_per_token_buffer
+            c[("t2r", out.data_ptr())] = (qsl, num_reqs, t, t)
+        return c
+
+
+class _Np1Runner:
+    """The runner side of K31_NP1: mode, eligibility, the launch, the fast
+    InputBatch, and the comparison mode's bookkeeping."""
+
+    def __init__(self) -> None:
+        import os
+
+        self.env_mode = _np1_env_mode()
+        self.switch = os.environ.get("K31_NP1_SWITCH") or None
+        self.max_reqs = min(
+            max(_env_int("K31_NP1_MAX_REQS", 3), 1), 4
+        )
+        self.neg = os.environ.get("K31_NP1_CHECK_NEG", "0") not in ("", "0")
+        self.fast_launch = os.environ.get("K31_NP1_FAST_LAUNCH", "1") not in ("", "0")
+        self.mode = self.env_mode
+        self._switch_t = 0.0
+        self._switch_mtime = None
+        self.layout: _Np1Layout | None = None
+        self.layout_failed = False
+        self.stats = dict(
+            fast=0, checked=0, ineligible=0, problems=0, unseen=0,
+            mismatched_steps=0, neg=0, neg_caught=0,
+        )  # fmt: skip
+        self.mm_names: list[str] = []
+        self.mm_total = None
+        self.last_log = 0
+
+    def current_mode(self) -> str | None:
+        if self.env_mode is None:
+            return None
+        if self.switch is not None:
+            import os
+            import time
+
+            now = time.monotonic()
+            if now - self._switch_t > 0.2:
+                self._switch_t = now
+                try:
+                    st = os.stat(self.switch)
+                    if st.st_mtime_ns != self._switch_mtime:
+                        self._switch_mtime = st.st_mtime_ns
+                        with open(self.switch) as f:
+                            word = f.read().strip()
+                        if word in ("off", "on", "check"):
+                            if word != self.mode:
+                                self._maybe_log(force=True)
+                                logger.info("K31_NP1 mode: %s -> %s", self.mode, word)
+                            self.mode = word
+                except OSError:
+                    pass
+        return self.mode
+
+    def _eligible(self, runner, so, brs, bd, nreq: int, q: int) -> bool:
+        """A uniform speculative decode step of 1..max_reqs requests in a FULL
+        graph, without the features whose preparation the kernel does not do."""
+        if nreq < 1 or nreq > self.max_reqs:
+            return False
+        if brs.has_prefill or brs.num_draft_tokens_np is None:
+            return False
+        if bd.cg_mode != CUDAGraphMode.FULL or bd.num_ubatches != 1:
+            return False
+        t = nreq * q
+        if (bd.num_reqs or nreq) != nreq or bd.num_tokens != t or brs.num_tokens != t:
+            return False
+        if (
+            runner.pcp_manager is not None
+            or runner.use_pp
+            or runner.lora_config
+            or runner.adaptive_verification is not None
+            or runner.fast_prefill is not None
+            or runner.model_config.rswa_window is not None
+            or runner.model_state.num_new_sampled_tokens_per_step != 1
+            or not so.scheduled_spec_decode_tokens
+        ):
+            return False
+        if not (brs.num_scheduled_tokens == q).all():
+            return False
+        return bool((brs.num_draft_tokens_np == q - 1).all())
+
+    def _get_layout(self, runner, mode):
+        lay = self.layout
+        if lay is not None or self.layout_failed:
+            return lay
+        lay = _Np1Layout(runner)
+        if not lay.ok:
+            if lay.reason == "KDA builder not served" and self.stats["ineligible"] < 64:
+                return None  # builders not bound yet: retry on a later step
+            self.layout_failed = True
+            logger.warning("K31_NP1 stays off: %s", lay.reason)
+            return None
+        self.layout = lay
+        logger.info("K31_NP1 (%s): %s", mode, lay.describe())
+        return lay
+
+    def begin(self, runner, so, brs, bd):
+        """This step's plan (fast path or comparison), or None (stock path)."""
+        mode = self.current_mode()
+        if mode is None or mode == "off":
+            return None
+        q = runner.decode_query_len
+        nreq = len(brs.req_ids)
+        if not self._eligible(runner, so, brs, bd, nreq, q):
+            self.stats["ineligible"] += 1
+            return None
+        lay = self._get_layout(runner, mode)
+        if lay is None:
+            return None
+        shadow = mode == "check"
+        dev = runner.device
+        arena = torch.empty(lay.arena["len"], dtype=torch.int64, device=dev)
+        bt = runner.block_tables
+        num_rows = max(nreq, bt._num_dirty_rows)
+        out_tab, dst_ptrs, copies = lay.out_tab, bt.input_block_table_ptrs, None
+        if shadow:
+            # Run on copies of the outputs (their contents now: the stock path
+            # leaves untouched entries as they are, so must the kernel).
+            copies = {n: t.clone() for n, t in lay.persist.items()}
+            moved = {t.data_ptr(): copies[n].data_ptr() for n, t in lay.persist.items()}
+            out_list = [moved.get(p, p) if p else 0 for p in lay.out_list]
+            out_tab = torch.tensor(out_list, dtype=torch.int64, device=dev)
+            dst_ptrs = torch.tensor(
+                [copies[f"input_block_table_{g}"].data_ptr() for g in range(lay.ng)],
+                dtype=torch.uint64,
+                device=dev,
+            )
+        idx = [int(x) for x in brs.idx_mapping_np] + [-1] * (4 - nreq)
+        nb = bt.num_blocks.gpu
+        args = (
+            out_tab, lay.in_tab, lay.int_tab, arena, nb, nb.stride(0),
+            runner.req_states.prefill_len.gpu, bt.block_table_ptrs, dst_ptrs,
+            bt.block_table_strides, bt.block_sizes_tensor, bt.slot_mapping_enabled,
+            bt.dcp_sharded, nreq, num_rows, idx[0], idx[1], idx[2], idx[3],
+            runner.input_buffers.seq_lens.shape[0], bt.slot_mappings.shape[1],
+            runner.dcp_size, runner.dcp_rank, runner.cp_interleave,
+        )  # fmt: skip
+        grid = _np1_grid(lay, nreq, num_rows)
+        if lay.compiled is not None:
+            # The compiled kernel's own launcher: every argument keeps the
+            # specialization it was compiled for (16-byte aligned tensors,
+            # unspecialized integers).
+            lay.compiled[(grid[0], 1, 1)](*args, *lay.const_values)
+        else:
+            k = _np1_step_prep_kernel[grid](*args, **lay.consts)
+            if self.fast_launch and k is not None:
+                names = _np1_step_prep_kernel.arg_names[len(args) :]
+                lay.const_values = [lay.consts[n] for n in names]
+                lay.compiled = k
+        a = lay.arena
+        t = nreq * q
+        tensors = dict(
+            idx=arena[a["idx"] : a["idx"] + nreq],
+            cu=arena[a["cu"] :].view(torch.int32)[: nreq + 1],
+            eidx=arena[a["eidx"] : a["eidx"] + t],
+            logits=arena[a["logits"] : a["logits"] + t],
+            epos=arena[a["epos"] :].view(torch.int32)[:t],
+            nacc=arena[a["nacc"] :].view(torch.int32)[:nreq],
+            ncomp=arena[a["ncomp"] :].view(torch.int32)[:nreq],
+        )
+        if shadow:
+            plan = _Np1Plan({}, tensors, True)
+            plan.check = (copies, arena)
+            plan.input_batch = self._input_batch(runner, so, brs, bd, tensors)
+            if self.neg and (self.stats["checked"] + 1) % 100 == 0:
+                copies["positions"][0] += 1  # negative control: must be caught
+            return plan
+        bt._num_dirty_rows = nreq
+        plan = _Np1Plan(lay.claims(runner, nreq, tensors["idx"].data_ptr()), tensors, False)
+        plan.input_batch = self._input_batch(runner, so, brs, bd, tensors)
+        plan.block_tables = tuple(b[:nreq] for b in bt.input_block_tables)
+        plan.slot_mappings = bt.slot_mappings[:, :t]
+        self.stats["fast"] += 1
+        return plan
+
+    def _input_batch(self, runner, so, brs, bd, tensors) -> InputBatch:
+        """`GPUModelRunner.prepare_inputs` of an eligible step, with the device
+        tensors the kernel wrote."""
+        buf = runner.input_buffers
+        req_ids = brs.req_ids
+        nreq = len(req_ids)
+        num_tokens = brs.num_tokens
+        nsched = brs.num_scheduled_tokens
+        idx_np = brs.idx_mapping_np
+        ndraft = brs.num_draft_tokens_np
+        total_draft = int(ndraft.sum())
+        cu_np = np.empty(nreq + 1, dtype=np.int32)
+        cu_np[0] = 0
+        np.cumsum(ndraft + 1, out=cu_np[1:])
+        qsl_np = np.empty(runner.max_num_reqs + 1, dtype=np.int32)
+        qsl_np[0] = 0
+        np.cumsum(nsched, out=qsl_np[1 : nreq + 1])
+        qsl_np[nreq + 1 :] = num_tokens
+        nc_np = runner.req_states.num_computed_tokens_np[idx_np]
+        ub_np = np.zeros(nreq, dtype=np.int32)
+        np.add(nc_np, nsched, out=ub_np)
+        return InputBatch(
+            req_ids=req_ids,
+            num_reqs=nreq,
+            num_reqs_after_padding=nreq,
+            idx_mapping=tensors["idx"],
+            idx_mapping_np=idx_np,
+            expanded_idx_mapping=tensors["eidx"],
+            expanded_local_pos=tensors["epos"],
+            num_scheduled_tokens=nsched,
+            num_tokens=num_tokens,
+            num_tokens_after_padding=num_tokens,
+            num_draft_tokens=total_draft,
+            num_draft_tokens_per_req=ndraft,
+            num_admitted_draft_tokens=None,
+            query_start_loc=buf.query_start_loc[: nreq + 1],
+            query_start_loc_np=qsl_np[: nreq + 1],
+            seq_lens=buf.seq_lens[:nreq],
+            seq_lens_cpu_upper_bound=torch.from_numpy(ub_np),
+            dcp_local_seq_lens=None,
+            num_computed_tokens_np=nc_np,
+            prefill_len_np=brs.prefill_len_np,
+            num_computed_prefill_tokens_np=brs.num_computed_prefill_tokens_np,
+            is_prefilling_np=brs.is_prefilling_np,
+            has_prefill=brs.has_prefill,
+            prefill_runs_as_decode_np=brs.prefill_runs_as_decode_np,
+            decode_graph_eligible=brs.decode_graph_eligible,
+            max_seq_len_np=brs.max_seq_len_np,
+            input_ids=buf.input_ids[:num_tokens],
+            positions=buf.positions[:num_tokens],
+            is_padding=buf.is_padding[:num_tokens],
+            logits_indices=tensors["logits"],
+            cu_num_logits=tensors["cu"],
+            cu_num_logits_np=cu_np,
+            has_structured_output_reqs=so.has_structured_output_requests,
+            prompt_lens=None,
+            fast_prefill=None,
+            max_query_len=None,
+        )
+
+    def stock_inputs_ready(self, runner, plan, input_batch) -> None:
+        """Comparison mode: the claims as the stock call sites will pass them."""
+        lay = self.layout
+        plan.claims = lay.claims(runner, input_batch.num_reqs, input_batch.idx_mapping.data_ptr())
+
+    def finish(self, runner, plan, ib_s) -> None:
+        lay = self.layout
+        unseen = plan.unseen()
+        if plan.problems or unseen:
+            self.stats["problems"] += len(plan.problems)
+            self.stats["unseen"] += len(unseen)
+            if self.stats["problems"] + self.stats["unseen"] <= 20:
+                logger.warning(
+                    "K31_NP1 claim problems: %s unseen: %s", plan.problems[:4], unseen[:4]
+                )
+        if not plan.shadow:
+            self._maybe_log()
+            return
+        # Comparison: every output, bit for bit.
+        copies, arena = plan.check
+        mine = plan.input_batch
+        pairs: list = []
+        names: list = []
+        for n, real in lay.persist.items():
+            names.append(n)
+            pairs.append((copies[n], real))
+        tens = plan.tensors
+        for n, real in (
+            ("idx_mapping", ib_s.idx_mapping),
+            ("cu_num_logits", ib_s.cu_num_logits),
+            ("expanded_idx_mapping", ib_s.expanded_idx_mapping),
+            ("expanded_local_pos", ib_s.expanded_local_pos),
+            ("logits_indices", ib_s.logits_indices),
+        ):
+            names.append(n)
+            pairs.append((tens[{"idx_mapping": "idx", "cu_num_logits": "cu",
+                                "expanded_idx_mapping": "eidx",
+                                "expanded_local_pos": "epos",
+                                "logits_indices": "logits"}[n]], real))
+        for key, n in ((("nacc",), "nacc"), (("ncomp",), "ncomp")):
+            obs = plan.observed.get(key)
+            names.append(n)
+            pairs.append((tens[n], obs))
+        diffs = []
+        host_bad = 0
+        for (a, b) in pairs:
+            if b is None or a.shape != b.shape or a.dtype != b.dtype:
+                host_bad += 1
+                diffs.append(torch.ones((), dtype=torch.int64, device=a.device))
+            else:
+                diffs.append((a != b).sum())
+        # The host fields of the fast InputBatch.
+        for f in (
+            "num_reqs", "num_reqs_after_padding", "num_tokens",
+            "num_tokens_after_padding", "num_draft_tokens", "has_prefill",
+            "decode_graph_eligible", "max_query_len",
+        ):  # fmt: skip
+            if getattr(mine, f) != getattr(ib_s, f):
+                host_bad += 1
+        for f in (
+            "idx_mapping_np", "num_scheduled_tokens", "num_draft_tokens_per_req",
+            "query_start_loc_np", "num_computed_tokens_np", "prefill_len_np",
+            "num_computed_prefill_tokens_np", "is_prefilling_np", "cu_num_logits_np",
+        ):  # fmt: skip
+            x, y = getattr(mine, f), getattr(ib_s, f)
+            if x is None or y is None:
+                host_bad += int((x is None) != (y is None))
+            elif x.shape != y.shape or not np.array_equal(x, y):
+                host_bad += 1
+        if not torch.equal(mine.seq_lens_cpu_upper_bound, ib_s.seq_lens_cpu_upper_bound):
+            host_bad += 1
+        for f in ("query_start_loc", "seq_lens", "input_ids", "positions", "is_padding"):
+            x, y = getattr(mine, f), getattr(ib_s, f)
+            if x.data_ptr() != y.data_ptr() or x.shape != y.shape:
+                host_bad += 1
+        counts = torch.stack(diffs)
+        if self.mm_total is None or self.mm_names != names:
+            self.mm_names = names
+            self.mm_total = torch.zeros(len(names), dtype=torch.int64, device=counts.device)
+        self.mm_total += counts
+        self.stats["checked"] += 1
+        key = f"checked_r{mine.num_reqs}"
+        self.stats[key] = self.stats.get(key, 0) + 1
+        bad_claims = len(plan.problems) + len(unseen)
+        neg_step = self.neg and self.stats["checked"] % 100 == 0
+        per_name = counts.tolist()
+        step_bad = sum(per_name)
+        if neg_step:
+            self.stats["neg"] += 1
+            pos = per_name[names.index("positions")]
+            self.stats["neg_caught"] += int(pos > 0)
+            step_bad -= pos
+            self.mm_total[names.index("positions")] -= pos
+        if step_bad or host_bad or bad_claims:
+            self.stats["mismatched_steps"] += 1
+            if self.stats["mismatched_steps"] <= 20:
+                logger.warning(
+                    "K31_NP1 check: step mismatch: device %s host %d claims %d (%s)",
+                    {n: int(c) for n, c in zip(names, per_name) if c},
+                    host_bad, bad_claims, plan.problems[:2] + unseen[:2],
+                )
+        self._maybe_log()
+
+    def _maybe_log(self, force: bool = False) -> None:
+        n = self.stats["fast"] + self.stats["checked"]
+        if force or n in (1, 10, 100) or n - self.last_log >= 1000:
+            self.last_log = n
+            mm = ""
+            if self.mm_total is not None:
+                tot = self.mm_total.tolist()
+                mm = " mismatches %d %s" % (
+                    sum(tot), {k: v for k, v in zip(self.mm_names, tot) if v}
+                )
+            logger.info("K31_NP1 stats %s%s", self.stats, mm)
+
+
+def _np1_grid(lay: _Np1Layout, nreq: int, num_rows: int) -> tuple[int]:
+    c = lay.consts
+    return np1_grid(
+        lay.ng, c["NMG"], c["NKB"], lay.nib, lay.nkt, lay.nch, lay.nch_idx,
+        nreq, num_rows, lay.q, lay.kt_ch, lay.ebt_ch,
+    )  # fmt: skip
 
 
 class ExecuteModelState(NamedTuple):

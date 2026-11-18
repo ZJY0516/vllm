@@ -204,6 +204,22 @@ def get_compressed_slot_mapping(
     states must not be rewritten either.
     """
     if out is not None:
+        from vllm.v1.worker.gpu.input_batch import np1_claim
+
+        if np1_claim(
+            ("cslot", out.data_ptr()),
+            num_tokens,
+            slot_mapping.data_ptr(),
+            query_start_loc.data_ptr(),
+            seq_lens.data_ptr(),
+            block_table.data_ptr(),
+            block_table.stride(0),
+            block_size,
+            compress_ratio,
+            dcp_world_size,
+            cp_interleave,
+        ):
+            return out[:num_tokens]  # K31_NP1 wrote them.
         # Guard: for padded / invalid sequences.
         # Negative positions produce bogus block indices that lead to illegal memory
         # accesses inside the block_table load.

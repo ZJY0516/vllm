@@ -757,3 +757,622 @@ def expand_idx_mapping(
         BLOCK_SIZE=triton.next_power_of_2(max_expand_len),
     )
     return expanded_idx_mapping, expanded_local_pos
+
+
+# ---------------------------------------------------------------------------
+# K31_NP1: the next-step preparation of a uniform speculative decode step in
+# one launch.
+#
+# A decode step whose requests all verify `Q = 1 + num_spec` tokens prepares
+# its inputs and metadata with many small launches and host-to-device copies:
+# the runner (request slots, query starts, positions, sequence lengths, input
+# ids, logits indices, block tables, slot mappings, the Mamba align
+# preprocess, the DCP local lengths) and the attention metadata builders
+# (accepted-token gather, aligned state indices, staged KDA metadata, record
+# rows, kernel-block tables, indexer slot mapping and decode metadata,
+# token-request mapping). Every value is a function of the few host values of
+# the batch (request slots and token counts, passed as kernel arguments, so no
+# host-to-device copy) and of device state that no launch of that sequence
+# changes before reading it. `_np1_step_prep_kernel` writes all of them, with
+# the same formulas and the same write sets, in one launch.
+#
+# The metadata builders still run on the host (they build the Python
+# metadata); each launch site that this kernel already served is claimed
+# (`np1_claim`) and skipped, so any site the plan does not cover keeps its own
+# launch.
+# ---------------------------------------------------------------------------
+
+_NP1_PLAN = None
+
+
+def np1_current():
+    """The next-step preparation plan of this step, or None."""
+    return _NP1_PLAN
+
+
+def np1_set(plan) -> None:
+    global _NP1_PLAN
+    _NP1_PLAN = plan
+
+
+def np1_claim(key, *params) -> bool:
+    """True when this step's plan already wrote the outputs of launch site
+    `key` for exactly these parameters (the caller then skips its launch)."""
+    plan = _NP1_PLAN
+    if plan is None:
+        return False
+    return plan.claim(key, params)
+
+
+def np1_observe(key, tensor) -> None:
+    """Hand a stock output to this step's plan (comparison mode only)."""
+    plan = _NP1_PLAN
+    if plan is not None:
+        plan.observe(key, tensor)
+
+
+# Slots of the kernel's tables: `out_tab` / `in_tab` hold int64 data pointers,
+# `int_tab` integer parameters.
+NP1_O_IS_PADDING = 0  # bool [max_num_tokens]
+NP1_O_QSL = 1  # int32 [max_num_reqs + 1]
+NP1_O_POSITIONS = 2  # int64 [max_num_tokens]
+NP1_O_SEQ_LENS = 3  # int32 [max_num_reqs]
+NP1_O_INPUT_IDS = 4  # int32 [max_num_tokens]
+NP1_O_SIDX = 5  # int32 [max_num_reqs] Mamba running state column
+NP1_O_SRC_COL = 6  # int32 [max_num_reqs]
+NP1_O_SRC_OFF = 7  # int32 [max_num_reqs]
+NP1_O_NACC = 8  # int32 [max_num_reqs] Mamba accepted tokens
+NP1_O_DCP_LOCAL = 9  # int32 [max_num_reqs]
+NP1_O_ALIGNED = 10  # int32 [num_mamba_groups, max_num_reqs, slots]
+NP1_O_REC_ROWS = 11  # int32 [max_num_reqs]
+NP1_O_REQ_PER_TOKEN = 12  # int32 [max_num_batched_tokens]
+NP1_O_SLOTS = 13  # int64 [num_kv_cache_groups, max_num_batched_tokens]
+NP1_O_KDA = 16  # + 3k: staged state indices, staged query starts, staged accepted
+NP1_O_IDX = 32  # + 8k: seq lens, block table, lens, indices, per-request, global, slots
+NP1_O_KT = 48  # + m: kernel-block table of attention group m
+NP1_O_LEN = 56
+NP1_I_NC = 0  # int32 [max_num_reqs] num_computed_tokens
+NP1_I_LAST = 1  # int64 [max_num_reqs] last sampled token
+NP1_I_DRAFT = 2  # int64 [max_num_reqs, num_spec]
+NP1_I_SIDX = 3  # int32 Mamba running state column before the step
+NP1_I_NACC = 4  # int32 Mamba accepted tokens before the step
+NP1_I_KDA_NACC = 8  # + k: the accepted tokens a KDA builder stages
+NP1_I_LEN = 16
+NP1_N_DRAFT_STRIDE = 0
+NP1_N_ALIGNED_S0 = 1
+NP1_N_ALIGNED_S1 = 2
+NP1_N_ALIGNED_S2 = 3
+NP1_N_MAMBA_STRIDE = 4
+NP1_N_SLOT_STRIDE = 5
+NP1_N_MAMBA_GID = 8  # + i: kv cache group of Mamba group i
+NP1_N_KDA = 16  # + 4k: Mamba group index, staged stride 0, stride 1, slots
+NP1_N_IDX = 40  # + 8k: group, out stride, columns, capacity, B, alpha, kernel bs, slots cap
+NP1_N_KT = 64  # + 5m: group, B, alpha, out stride, kernel columns
+NP1_N_LEN = 88
+NP1_MAX_REQS = 4
+
+
+def np1_arena_layout(q: int) -> dict[str, int]:
+    """Word offsets (16-byte aligned) of the per-step outputs that the stock
+    path allocates, in one int64 arena."""
+    t = NP1_MAX_REQS * q
+    sizes = (
+        ("idx", NP1_MAX_REQS),  # int64 idx_mapping
+        ("cu", (NP1_MAX_REQS + 2) // 2),  # int32 cu_num_logits
+        ("eidx", t),  # int64 expanded_idx_mapping
+        ("logits", t),  # int64 logits_indices
+        ("epos", (t + 1) // 2),  # int32 expanded_local_pos
+        ("nacc", (NP1_MAX_REQS + 1) // 2),  # int32 gathered accepted tokens
+        ("ncomp", (NP1_MAX_REQS + 1) // 2),  # int32 num_computed_tokens
+    )
+    out, off = {}, 0
+    for name, n in sizes:
+        out[name] = off
+        off += (n + 1) // 2 * 2
+    out["len"] = off
+    return out
+
+
+@triton.jit
+def _np1_req(r, idx0, idx1, idx2, idx3):
+    return tl.where(r == 0, idx0, tl.where(r == 1, idx1, tl.where(r == 2, idx2, idx3)))
+
+
+@triton.jit
+def _np1_gathered(
+    flat, gid, stride, num_reqs, num_rows, max_rows, idx0, idx1, idx2, idx3,
+    src_ptrs, dst_ptrs, nb_ptr, nb_stride, mask,
+):  # fmt: skip
+    """The value `_gather_block_tables_kernel` leaves at flat offset `flat` of
+    kv cache group `gid`'s forward block table: a request row's block ids
+    below its block count, zero in the cleared padding rows, and elsewhere the
+    previous contents (which no launch of the step writes). The loads are
+    issued together (the selection follows)."""
+    row = flat // stride
+    col = flat % stride
+    real = row < num_reqs
+    req = _np1_req(row, idx0, idx1, idx2, idx3)
+    src = tl.load(src_ptrs + gid).to(tl.pointer_type(tl.int32))
+    dst = tl.load(dst_ptrs + gid).to(tl.pointer_type(tl.int32))
+    nb = tl.load(nb_ptr + gid * nb_stride + req, mask=mask & real, other=0)
+    v_src = tl.load(src + req.to(tl.int64) * stride + col, mask=mask & real, other=0)
+    v_old = tl.load(dst + flat, mask=mask & (row < max_rows), other=0)
+    from_src = real & (col < nb)
+    stale = (real & (col >= nb)) | (row >= num_rows)
+    return tl.where(from_src, v_src, tl.where(stale, v_old, 0))
+
+
+@triton.jit
+def _np1_kernel_table(
+    row, kcol, gid, B, alpha, num_reqs, num_rows, max_rows, idx0, idx1, idx2, idx3,
+    src_ptrs, dst_ptrs, bt_strides, nb_ptr, nb_stride, mask,
+):  # fmt: skip
+    """`AttentionGroup.map_to_kernel_block_table` of the forward block table:
+    kernel block j of block b is b * alpha + j (B kernel blocks per block)."""
+    stride = tl.load(bt_strides + gid)
+    v = _np1_gathered(
+        row.to(tl.int64) * stride + kcol // B, gid, stride, num_reqs, num_rows,
+        max_rows, idx0, idx1, idx2, idx3, src_ptrs, dst_ptrs, nb_ptr, nb_stride, mask,
+    )  # fmt: skip
+    return (kcol % B) + alpha * v
+
+
+@triton.jit
+def _np1_slot(
+    g, req, pos64, mask, src_bt_ptrs, bt_strides, bt_block_sizes, sm_enabled,
+    dcp_sharded, dcp_rank, CP_SIZE: tl.constexpr, CP_INTERLEAVE: tl.constexpr,
+    PAD_ID: tl.constexpr,
+):  # fmt: skip
+    """`_compute_slot_mappings_kernel` for tokens of kv cache group `g`."""
+    bt = tl.load(src_bt_ptrs + g).to(tl.pointer_type(tl.int32))
+    bstride = tl.load(bt_strides + g)
+    kv_bs = tl.load(bt_block_sizes + g)
+    enabled = tl.load(sm_enabled + g)
+    is_real = req >= 0
+    if CP_SIZE == 1:
+        local_pos = pos64
+        bidx = tl.where(enabled, local_pos // kv_bs, 0)
+        boff = local_pos % kv_bs
+        bnum = tl.load(bt + req * bstride + bidx, mask=mask & is_real, other=0)
+        sid = bnum * kv_bs + boff
+    else:
+        sharded = tl.load(dcp_sharded + g)
+        vbs = kv_bs * CP_SIZE
+        vbi = pos64 // vbs
+        vbo = pos64 % vbs
+        is_local = vbo // CP_INTERLEAVE % CP_SIZE == dcp_rank
+        rounds = vbo // (CP_INTERLEAVE * CP_SIZE)
+        remainder = vbo % CP_INTERLEAVE
+        local_off = rounds * CP_INTERLEAVE + remainder
+        local_pos = vbi * kv_bs + local_off
+        local_pos = tl.where(sharded, local_pos, pos64)
+        is_local = ~sharded | is_local
+        bidx = tl.where(enabled, local_pos // kv_bs, 0)
+        boff = local_pos % kv_bs
+        bnum = tl.load(
+            bt + req * bstride + bidx, mask=mask & is_local & is_real, other=0
+        )
+        sid = bnum * kv_bs + boff
+        sid = tl.where(is_local, sid, PAD_ID)
+    return tl.where(enabled & is_real, sid, PAD_ID)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "nb_stride", "num_reqs", "num_rows", "idx0", "idx1", "idx2", "idx3",
+        "max_num_reqs", "max_num_tokens", "dcp_size", "dcp_rank", "cp_interleave",
+    ]
+)  # fmt: skip
+def _np1_step_prep_kernel(
+    out_tab,
+    in_tab,
+    int_tab,
+    arena_ptr,
+    nb_ptr,
+    nb_stride,
+    prefill_len_ptr,
+    src_bt_ptrs,
+    dst_bt_ptrs,
+    bt_strides,
+    bt_block_sizes,
+    sm_enabled,
+    dcp_sharded,
+    num_reqs,
+    num_rows,
+    idx0,
+    idx1,
+    idx2,
+    idx3,
+    max_num_reqs,
+    max_num_tokens,
+    dcp_size,
+    dcp_rank,
+    cp_interleave,
+    Q: tl.constexpr,
+    BT: tl.constexpr,
+    BR: tl.constexpr,
+    NG: tl.constexpr,
+    NMG: tl.constexpr,
+    NSLOT: tl.constexpr,
+    NSLOT_P2: tl.constexpr,
+    MAMBA_BS: tl.constexpr,
+    ALIGN_BS: tl.constexpr,
+    NKB: tl.constexpr,
+    NIB: tl.constexpr,
+    NKT: tl.constexpr,
+    IDX_DCP: tl.constexpr,
+    IDX_SLOTS: tl.constexpr,
+    SKIP_PADDING: tl.constexpr,
+    HAS_MAMBA: tl.constexpr,
+    HAS_DCP: tl.constexpr,
+    HAS_REC_ROWS: tl.constexpr,
+    HAS_REQ_PER_TOKEN: tl.constexpr,
+    CP_SIZE: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
+    PAD_ID: tl.constexpr,
+    A_IDX: tl.constexpr,
+    A_CU: tl.constexpr,
+    A_EIDX: tl.constexpr,
+    A_LOGITS: tl.constexpr,
+    A_EPOS: tl.constexpr,
+    A_NACC: tl.constexpr,
+    A_NCOMP: tl.constexpr,
+    CHUNK: tl.constexpr,
+    NCH: tl.constexpr,
+    NCH_IDX: tl.constexpr,
+    KT_CH: tl.constexpr,
+    EBT_CH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Programs (each a short chain: its loads together, then its stores):
+    0 request values, 1 token values, 2 Mamba preprocess, then one per Mamba
+    group (aligned indices + the staging of its KDA builders), one per KDA
+    builder (staged query starts and accepted tokens), one per kv cache group
+    (slot mappings of the tokens), one per indexer builder (decode metadata,
+    and its re-derived slot mapping), then the bulk copies and fills."""
+    pid = tl.program_id(0)
+    num_tokens = num_reqs * Q
+    P_MAMBA: tl.constexpr = 2
+    P_ALIGN: tl.constexpr = 3
+    P_KDAQ: tl.constexpr = P_ALIGN + NMG
+    P_SLOT: tl.constexpr = P_KDAQ + NKB
+    P_IDX: tl.constexpr = P_SLOT + NG
+    P_BULK: tl.constexpr = P_IDX + NIB
+    if pid == 0:
+        # request values: idx_mapping, cu_num_logits, query_start_loc and
+        # sequence lengths (whole buffers), DCP local lengths, the metadata's
+        # num_computed_tokens, record rows
+        nc_ptr = tl.load(in_tab + 0).to(tl.pointer_type(tl.int32))
+        qsl = tl.load(out_tab + 1).to(tl.pointer_type(tl.int32))
+        seq_lens = tl.load(out_tab + 3).to(tl.pointer_type(tl.int32))
+        rr = tl.arange(0, BR)
+        rmask = rr < num_reqs
+        req_r = _np1_req(rr, idx0, idx1, idx2, idx3)
+        nc_r = tl.load(nc_ptr + req_r, mask=rmask, other=0)
+        tl.store(arena_ptr + A_IDX + rr, req_r.to(tl.int64), mask=rmask)
+        cu = (arena_ptr + A_CU).to(tl.pointer_type(tl.int32))
+        tl.store(cu + rr, rr * Q, mask=rr <= num_reqs)
+        ncomp = (arena_ptr + A_NCOMP).to(tl.pointer_type(tl.int32))
+        tl.store(ncomp + rr, (nc_r + Q) - Q, mask=rmask)
+        if HAS_REC_ROWS:
+            rec_rows = tl.load(out_tab + 11).to(tl.pointer_type(tl.int32))
+            tl.store(rec_rows + rr, req_r.to(tl.int32), mask=rmask)
+        for i0 in tl.range(0, max_num_reqs + 1, BLOCK):
+            o = i0 + tl.arange(0, BLOCK)
+            tl.store(qsl + o, tl.minimum(o, num_reqs) * Q, mask=o < max_num_reqs + 1)
+        for i1 in tl.range(0, max_num_reqs, BLOCK):
+            o1 = i1 + tl.arange(0, BLOCK)
+            ov = tl.load(
+                nc_ptr + _np1_req(o1, idx0, idx1, idx2, idx3), mask=o1 < num_reqs, other=0
+            )
+            tl.store(
+                seq_lens + o1, tl.where(o1 < num_reqs, ov + Q, 0), mask=o1 < max_num_reqs
+            )
+            if HAS_DCP:
+                dcp_out = tl.load(out_tab + 9).to(tl.pointer_type(tl.int32))
+                sv = ov + Q
+                rounds = sv // (dcp_size * cp_interleave)
+                rem = sv % (dcp_size * cp_interleave)
+                rem = tl.maximum(rem - dcp_rank * cp_interleave, 0)
+                rem = tl.minimum(rem, cp_interleave)
+                loc = rounds * cp_interleave + rem
+                tl.store(
+                    dcp_out + o1, tl.where(o1 < num_reqs, loc, 0), mask=o1 < max_num_reqs
+                )
+    elif pid == 1:
+        # token values: positions, padding flags, expanded indices, logits
+        # indices, input ids (last sampled token, then the drafts), token ->
+        # request
+        nc_ptr = tl.load(in_tab + 0).to(tl.pointer_type(tl.int32))
+        last = tl.load(in_tab + 1).to(tl.pointer_type(tl.int64))
+        draft = tl.load(in_tab + 2).to(tl.pointer_type(tl.int64))
+        d_stride = tl.load(int_tab + 0)
+        positions = tl.load(out_tab + 2).to(tl.pointer_type(tl.int64))
+        input_ids = tl.load(out_tab + 4).to(tl.pointer_type(tl.int32))
+        t = tl.arange(0, BT)
+        tmask = t < num_tokens
+        r = t // Q
+        j = t % Q
+        req = _np1_req(r, idx0, idx1, idx2, idx3)
+        nc = tl.load(nc_ptr + req, mask=tmask, other=0)
+        plen = tl.load(prefill_len_ptr + req, mask=tmask, other=0)
+        lv = tl.load(last + req, mask=tmask & (j == 0), other=0)
+        dv = tl.load(
+            draft + req.to(tl.int64) * d_stride + (j - 1), mask=tmask & (j > 0), other=0
+        )
+        tl.store(positions + t, nc + j, mask=tmask)
+        if SKIP_PADDING:
+            is_padding = tl.load(out_tab + 0).to(tl.pointer_type(tl.int8))
+            tl.store(is_padding + t, tl.zeros([BT], dtype=tl.int8), mask=tmask)
+        tl.store(arena_ptr + A_EIDX + t, req.to(tl.int64), mask=tmask)
+        epos = (arena_ptr + A_EPOS).to(tl.pointer_type(tl.int32))
+        tl.store(epos + t, j, mask=tmask)
+        tl.store(arena_ptr + A_LOGITS + t, (r * Q + j).to(tl.int64), mask=tmask)
+        gen = tmask & (nc + Q > plen)
+        tl.store(input_ids + t, lv, mask=gen & (j == 0) & (nc >= plen))
+        tl.store(input_ids + t, dv, mask=gen & (j > 0))
+        if HAS_REQ_PER_TOKEN:
+            rpt = tl.load(out_tab + 12).to(tl.pointer_type(tl.int32))
+            tl.store(rpt + t, r, mask=tmask)
+    elif pid < P_ALIGN:
+        if HAS_MAMBA:
+            # Mamba align preprocess, then the accepted-token gather
+            nc_ptr = tl.load(in_tab + 0).to(tl.pointer_type(tl.int32))
+            sidx_in = tl.load(in_tab + 3).to(tl.pointer_type(tl.int32))
+            nacc_in = tl.load(in_tab + 4).to(tl.pointer_type(tl.int32))
+            sidx_out = tl.load(out_tab + 5).to(tl.pointer_type(tl.int32))
+            src_col = tl.load(out_tab + 6).to(tl.pointer_type(tl.int32))
+            src_off = tl.load(out_tab + 7).to(tl.pointer_type(tl.int32))
+            nacc_out = tl.load(out_tab + 8).to(tl.pointer_type(tl.int32))
+            rr = tl.arange(0, BR)
+            rmask = rr < num_reqs
+            req_r = _np1_req(rr, idx0, idx1, idx2, idx3)
+            mmask = rmask & (req_r >= 0)
+            nc_r = tl.load(nc_ptr + req_r, mask=rmask, other=0)
+            old = tl.load(sidx_in + req_r, mask=mmask, other=-1)
+            na = tl.load(nacc_in + req_r, mask=mmask, other=1)
+            tl.store(src_col + req_r, old, mask=mmask)
+            tl.store(src_off + req_r, tl.maximum(na - 1, 0), mask=mmask)
+            new = (nc_r + Q + MAMBA_BS - 1) // MAMBA_BS - 1
+            tl.store(sidx_out + req_r, new, mask=mmask)
+            reset = (old >= 0) & (old != new)
+            tl.store(nacc_out + req_r, tl.full([BR], 1, tl.int32), mask=mmask & reset)
+            gathered = (arena_ptr + A_NACC).to(tl.pointer_type(tl.int32))
+            tl.store(gathered + rr, tl.where(reset, 1, na), mask=rmask)
+    elif pid < P_KDAQ:
+        # aligned state indices of Mamba group gi (from where the forward block
+        # tables of this launch take them), staged by its KDA builders
+        gi = pid - P_ALIGN
+        nc_ptr = tl.load(in_tab + 0).to(tl.pointer_type(tl.int32))
+        aligned = tl.load(out_tab + 10).to(tl.pointer_type(tl.int32))
+        a_s0 = tl.load(int_tab + 1)
+        a_s1 = tl.load(int_tab + 2)
+        a_s2 = tl.load(int_tab + 3)
+        mstride = tl.load(int_tab + 4)
+        gid = tl.load(int_tab + 8 + gi)
+        rr = tl.arange(0, BR)
+        rmask = rr < num_reqs
+        req_r = _np1_req(rr, idx0, idx1, idx2, idx3)
+        nc_r = tl.load(nc_ptr + req_r, mask=rmask, other=0)
+        ss = tl.arange(0, NSLOT_P2)
+        first = tl.maximum((nc_r + Q - 1) // ALIGN_BS, 0)
+        amask = rmask[:, None] & (ss[None, :] < NSLOT)
+        flat = rr[:, None].to(tl.int64) * mstride + first[:, None] + ss[None, :]
+        v = _np1_gathered(
+            flat, gid, mstride, num_reqs, num_rows, max_num_reqs, idx0, idx1, idx2,
+            idx3, src_bt_ptrs, dst_bt_ptrs, nb_ptr, nb_stride, amask,
+        )  # fmt: skip
+        tl.store(
+            aligned + gi * a_s0 + rr[:, None] * a_s1 + ss[None, :] * a_s2, v, mask=amask
+        )
+        for kk in tl.static_range(NKB):
+            kg = tl.load(int_tab + 16 + 4 * kk)
+            st_s0 = tl.load(int_tab + 17 + 4 * kk)
+            st_s1 = tl.load(int_tab + 18 + 4 * kk)
+            st_n = tl.load(int_tab + 19 + 4 * kk)
+            staged = tl.load(out_tab + 16 + 3 * kk).to(tl.pointer_type(tl.int32))
+            smask = amask & (kg == gi) & (ss[None, :] < st_n)
+            tl.store(staged + rr[:, None] * st_s0 + ss[None, :] * st_s1, v, mask=smask)
+    elif pid < P_SLOT:
+        # KDA builder k: staged query starts and accepted tokens
+        k = pid - P_KDAQ
+        sq = tl.load(out_tab + 17 + 3 * k).to(tl.pointer_type(tl.int32))
+        sa = tl.load(out_tab + 18 + 3 * k).to(tl.pointer_type(tl.int32))
+        src_a = tl.load(in_tab + 8 + k).to(tl.pointer_type(tl.int32))
+        rr = tl.arange(0, BR)
+        rmask = rr < num_reqs
+        av = tl.load(src_a + rr, mask=rmask, other=1)
+        tl.store(sq + rr, tl.minimum(rr, num_reqs) * Q, mask=rr <= num_reqs)
+        tl.store(sa + rr, av, mask=rmask)
+    elif pid < P_IDX:
+        # slot mappings of the step's tokens, kv cache group g
+        g = pid - P_SLOT
+        nc_ptr = tl.load(in_tab + 0).to(tl.pointer_type(tl.int32))
+        slots = tl.load(out_tab + 13).to(tl.pointer_type(tl.int64))
+        slot_stride = tl.load(int_tab + 5)
+        t = tl.arange(0, BT)
+        tmask = t < num_tokens
+        r = t // Q
+        j = t % Q
+        req = _np1_req(r, idx0, idx1, idx2, idx3)
+        nc = tl.load(nc_ptr + req, mask=tmask, other=0)
+        pos64 = (nc + j).to(tl.int64)
+        sid = _np1_slot(
+            g, req, pos64, tmask, src_bt_ptrs, bt_strides, bt_block_sizes,
+            sm_enabled, dcp_sharded, dcp_rank, CP_SIZE, CP_INTERLEAVE, PAD_ID,
+        )  # fmt: skip
+        tl.store(slots + g * slot_stride + t, sid, mask=tmask)
+    elif pid < P_BULK:
+        # indexer builder k: decode metadata (per-token bounds, lengths, request
+        # indices) and the slot mapping its builder re-derives from its block
+        # table
+        k = pid - P_IDX
+        nc_ptr = tl.load(in_tab + 0).to(tl.pointer_type(tl.int32))
+        dsl = tl.load(out_tab + 32 + 8 * k).to(tl.pointer_type(tl.int32))
+        dlen = tl.load(out_tab + 34 + 8 * k).to(tl.pointer_type(tl.int32))
+        dind = tl.load(out_tab + 35 + 8 * k).to(tl.pointer_type(tl.int32))
+        preq = tl.load(out_tab + 36 + 8 * k).to(tl.pointer_type(tl.int32))
+        t = tl.arange(0, BT)
+        tmask = t < num_tokens
+        r = t // Q
+        j = t % Q
+        req = _np1_req(r, idx0, idx1, idx2, idx3)
+        nc = tl.load(nc_ptr + req, mask=tmask, other=0)
+        seq = nc + Q
+        length = seq - Q + j + 1
+        if IDX_DCP:
+            glob = tl.load(out_tab + 37 + 8 * k).to(tl.pointer_type(tl.int32))
+            tl.store(glob + t, length, mask=tmask)
+            base = length // cp_interleave // dcp_size * cp_interleave
+            rem2 = length - base * dcp_size
+            rem2 = tl.minimum(tl.maximum(rem2 - dcp_rank * cp_interleave, 0), cp_interleave)
+            length = base + rem2
+        tl.store(dsl + t, length, mask=tmask)
+        tl.store(dlen + t, tl.full([BT], 1, tl.int32), mask=tmask)
+        tl.store(dind + t, r, mask=tmask)
+        rr = tl.arange(0, BR)
+        tl.store(preq + rr, tl.full([BR], Q, tl.int32), mask=rr < num_reqs)
+        if IDX_SLOTS:
+            gid = tl.load(int_tab + 40 + 8 * k)
+            kb = tl.load(int_tab + 44 + 8 * k)
+            ka = tl.load(int_tab + 45 + 8 * k)
+            kbs = tl.load(int_tab + 46 + 8 * k)
+            islots = tl.load(out_tab + 38 + 8 * k).to(tl.pointer_type(tl.int64))
+            pos64 = (nc + j).to(tl.int64)
+            own = _np1_slot(
+                gid, req, pos64, tmask, src_bt_ptrs, bt_strides, bt_block_sizes,
+                sm_enabled, dcp_sharded, dcp_rank, CP_SIZE, CP_INTERLEAVE, PAD_ID,
+            )  # fmt: skip
+            cpos = seq - Q + j
+            lpos = cpos // (cp_interleave * dcp_size) * cp_interleave + (
+                cpos % cp_interleave
+            )
+            bn = _np1_kernel_table(
+                r, lpos // kbs, gid, kb, ka, num_reqs, num_rows, max_num_reqs, idx0,
+                idx1, idx2, idx3, src_bt_ptrs, dst_bt_ptrs, bt_strides, nb_ptr,
+                nb_stride, tmask,
+            )  # fmt: skip
+            valid = own != PAD_ID
+            sv2 = bn.to(tl.int64) * kbs + (lpos % kbs)
+            tl.store(islots + t, tl.where(valid, sv2, PAD_ID), mask=tmask)
+    else:
+        q0 = pid - P_BULK
+        n_bt = NG * num_rows
+        q1 = q0 - n_bt
+        q2 = q1 - NG * NCH
+        n_kt = NKT * num_reqs * KT_CH
+        q3 = q2 - n_kt
+        n_rows = NIB * num_tokens * EBT_CH
+        q4 = q3 - n_rows
+        if q0 < n_bt:
+            # forward block tables: copy the request rows, clear the others
+            g_b1 = q0 // num_rows
+            row_b1 = q0 % num_rows
+            stride_b1 = tl.load(bt_strides + g_b1)
+            dst_b1 = tl.load(dst_bt_ptrs + g_b1).to(tl.pointer_type(tl.int32))
+            dst_row_b1 = dst_b1 + row_b1 * stride_b1
+            if row_b1 >= num_reqs:
+                for iz_b1 in tl.range(0, stride_b1, BLOCK):
+                    oz_b1 = iz_b1 + tl.arange(0, BLOCK)
+                    tl.store(
+                        dst_row_b1 + oz_b1,
+                        tl.zeros([BLOCK], tl.int32),
+                        mask=oz_b1 < stride_b1,
+                    )
+            else:
+                req_b1 = _np1_req(row_b1, idx0, idx1, idx2, idx3)
+                src_b1 = tl.load(src_bt_ptrs + g_b1).to(tl.pointer_type(tl.int32))
+                nb_b1 = tl.load(nb_ptr + g_b1 * nb_stride + req_b1)
+                src_row_b1 = src_b1 + req_b1 * stride_b1
+                for i1_b1 in tl.range(0, nb_b1, BLOCK):
+                    o1_b1 = i1_b1 + tl.arange(0, BLOCK)
+                    v1_b1 = tl.load(src_row_b1 + o1_b1, mask=o1_b1 < nb_b1, other=0)
+                    tl.store(dst_row_b1 + o1_b1, v1_b1, mask=o1_b1 < nb_b1)
+        elif q1 < NG * NCH:
+            # slot mappings: PAD from the step's token count to the end
+            g_b2 = q1 // NCH
+            c_b2 = q1 % NCH
+            slots_b2 = tl.load(out_tab + 13).to(tl.pointer_type(tl.int64))
+            slot_stride_b2 = tl.load(int_tab + 5)
+            lo_b2 = tl.maximum(c_b2 * CHUNK, num_tokens)
+            hi_b2 = tl.minimum((c_b2 + 1) * CHUNK, max_num_tokens)
+            for i2_b2 in tl.range(lo_b2, hi_b2, BLOCK):
+                o2_b2 = i2_b2 + tl.arange(0, BLOCK)
+                tl.store(
+                    slots_b2 + g_b2 * slot_stride_b2 + o2_b2,
+                    tl.full([BLOCK], PAD_ID, tl.int64),
+                    mask=o2_b2 < hi_b2,
+                )
+        elif q2 < n_kt:
+            # kernel-block tables of the request rows, BLOCK columns per program
+            c_b3 = q2 % KT_CH
+            m_b3 = q2 // KT_CH // num_reqs
+            row_b3 = q2 // KT_CH % num_reqs
+            gid_b3 = tl.load(int_tab + 64 + 5 * m_b3)
+            kb_b3 = tl.load(int_tab + 65 + 5 * m_b3)
+            ka_b3 = tl.load(int_tab + 66 + 5 * m_b3)
+            ostride_b3 = tl.load(int_tab + 67 + 5 * m_b3)
+            kcols_b3 = tl.load(int_tab + 68 + 5 * m_b3)
+            kt_b3 = tl.load(out_tab + 48 + m_b3).to(tl.pointer_type(tl.int32))
+            o3_b3 = c_b3 * BLOCK + tl.arange(0, BLOCK)
+            mk_b3 = o3_b3 < kcols_b3
+            v3_b3 = _np1_kernel_table(
+                row_b3, o3_b3, gid_b3, kb_b3, ka_b3, num_reqs, num_rows,
+                max_num_reqs, idx0, idx1, idx2, idx3, src_bt_ptrs, dst_bt_ptrs,
+                bt_strides, nb_ptr, nb_stride, mk_b3,
+            )  # fmt: skip
+            tl.store(kt_b3 + row_b3.to(tl.int64) * ostride_b3 + o3_b3, v3_b3, mask=mk_b3)
+        elif q3 < n_rows:
+            # indexer: each token's copy of its request's (kernel) block-table
+            # row, BLOCK columns per program
+            c_b4 = q3 % EBT_CH
+            k_b4 = q3 // EBT_CH // num_tokens
+            tok_b4 = q3 // EBT_CH % num_tokens
+            row_b4 = tok_b4 // Q
+            gid_b4 = tl.load(int_tab + 40 + 8 * k_b4)
+            ostride_b4 = tl.load(int_tab + 41 + 8 * k_b4)
+            cols_b4 = tl.load(int_tab + 42 + 8 * k_b4)
+            kb_b4 = tl.load(int_tab + 44 + 8 * k_b4)
+            ka_b4 = tl.load(int_tab + 45 + 8 * k_b4)
+            ebt_b4 = tl.load(out_tab + 33 + 8 * k_b4).to(tl.pointer_type(tl.int32))
+            o4_b4 = c_b4 * BLOCK + tl.arange(0, BLOCK)
+            mk_b4 = o4_b4 < cols_b4
+            v4_b4 = _np1_kernel_table(
+                row_b4, o4_b4, gid_b4, kb_b4, ka_b4, num_reqs, num_rows,
+                max_num_reqs, idx0, idx1, idx2, idx3, src_bt_ptrs, dst_bt_ptrs,
+                bt_strides, nb_ptr, nb_stride, mk_b4,
+            )  # fmt: skip
+            tl.store(ebt_b4 + tok_b4.to(tl.int64) * ostride_b4 + o4_b4, v4_b4, mask=mk_b4)
+        elif q4 < NIB * NCH_IDX:
+            # indexer: zero the per-token bounds past the step's tokens, and
+            # PAD its slot mapping there
+            k_b5 = q4 // NCH_IDX
+            c_b5 = q4 % NCH_IDX
+            cap_b5 = tl.load(int_tab + 43 + 8 * k_b5)
+            dsl_b5 = tl.load(out_tab + 32 + 8 * k_b5).to(tl.pointer_type(tl.int32))
+            lo_b5 = tl.maximum(c_b5 * CHUNK, num_tokens)
+            hi_b5 = tl.minimum((c_b5 + 1) * CHUNK, cap_b5)
+            for i5_b5 in tl.range(lo_b5, hi_b5, BLOCK):
+                o5_b5 = i5_b5 + tl.arange(0, BLOCK)
+                tl.store(dsl_b5 + o5_b5, tl.zeros([BLOCK], tl.int32), mask=o5_b5 < hi_b5)
+            if IDX_SLOTS:
+                scap_b5 = tl.load(int_tab + 47 + 8 * k_b5)
+                islots_b5 = tl.load(out_tab + 38 + 8 * k_b5).to(tl.pointer_type(tl.int64))
+                hi6_b5 = tl.minimum((c_b5 + 1) * CHUNK, scap_b5)
+                for i6_b5 in tl.range(lo_b5, hi6_b5, BLOCK):
+                    o6_b5 = i6_b5 + tl.arange(0, BLOCK)
+                    tl.store(
+                        islots_b5 + o6_b5, tl.full([BLOCK], -1, tl.int64), mask=o6_b5 < hi6_b5
+                    )
+
+
+def np1_grid(
+    ng: int, nmg: int, nkb: int, nib: int, nkt: int, nch: int, nch_idx: int,
+    num_reqs: int, num_rows: int, q: int, kt_ch: int, ebt_ch: int,
+) -> tuple[int]:  # fmt: skip
+    """The launch grid of `_np1_step_prep_kernel`."""
+    t = num_reqs * q
+    return (
+        3 + nmg + nkb + ng + nib + ng * num_rows + ng * nch
+        + nkt * num_reqs * kt_ch + nib * t * ebt_ch + nib * nch_idx,
+    )  # fmt: skip

@@ -23,6 +23,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_upd
 from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadataBuilder
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.gpu.input_batch import np1_claim
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -300,7 +301,8 @@ def _build_deferred(
             if spec_request_indices is not None:
                 slots = slots[spec_request_indices]
             live = min(num_spec_decodes, slots.shape[0])
-            rows[:live].copy_(slots[:live], non_blocking=True)
+            if not np1_claim(("rows", rows.data_ptr()), live, slots.data_ptr()):
+                rows[:live].copy_(slots[:live], non_blocking=True)
         rows[live : max(m.num_reqs, num_spec_decodes)].fill_(-1)
         if shared is not None:
             shared[1] = stage_key

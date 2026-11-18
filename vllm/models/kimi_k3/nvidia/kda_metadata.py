@@ -37,6 +37,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.gpu.input_batch import np1_claim
 
 if TYPE_CHECKING:
     from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
@@ -130,6 +131,20 @@ def stage_spec_decode_metadata(
     assert state_indices.is_cuda
     assert state_indices.ndim == 2
     batch_size, num_state_slots = staged_state_indices.shape
+    if np1_claim(
+        ("stage", staged_state_indices.data_ptr()),
+        num_spec_decodes,
+        batch_size,
+        state_indices.data_ptr(),
+        state_indices.stride(0),
+        state_indices.stride(1),
+        query_start_loc.data_ptr(),
+        num_accepted_tokens.data_ptr(),
+        staged_query_start_loc.data_ptr(),
+        staged_num_accepted_tokens.data_ptr(),
+        num_state_slots,
+    ):
+        return  # K31_NP1 staged them.
     BLOCK_ROWS = 32
     grid = (triton.cdiv(batch_size + 1, BLOCK_ROWS),)
     _stage_spec_decode_metadata_kernel[grid](

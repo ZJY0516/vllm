@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.gpu.input_batch import np1_current
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
 from vllm.v1.worker.utils import (
@@ -514,6 +515,14 @@ def build_attn_metadata(
     token_to_req_indices: torch.Tensor | None = None
     # The first group's num_computed_tokens, shared (K31_HP_NC).
     num_computed_tokens: torch.Tensor | None = None
+    # K31_NP1 wrote this step's num_computed_tokens (seq_lens - query_lens).
+    np1 = np1_current()
+    np1_ncomp = np1 is not None and np1.claim(
+        ("ncomp",),
+        (num_reqs, seq_lens.data_ptr(), query_start_loc_gpu.data_ptr()),
+    )
+    if np1_ncomp:
+        num_computed_tokens = np1.tensors["ncomp"]
     # Mamba groups with the same spec and builder differ only in their state
     # indices, so later groups re-gather those from the first group's metadata.
     # Also at capture, so FULL graphs share the batch-level buffers.
@@ -567,7 +576,7 @@ def build_attn_metadata(
             _token_to_req_indices_cache=token_to_req_indices,
             **common_attn_metadata_extra_kwargs,
         )
-        if _SHARE_NUM_COMPUTED and num_computed_tokens is not None:
+        if (_SHARE_NUM_COMPUTED or np1_ncomp) and num_computed_tokens is not None:
             common_attn_metadata._num_computed_tokens_cache = num_computed_tokens
 
         for attn_group in attn_groups[i]:
@@ -604,4 +613,10 @@ def build_attn_metadata(
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
         if _SHARE_NUM_COMPUTED:
             num_computed_tokens = common_attn_metadata._num_computed_tokens_cache
+        if (
+            np1 is not None
+            and not np1_ncomp
+            and common_attn_metadata._num_computed_tokens_cache is not None
+        ):
+            np1.observe(("ncomp",), common_attn_metadata._num_computed_tokens_cache)
     return attn_metadata

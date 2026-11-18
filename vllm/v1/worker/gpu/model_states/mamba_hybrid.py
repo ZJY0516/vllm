@@ -25,7 +25,7 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.input_batch import InputBatch, np1_current
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -246,6 +246,22 @@ class MambaHybridModelState(DefaultModelState):
             input_batch.idx_mapping,
         )
 
+    def np1_precopy(self, input_batch: InputBatch) -> None:
+        """`preprocess_state` after K31_NP1 ran its align preprocess: the
+        state pre-copy alone (ReplaySSM, which also resets slots here, keeps
+        the stock path)."""
+        if not self._align_mode or input_batch.num_reqs == 0:
+            return
+        ctx = self._mamba_ctx
+        assert ctx is not None and ctx.replayssm is None
+        ctx.run_fused_precopy(
+            input_batch.num_reqs,
+            self._mamba_state_idx_gpu,
+            self._mamba_src_col_gpu,
+            self._mamba_src_off_gpu,
+            input_batch.idx_mapping,
+        )
+
     def prepare_attn(
         self,
         input_batch: InputBatch,
@@ -291,11 +307,20 @@ class MambaHybridModelState(DefaultModelState):
         # compute them during actual (non-capture) forward execution.
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
+        np1 = np1_current()
         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
-            num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
-            num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
-                input_batch.idx_mapping
-            ]
+            if np1 is not None and np1.claim(
+                ("nacc",), (num_reqs, input_batch.idx_mapping.data_ptr())
+            ):
+                # K31_NP1 wrote the gathered accepted-token counts.
+                num_accepted_tokens = np1.tensors["nacc"]
+            else:
+                num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
+                num_accepted_tokens[: input_batch.num_reqs] = (
+                    self.num_accepted_tokens_gpu[input_batch.idx_mapping]
+                )
+                if np1 is not None:
+                    np1.observe(("nacc",), num_accepted_tokens)
 
             # GDN uses >= 0 to select spec-decode rows, so non-decode rows
             # need the -1 sentinel. Decode rows without drafts stay spec rows:
@@ -330,9 +355,17 @@ class MambaHybridModelState(DefaultModelState):
                         aligned_index_builders.append((group_idx, builder))
             if aligned_index_builders:
                 assert self._mamba_ctx is not None
-                all_group_indices = self._mamba_ctx.compute_aligned_state_indices(
-                    input_batch.seq_lens, num_reqs
-                )
+                if np1 is not None and np1.claim(
+                    ("aligned",), (num_reqs, input_batch.seq_lens.data_ptr())
+                ):
+                    # K31_NP1 wrote them where this launch writes them.
+                    all_group_indices = self._mamba_ctx.aligned_state_indices[
+                        :, :num_reqs
+                    ]
+                else:
+                    all_group_indices = self._mamba_ctx.compute_aligned_state_indices(
+                        input_batch.seq_lens, num_reqs
+                    )
                 for group_idx, builder in aligned_index_builders:
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
 
