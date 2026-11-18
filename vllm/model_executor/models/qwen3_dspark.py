@@ -15,6 +15,8 @@ DFlash Qwen3 draft (see qwen3_dflash.py). DSpark adds:
 DSparkMarkovHead and DSparkConfidenceHead are shared with the DSV4-style DSpark model.
 """
 
+import os
+import types
 from collections.abc import Iterable
 
 import torch
@@ -229,6 +231,18 @@ class Qwen3DSparkModel(DFlashQwen3Model):
                 bias=True,
                 with_markov=with_markov,
             )
+        self._s31_ar_key: int | None = None
+        _s31_backbone_init(self)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self._s31_ar_key is None:
+            return super().forward(input_ids, positions, input_embeds)
+        return _s31_forward(self, input_ids, positions, input_embeds)
 
 
 class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
@@ -271,6 +285,11 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
             )
         else:
             self.draft_id_to_target_id = None
+        _s31_init(self, prefix)
+
+    def process_weights_after_loading(self) -> None:
+        super().process_weights_after_loading()
+        _s31_after_loading(self)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
@@ -357,3 +376,301 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
         mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
         loader = AutoWeightsLoader(self)
         loader.load_weights(model_weights.items(), mapper=mapper)
+
+
+# --------------------------------------------------------------------------------
+# Decode fast paths of the DSpark draft (env-gated, default off; TP > 1 only).
+#  K31_S31FC=1: the context projection `fc` is column-parallel with its output
+#      gathered (each rank streams 1/TP of the weight: the same dot products over
+#      the full input width per output column), on the drafter mailbox gather when
+#      available, the TP all-gather otherwise.
+#  K31_S31MK=1: the sequential Markov sampling runs as the vocabulary-sharded fused
+#      launches of `specialized_decode.drafter.markov` (the lm_head shard's logits,
+#      the per-step bias + Gumbel select over each rank's vocabulary range, one
+#      exchange of the per-rank maxima per step, one gather of the final logits);
+#      steps it does not serve keep the loop of the speculator.
+# Both need the drafter collectives (`specialized_decode.drafter.comm`), built at
+# load on every TP rank in the same order.
+# --------------------------------------------------------------------------------
+
+
+def _s31_on(name: str) -> bool:
+    return os.environ.get(name, "0") not in ("", "0")
+
+
+def _s31_init(model: "Qwen3DSparkForCausalLM", prefix: str) -> None:
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    tp = get_tensor_model_parallel_world_size()
+    model._s31_fc = False
+    model._s31_mk = _s31_on("K31_S31MK") and tp > 1
+    backbone = model.model
+    fc = getattr(backbone, "fc", None) if backbone.use_aux_hidden_state else None
+    if (
+        _s31_on("K31_S31FC")
+        and tp > 1
+        and fc is not None
+        and backbone.quant_config is None
+        and fc.output_size % tp == 0
+    ):
+        from vllm.models.kimi_k3.nvidia.specialized_decode.drafter.model import (
+            _gathered_linear,
+        )
+
+        gathered = _gathered_linear()(
+            fc.input_size,
+            fc.output_size,
+            bias=False,
+            gather_output=False,
+            return_bias=False,
+            params_dtype=fc.params_dtype,
+            quant_config=None,
+            prefix=maybe_prefix(maybe_prefix(prefix, "model"), "fc"),
+        )
+        del backbone.fc
+        backbone.fc = gathered
+        model._s31_fc = True
+    if model._s31_mk:
+        model.sample_sequential = types.MethodType(_s31_sample_sequential, model)
+    if model._s31_fc or model._s31_mk or backbone._s31_dg or (
+        backbone._s31_ar_key is not None
+    ):
+        logger.info(
+            "sol31 DSpark draft fast paths: fc column-parallel %s, fused Markov %s, "
+            "DraftGemm %s, ArNorm %s (TP %d)",
+            model._s31_fc,
+            model._s31_mk,
+            backbone._s31_dg,
+            backbone._s31_ar_key is not None,
+            tp,
+        )
+
+
+def _s31_after_loading(model: "Qwen3DSparkForCausalLM") -> None:
+    if getattr(model, "_s31_loaded", False):
+        return
+    model._s31_loaded = True
+    backbone = model.model
+    if getattr(backbone, "_s31_dg", False):
+        count = _s31_install_gemms(backbone)
+        logger.info("sol31 DSpark draft linears on DraftGemm: %d", count)
+    ar_key = getattr(backbone, "_s31_ar_key", None)
+    if not (
+        getattr(model, "_s31_fc", False)
+        or getattr(model, "_s31_mk", False)
+        or ar_key is not None
+    ):
+        return
+    from vllm.distributed import get_tp_group
+    from vllm.models.kimi_k3.nvidia.specialized_decode.drafter import (
+        comm as comm_module,
+    )
+
+    comm = comm_module.build(model, get_tp_group())
+    model._drafter_comm = comm
+    if model._s31_fc and comm is not None:
+        backbone.fc.comm = comm
+    if ar_key is not None:
+        _S31_AR[ar_key]["comm"] = comm
+    logger.info(
+        "sol31 DSpark draft collectives: %s (fc %s, fused Markov %s, ArNorm %s)",
+        "mailbox" if comm is not None else "stock",
+        model._s31_fc,
+        model._s31_mk,
+        ar_key is not None,
+    )
+
+
+def _s31_sample_sequential(self, speculator, num_reqs, head_hidden) -> bool:
+    """The speculator asks the model for its own Markov sampling first; False
+    (nothing done) keeps the speculator's loop."""
+    from vllm.models.kimi_k3.nvidia.specialized_decode.drafter.markov import (
+        sample_sequential as fused,
+    )
+
+    return fused(speculator, self, num_reqs, head_hidden)
+
+
+# K31_S31DG=1: the draft layers' BF16 linears (qkv, o, gate_up, down) run on the
+#      drafter decode GEMM (`specialized_decode.drafter.linears.DraftGemm`: warp
+#      split-K up to 32 rows, FP32 accumulation, one BF16 rounding; cuBLAS above),
+#      called through the custom op `vllm.s31_draft_gemm` so the compiled draft
+#      forward keeps it as one opaque call.
+# K31_S31AR=1 (1 < TP <= K31_S31AR_MAXTP, default 8): each all-reduce of the draft layers (o_proj, down_proj)
+#      runs fused with the RMSNorm that follows it on the drafter mailbox ArNorm
+#      (`specialized_decode.drafter.comm.DrafterComm.ar_norm`, BF16 partials summed
+#      in FP32 in rank order, one rounding, then the residual add and the RMSNorm),
+#      through the custom op `vllm.s31_ar_norm`; rows it does not serve take the
+#      TP all-reduce and vLLM's fused add + RMSNorm.
+
+_S31_GEMMS: list = []
+_S31_AR: dict = {}
+_S31_OPS: set = set()
+
+
+def _s31_gemm_impl(x: torch.Tensor, key: int) -> torch.Tensor:
+    gemm = _S31_GEMMS[key]
+    out = torch.empty((x.shape[0], gemm.n), dtype=x.dtype, device=x.device)
+    gemm.run(x.contiguous(), out)
+    return out
+
+
+def _s31_gemm_fake(x: torch.Tensor, key: int) -> torch.Tensor:
+    return x.new_empty((x.shape[0], _S31_GEMMS[key].n))
+
+
+def _s31_ar_norm_impl(
+    x: torch.Tensor, residual: torch.Tensor, key: int, site: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    state = _S31_AR[key]
+    norm = state["norms"][site]
+    comm = state["comm"]
+    out = None
+    if comm is not None:
+        out = comm.ar_norm(x, residual, norm, site % 2)
+    if out is None:
+        from vllm import _custom_ops as ops
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        y = tensor_model_parallel_all_reduce(x.contiguous())
+        res = residual.clone()
+        ops.fused_add_rms_norm(y, res, norm.weight.data, norm.variance_epsilon)
+        out = (y, res)
+    return out
+
+
+def _s31_ar_norm_fake(
+    x: torch.Tensor, residual: torch.Tensor, key: int, site: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(x)
+
+
+def _s31_register_op(name: str) -> None:
+    if name in _S31_OPS:
+        return
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    if name == "s31_draft_gemm":
+        direct_register_custom_op(
+            "s31_draft_gemm", _s31_gemm_impl, mutates_args=[], fake_impl=_s31_gemm_fake
+        )
+    elif name == "s31_ar_norm":
+        direct_register_custom_op(
+            "s31_ar_norm",
+            _s31_ar_norm_impl,
+            mutates_args=[],
+            fake_impl=_s31_ar_norm_fake,
+        )
+    _S31_OPS.add(name)
+
+
+def _s31_backbone_init(backbone: "Qwen3DSparkModel") -> None:
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    tp = get_tensor_model_parallel_world_size()
+    backbone._s31_dg = _s31_on("K31_S31DG") and backbone.quant_config is None
+    if backbone._s31_dg:
+        _s31_register_op("s31_draft_gemm")
+    # ArNorm measured slower than the stock all-reduce + RMSNorm at 16 ranks (7 rows)
+    # and faster at 8 ranks (8-24 rows): served up to K31_S31AR_MAXTP ranks.
+    max_tp = int(os.environ.get("K31_S31AR_MAXTP", "8") or 8)
+    if not (_s31_on("K31_S31AR") and 1 < tp <= max_tp):
+        return
+    if any(
+        getattr(layer.self_attn.o_proj, "bias", None) is not None
+        or getattr(layer.mlp.down_proj, "bias", None) is not None
+        for layer in backbone.layers
+    ):
+        return
+    _s31_register_op("s31_ar_norm")
+    norms = []
+    for index, layer in enumerate(backbone.layers):
+        layer.self_attn.o_proj.reduce_results = False
+        layer.mlp.down_proj.reduce_results = False
+        if index > 0:
+            norms.append(layer.input_layernorm)
+        norms.append(layer.post_attention_layernorm)
+    norms.append(backbone.norm)
+    key = len(_S31_AR)
+    _S31_AR[key] = {"norms": norms, "comm": None}
+    backbone._s31_ar_key = key
+
+
+def _s31_forward(backbone, input_ids, positions, input_embeds):
+    """`DFlashQwen3Model.forward` with each layer all-reduce fused into the
+    RMSNorm after it (`vllm.s31_ar_norm`); same layers, same order."""
+    if input_embeds is None:
+        input_embeds = backbone.embed_input_ids(input_ids)
+    key = backbone._s31_ar_key
+    residual = input_embeds
+    partial = None
+    site = 0
+    for index, layer in enumerate(backbone.layers):
+        if index == 0:
+            hidden = layer.input_layernorm(input_embeds)
+        else:
+            hidden, residual = torch.ops.vllm.s31_ar_norm(partial, residual, key, site)
+            site += 1
+        attn = layer.self_attn(positions=positions, hidden_states=hidden)
+        hidden, residual = torch.ops.vllm.s31_ar_norm(attn, residual, key, site)
+        site += 1
+        partial = layer.mlp(hidden)
+    hidden, _ = torch.ops.vllm.s31_ar_norm(partial, residual, key, site)
+    return hidden
+
+
+def _s31_gemm_method():
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    class S31GemmMethod(UnquantizedLinearMethod):
+        """An unquantized linear's `apply` on `vllm.s31_draft_gemm` (2-D BF16
+        input, no bias); the original method otherwise."""
+
+        def __init__(self, inner, key):  # super().__init__ not needed
+            self.inner = inner
+            self.key = key
+
+        def __getattr__(self, name):
+            return getattr(self.__dict__["inner"], name)
+
+        def apply(self, layer, x, bias=None):
+            if bias is not None or x.dim() != 2 or x.dtype != torch.bfloat16:
+                return self.inner.apply(layer, x, bias)
+            return torch.ops.vllm.s31_draft_gemm(x, self.key)
+
+    return S31GemmMethod
+
+
+def _s31_install_gemms(backbone) -> int:
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.models.kimi_k3.nvidia.specialized_decode.drafter.linears import (
+        DraftGemm,
+    )
+
+    method_cls = _s31_gemm_method()
+    count = 0
+    for layer in backbone.layers:
+        for linear in (
+            layer.self_attn.qkv_proj,
+            layer.self_attn.o_proj,
+            layer.mlp.gate_up_proj,
+            layer.mlp.down_proj,
+        ):
+            method = getattr(linear, "quant_method", None)
+            weight = getattr(linear, "weight", None)
+            if (
+                type(method) is not UnquantizedLinearMethod
+                or weight is None
+                or weight.dtype != torch.bfloat16
+                or weight.dim() != 2
+                or getattr(linear, "bias", None) is not None
+            ):
+                continue
+            gemm = DraftGemm(weight)
+            if not gemm.eligible:
+                continue
+            key = len(_S31_GEMMS)
+            _S31_GEMMS.append(gemm)
+            linear.quant_method = method_cls(method, key)
+            count += 1
+    return count
