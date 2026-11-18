@@ -14,7 +14,7 @@ from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
 from ..common.host import architecture, tensor_maps, to_cute
 from ..common.host import stream as current_stream
-from .splitk import SplitKGemm, SplitKTactic
+from .splitk import SplitKGemm, SplitKPushGemm, SplitKTactic
 
 
 def matrix_view(tensor, *, output=False):
@@ -39,6 +39,24 @@ def compile_projection(tactic, output_dtype, arch):
     split = SplitKTactic(*tactic)
     kernel = SplitKGemm(tactic=split)
     args = (fake(1), fake(1), y, y, cutlass.Int64(0), make_fake_stream())
+    return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
+
+
+@cache
+def compile_push_projection(tactic, arch, tp):
+    """`SplitKPushGemm` (BF16 rows, also peer-stored into the MoE tail's RS
+    mailboxes); args (w, x, y, a_map, peers [tp] Int64, parity, rank, capacity)."""
+
+    def fake(stride):
+        shape = tuple(cute.sym_int() for _ in range(3))
+        return make_fake_tensor(cutlass.BFloat16, shape, stride, assumed_align=16)
+
+    w, x = fake((cute.sym_int(64), 1, 0)), fake((cute.sym_int(64), 1, 0))
+    y = fake((1, cute.sym_int(64), 0))
+    peers = make_fake_tensor(cutlass.Int64, (tp,), (1,), assumed_align=16)
+    kernel = SplitKPushGemm(tactic=SplitKTactic(*tactic), tp=tp)
+    i32 = cutlass.Int32(0)
+    args = (w, x, y, cutlass.Int64(0), peers, i32, i32, i32, make_fake_stream())
     return cute.experimental.compile(kernel, *args, options=f"--gpu-arch={arch}")
 
 
@@ -103,4 +121,25 @@ class PreparedProjection:
             )
         code, extra = self.kernels[b], self.extra[b]
         code(self.weight_view, matrix_view(x), y, y, *extra, stream)
+        return out
+
+    def push_kernel(self, batch, tp):
+        """The peer-storing variant of `batch`'s tactic (BF16 output only)."""
+        if self.output_dtype != torch.bfloat16:
+            raise ValueError("push projection: BF16 output only")
+        tactic = self.policies[batch]
+        arch = architecture(self.device)
+        with torch.accelerator.device_index(self.device.index):
+            return compile_push_projection(tactic, arch, tp), self.weight_map(tactic[0])
+
+    def run_push(self, code, x, out, peers, parity, rank, capacity):
+        """`run` whose rows are also peer-stored (contiguous [B, 7168] rows)."""
+        if out.stride(0) != 7168 or out.shape[1] != 7168 or out.stride(1) != 1:
+            shape = (tuple(out.shape), out.stride())
+            raise ValueError(f"push projection output {shape}")
+        kernel, extra = code
+        y = matrix_view(out, output=True)
+        stream = current_stream(self.device)
+        args = (self.weight_view, matrix_view(x), y, *extra, peers, parity, rank)
+        kernel(*args, capacity, stream)
         return out

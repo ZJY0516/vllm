@@ -378,3 +378,144 @@ class SplitKGemm:
             rD.store(rAcc.load().to(c_dtype))
             # Preserve TMEM coordinates; the copy predicates output tails.
             cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+
+
+# Split-1 GEMM whose epilogue also peer-stores its rows into the MoE tail's RS
+# mailboxes (the stores and slot layout of ``WaveMoeTail.push_kernel``), so the rows
+# land as each CTA finishes instead of after the whole GEMM and a push launch.
+from ..common.primitives import load_words, no_neg_zero, store_relaxed  # noqa: E402
+
+ROW = 7168  # the hidden size: one contiguous output row
+
+
+class SplitKPushGemm(SplitKGemm):
+    """`SplitKGemm` at split 1 whose epilogue threads, once their [cta_m, cta_n] tile
+    is stored, store it again into slot (parity, rank) of every peer's RS mailbox:
+    row `token`, shard `column // (ROW / tp)`, negative-zero halves made +0."""
+
+    def __init__(self, *, tactic: SplitKTactic, tp: int):
+        super().__init__(tactic=tactic)
+        assert self.split_k == 1, "push epilogue: split 1 only"
+        assert self.cta_m % 8 == 0 and (self.cta_m * self.cta_n // 8) % 128 == 0
+        self.tp, self.shard = tp, ROW // tp
+        self.chunks = self.cta_m * self.cta_n // 8  # 16-byte chunks per tile
+
+    @cute.experimental.jit
+    def __call__(
+        self, a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, a_map: cutlass.Int64,
+        peers: cute.Tensor, parity: cutlass.Int32, rank: cutlass.Int32,
+        capacity: cutlass.Int32, stream: _cuda.CUstream,
+    ):  # fmt: skip
+        self.kernel(a, b, c, a_map, peers, parity, rank, capacity).launch(
+            grid=(
+                cute.ceil_div(c.layout.shape[0], self.cta_m),
+                cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
+                c.layout.shape[2],
+            ),
+            block=(self.threads_per_cta, 1, 1),
+            cluster=self.cluster_shape,
+            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            stream=stream,
+            use_pdl=True,
+        )
+
+    @cute.experimental.kernel
+    def kernel(
+        self, mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor, a_map: cutlass.Int64,
+        peers: cute.Tensor, parity: cutlass.Int32, rank: cutlass.Int32,
+        capacity: cutlass.Int32,
+    ):  # fmt: skip
+        """`SplitKGemm.kernel` at split 1, then `push_rows` in the epilogue warps."""
+        stages = self.num_ab_stage
+        ab_dtype = mA.element_type
+        majors = (utils.LayoutEnum.from_tensor(t).mma_major_mode() for t in (mA, mB))
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            ab_dtype, ab_dtype, *majors, self.acc_dtype, self.cta_group,
+            self.mma_tiler_mn,
+        )  # fmt: skip
+
+        mnk_tiler = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], self.cta_k)
+        block_idx = cute.arch.block_idx()
+        bidx = block_idx[0]
+        split_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        n_idx = block_idx[1] // self.split_k
+        l_idx = block_idx[2]
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
+        sA = _smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_a(*shape))
+        sB = _smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_b(*shape))
+        acc_layout = cute_ext.make_tmem_layout_acc(
+            tiled_mma, self.mma_tiler_mn, acc_stage=1
+        )
+        bar_full = _smem(cutlass.Int64, stages, 8).iterator
+        bar_empty = _smem(cutlass.Int64, stages, 8).iterator
+        bar_tma_epilog = _smem(cutlass.Int64, 1, 8).iterator  # FlashInfer's bias
+        bar_mma_epilog = _smem(cutlass.Int64, 1, 8).iterator
+        bar_tmem_alloc = _smem(cutlass.Int64, 1, 8).iterator
+        tmem_base_ptr = _smem(cutlass.Int32, 1, 4).iterator
+        mailbox, bar_reduce = sA, bar_mma_epilog  # split 1: compile-time dead
+
+        if warp_idx == 0:
+            with cute.arch.elect_one():
+                for i in range(stages):
+                    cute.arch.mbarrier_init(bar_full + i, 2)
+                    cute.arch.mbarrier_init(bar_empty + i, 1)
+                cute.arch.mbarrier_init(bar_tma_epilog, 32)
+                cute.arch.mbarrier_init(bar_mma_epilog, 1)
+                cute.arch.mbarrier_init(bar_tmem_alloc, 160)
+
+        cute.arch.mbarrier_init_fence()
+        cute.arch.barrier()
+
+        k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
+        k_tile_start = split_rank * k_tile_count
+
+        # Warp 3 is idle; warps 4-7 run the epilogue and the peer stores.
+        tiles = (k_tile_start, k_tile_count)
+        if warp_idx == 0:
+            self.weight_warp(bar_full, bar_empty, sA, a_map, bidx * self.cta_m, *tiles)
+        elif warp_idx == 1:
+            b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (n_idx, None, l_idx))
+            b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
+            self.activation_warp(bar_full, bar_empty, b_tile, sB, b_map, *tiles)
+        elif warp_idx == 2:
+            k_blocks = self.cta_k // cute.size(tiled_mma.shape_mnk, mode=[2])
+            self.mma_warp(
+                bar_full, bar_empty, bar_mma_epilog, bar_tmem_alloc, tiled_mma, sA, sB,
+                tmem_base_ptr, acc_layout, k_blocks, k_tile_count,
+            )  # fmt: skip
+        elif warp_idx >= 4:
+            epi_tid = cute.arch.thread_idx()[0] - 128
+            tile = cute.local_tile(mC, (self.cta_m, self.cta_n), (bidx, n_idx, l_idx))
+            self.epilog_warp(
+                bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, tile,
+                epi_tid, mC.element_type,
+                utils.LayoutEnum.from_tensor(mC), mailbox, bar_reduce, split_rank,
+            )  # fmt: skip
+            self.push_rows(mC, bidx, n_idx, epi_tid, peers, parity, rank, capacity)
+
+    @cute.experimental.jit
+    def push_rows(
+        self, mC: cute.Tensor, bidx: cutlass.Int32, n_idx: cutlass.Int32,
+        epi_tid: cutlass.Int32, peers: cute.Tensor, parity: cutlass.Int32,
+        rank: cutlass.Int32, capacity: cutlass.Int32,
+    ):  # fmt: skip
+        """The tile's rows, just stored by the 128 epilogue threads, into the peers'
+        RS slots: one 16-byte chunk per thread per pass."""
+        # Order the epilogue threads' tile stores before their reads (CTA scope).
+        cute.arch.barrier(barrier_id=1, number_of_threads=self.epilog_threads)
+        batch = cute.size(mC, mode=[1])
+        per_row = self.cta_m // 8
+        for p in cutlass.range_constexpr((self.chunks + 127) // 128):
+            j = epi_tid + 128 * p
+            token = n_idx * self.cta_n + j // per_row
+            column = bidx * self.cta_m + 8 * (j % per_row)
+            if token < batch:
+                row = mC.iterator + token * ROW + column
+                words = load_words(row, count=4, mutable=True)
+                offset = ((parity * self.tp + rank) * capacity + token) * self.shard
+                offset += column % self.shard
+                packed = tuple(no_neg_zero(w) for w in words)
+                peer = peers[column // self.shard]
+                store_relaxed(peer + cutlass.Int64(offset) * 2, packed)

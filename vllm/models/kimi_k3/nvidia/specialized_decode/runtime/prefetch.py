@@ -42,6 +42,7 @@ built from the model's layers.
 """
 
 import ctypes
+import os
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -70,6 +71,11 @@ NEXT_ATTENTION = {8: "1:96.100,2-3:96,4-7:64,8:32", 16: "1-8:1024"}
 # ahead prefetches still in flight when the experts exit delay the MoE tail's first
 # loads (its latent and weights land ~0.4 us later per layer, in-kernel stamps).
 EXPERTS_AHEAD = {8: "4-7:16", 16: ""}
+# TP16 B5-8 on the published MoE tail (moe.tail_runtime.PUB8), whose 16-CTA clusters
+# need whole SMs when the experts exit: K31_PUB8_AHEAD=<MiB> moves their next-layer
+# attention prefetch into the experts (no side-stream CTAs), like TP8 B4-7.
+if os.environ.get("K31_PUB8") == "1" and os.environ.get("K31_PUB8_AHEAD"):
+    EXPERTS_AHEAD[16] = f"5-8:{int(os.environ['K31_PUB8_AHEAD'])}"
 
 
 def attention_weights(attention):

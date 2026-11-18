@@ -5,6 +5,7 @@ and the latent shard into a multicast mailbox row; the routing kernel polls all 
 logits, ranks the top16 (sigmoid + bias, renormalized) and Lamport-copies the latent."""
 
 import functools
+import os
 
 import cutlass as c
 import cutlass.cute as cute
@@ -33,7 +34,7 @@ from ..gemm.projection import PreparedProjection
 from ..gemm.ws_gemm import WsGemm
 from .experts import PLAN_BYTES, plan_chunk
 from .shared import compile_down, compile_shared, weight_maps
-from .tail_runtime import CAP
+from .tail_runtime import CAP, PUB8
 
 
 @asm(Int32)
@@ -375,7 +376,18 @@ SPLITS = {
 # the shared expert's split-K gate/up GEMM has taken its SMs, so the early experts
 # do not starve it. GB300 TP8 K3.1 DSpark k=4 step, ms: DCP8 R1 136K 9.465 -> 9.371,
 # TP8 R1 32K 8.858 -> 8.794.
-EARLY_ROUTE = {8: "5-8:1", 16: ""}
+# TP16: the published verify batches (tail_runtime.PUB8), whose tail polls the shared
+# rows like TP8 B5-8's. K31_PUB8_JOIN=1 keeps them ungated instead: the shared expert
+# on the side stream, the experts released after the ranking, and the tail launched
+# after the side stream's last kernel (as for the front tail), so it never holds SMs
+# while the experts and the shared expert still run.
+_join = os.environ.get("K31_PUB8_JOIN") == "1"
+EARLY_ROUTE = {8: "5-8:1", 16: "" if _join else PUB8[16]}
+# Split-K shared-expert batches whose down GEMM peer-stores its rows into the MoE
+# tail's RS mailboxes itself (`PreparedProjection.run_push`) instead of a push launch
+# after it; the same bytes in the same slots. K31_PUB8_DPUSH=1: the TP16 published
+# batches.
+DOWN_PUSH = {8: "", 16: PUB8[16] if os.environ.get("K31_PUB8_DPUSH") == "1" else ""}
 # Split batches whose front GEMM rows join the gate/up kernel as extra M-tiles (one
 # kernel instead of two that slow each other ~2x side by side). TP8 from 33 rows: on
 # verify steps at k = 4 (seven and eight requests), decode-step A/B at 131K context,
@@ -494,6 +506,9 @@ class SharedFront:
         self.plans: dict[int, tuple] = {}
         early = batch_table(EARLY_ROUTE[tp])
         self.early = {b for b in batches if early.get(b) and b <= 8 and b not in fused}
+        push = batch_table(DOWN_PUSH[tp])
+        pushed = [b for b in batches if push.get(b) and b not in fused]
+        self.pushed = {b: self.down.push_kernel(b, tp) for b in pushed}
         for b in batches:
             views = tuple(t[:b] for t in storage)
             logits, gate, ids, weights, h, _, latent = map(to_cute, views)
@@ -564,6 +579,10 @@ class SharedFront:
             return views[5], lambda: down(args[7], maps, *mailbox, stream(self.device))
         self.gate_up.run(x, views[1])
         situ(*args, s)
+        if x.shape[0] in self.pushed:
+            code, ring = self.pushed[x.shape[0]], (*tail.ring, Int32(CAP))
+            shared = self.down.run_push(code, views[4], views[5], tail.peers, *ring)
+            return shared, None
         shared = self.down.run(views[4], views[5])
         tail.push(shared)
         return shared, None

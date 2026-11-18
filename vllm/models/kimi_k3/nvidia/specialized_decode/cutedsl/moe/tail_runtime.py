@@ -4,10 +4,12 @@
 latent partial and peer-stores the shared shard (three rotating parities), all-reduces
 and RMS-normalizes per K-slice, runs the K-split up projection and multicasts the output
 row into the next AttnRes mailbox. At TP8 B5+ and TP16 B9+ the experts publish the
-latent partial, WaveMoeTail.push the shared shard and WaveMoeTail does the rest. At
+latent partial, WaveMoeTail.push the shared shard and WaveMoeTail does the rest (TP16
+B5-8 under `PUB8`: WaveMoeTailExact, with the front tail's arithmetic). At
 `twoshot_batches` the latent all-reduce is `common.twoshot`: the experts push each
 partial chunk to its column owner, whose WaveMoeTail CTAs sum and multicast it."""
 
+import os
 from functools import cache
 
 import cuda.bindings.driver as cuda
@@ -21,7 +23,7 @@ from ..common.host import fake, prepare_shared_carveout, stream, tensor_maps, to
 from ..common.policy import batch_table
 from ..common.twoshot import TwoShot
 from ..oproj.prepared import OprojMailbox
-from .tail import MoeTail, WaveMoeTail
+from .tail import MoeTail, WaveMoeTail, WaveMoeTailExact
 
 # MoE tail mailbox tokens (padded decode batches); small-batch front_poll G/W/S rows per
 # parity.
@@ -50,16 +52,35 @@ UMMA = {8: "9-64:1", 16: "33-64:1"}
 # pairs and batches: the defaults.
 TAIL_GATE = {(16, 16): "5-8:1"}
 POLL_NS = {(16, 16): "5-8:0"}
+# TP16 verify batches published by the experts and finished by WaveMoeTailExact
+# (same output bits as the front tail); with them the MoE front gates the shared
+# expert (moe.front.EARLY_ROUTE). Default off; K31_PUB8=1 enables B5-8.
+# K31_PUB8_POLL0=1: its latent/RS polls retry without sleeping (as POLL_NS does for
+# the front tail); K31_PUB8_EARLY=1: it releases the next AttnRes at entry (EARLY).
+# Both change only timing, never what is loaded, summed or stored.
+_on = lambda name: os.environ.get(name, "0") == "1"
+PUB8 = {16: "5-8:1" if _on("K31_PUB8") else ""}
+PUB8_POLL_NS = 0 if _on("K31_PUB8_POLL0") else None
+# K31_PUB8_RSWARP=1: a ninth warp polls its RS rows from entry (same sums).
+PUB8_RS_WARP = _on("K31_PUB8_RSWARP")
+if _on("K31_PUB8_EARLY"):
+    EARLY[16] += ",5-8:1"
 
 
 def flat(t):
     return to_cute(t.reshape(-1), 16)
 
 
+def pub8(tp, batch):
+    """TP16 B<=8 batch on the published path (`PUB8`), run by WaveMoeTailExact."""
+    table = batch_table(PUB8.get(tp, ""))
+    return tp == 16 and batch <= 8 and bool(table.get(batch, 0))
+
+
 def published(tp, batch):
     """The experts publish the latent and WaveMoeTail runs the tail (else MoeTail
     front)."""
-    return batch > (4 if tp == 8 else 8)
+    return batch > (4 if tp == 8 else 8) or pub8(tp, batch)
 
 
 def front_gate(tp, dcp, batch):
@@ -92,6 +113,8 @@ def umma_batches(tp):
 def shares(tp, batch, twoshot=False):
     """WaveMoeTail clusters share reduced latent rows (all 112 CTAs must be
     co-resident)."""
+    if pub8(tp, batch):
+        return False
     return published(tp, batch) and WaveMoeTail(batch, tp, twoshot).reduce
 
 
@@ -163,7 +186,9 @@ def compile_tail(
     scalars: tuple = (Int64(0), Int64(0), Int32(0), Int32(0), Int32(CAP), Float32(1e-6))
     scalars += (Int32(2), Int32(CAP))
     kernel: MoeTail
-    if m8:
+    if m8 and pub8(tp, batch):
+        kernel = wave = WaveMoeTailExact(batch, tp, early, poll_ns, PUB8_RS_WARP)
+    elif m8:
         kernel = wave = WaveMoeTail(batch, tp, twoshot, early, umma)
         scalars += (vec(3 * CAP * 3584),) if wave.reduce else ()
     else:
@@ -230,6 +255,8 @@ class MoeTailWeights:
             on = mode != "front" and b in umma
             views = self.umma_views if on else views
             gate, sleep = front_gate(tp, dcp, b), front_poll_ns(tp, dcp, b)
+            if pub8(tp, b):
+                sleep = PUB8_POLL_NS
             kw = dict(early=b in early, umma=on, gate=gate, poll_ns=sleep)
             code = compile_tail(tp, b, device, mode, **kw)
             self.codes[b] = code, views, shares(tp, b, twoshot), twoshot

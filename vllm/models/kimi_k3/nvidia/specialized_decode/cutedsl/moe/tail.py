@@ -5,7 +5,8 @@ all-reduce, RMS tree, K-split up projection, shared reduce-scatter and output mu
 TMA weight loads overlap the mailbox wait. The caller owns the three rotating mailboxes
 and must use different parities on successive calls. TP8 B5+ and TP16 B9+ run the
 one-wave WaveMoeTail over latent rows published by the routed experts and shards
-pushed by WaveMoeTail.push."""
+pushed by WaveMoeTail.push; TP16 B5-8, when published (`tail_runtime.PUB8`), run
+WaveMoeTailExact, which keeps the front tail's arithmetic."""
 
 from functools import reduce
 from operator import or_
@@ -18,9 +19,11 @@ from ..common.primitives import (
     acquire_tensormap,
     alloc,
     bf16,
+    bits_float,
     copy_g2s,
     fence_tmem,
     fma,
+    fma2,
     fma_bf16,
     front_dirty,
     init_barriers,
@@ -37,6 +40,7 @@ from ..common.primitives import (
     mma_bf16_block,
     mul2,
     multicast_words,
+    named_barrier,
     no_neg_zero,
     pack_pair,
     push_float,
@@ -1040,3 +1044,222 @@ class WaveMoeTail(MoeTail):
             offset += column % self.shard
             packed = tuple(no_neg_zero(w) for w in words)
             store_relaxed(peers[column // self.shard] + Int64(offset) * 2, packed)
+
+
+class WaveMoeTailExact(WaveMoeTail):
+    """One-wave tail over published inputs for TP16 B5-8 whose arithmetic is the
+    front MoeTail's term for term (same products and sums, in the same order, with
+    the same roundings), so its output rows equal the front tail's bit for bit on the
+    same mailbox contents. Each of the seven 16-CTA clusters owns 64 shard rows. CTA
+    q polls latent slice q (224 columns) of every token from the TP sources itself
+    (no shared reduced rows, so clusters need not be co-resident) and, with partner
+    q ^ 1, covers the front tail's K chunk q // 2 (448 columns) for rows
+    32 (q % 2) .. 32 (q % 2) + 31 of the cluster's tile. The slice's 8-column square
+    sums go to every peer and its BF16 sums to the partner by DSMEM; each token's RMS
+    sum is then the front tail's 16 warp butterflies added in (CTA, warp) order. Lanes
+    chain their 16 columns of the chunk like the front GEMV, warps reduce them with
+    the same butterfly, and CTA 2 t + h, the owner of token t's row half h, adds the
+    8 chunk partials in chunk order and the RS rows and multicasts its 32 rows."""
+
+    def __init__(self, batch, tp=16, early=False, poll_ns=None, rs_warp=False):
+        assert tp == 16 and 4 < batch <= 8
+        super().__init__(batch, tp, early=early)
+        self.reduce = False
+        # ``rs_warp``: a ninth warp polls the owned RS rows from entry, beside the
+        # latent poll and the MMA chains, and hands them to warp 0 by a named barrier
+        # (same sums); warps 0..7 then sync by their own named barrier.
+        self.rs_warp = rs_warp
+        if rs_warp:
+            self.threads = 288
+        # ``poll_ns``: the latent/RS polls' sleep between rounds (None: WaveMoeTail's);
+        # it changes only when a poll retries, not what is loaded or summed.
+        if poll_ns is not None:
+            self.poll_ns = poll_ns
+        # Shared memory, bytes: chunk x [8, 448] BF16, partner slice [8, 224] BF16,
+        # squares [8, 448] FP32, chunk partials [8, 32] FP32, RS rows [32] FP32, two
+        # barriers; the allocation stays 116 KB (one CTA per SM, as WaveMoeTail).
+        self.layout = (0, 7168, 10752, 25088, 26112, 26240)
+
+    @cute.kernel
+    def kernel(self, args):
+        latent, shared, weight, gamma = args[0:4]
+        output_mc, par, rank, capacity, eps = args[10:15]
+        tid, warp, lane, block = thread()
+        if cutlass.const_expr(self.early):
+            cute.arch.griddepcontrol_launch_dependents()
+        q = cute.arch.block_idx_in_cluster()
+        batch, shard = self.batch, self.shard
+        chunk, half = q // 2, q % 2
+        row0 = block // 16 * 64 + 32 * half
+        owner, lat = chunk < batch, lane < 28
+        sm = alloc(cutlass.utils.SmemAllocator(), Uint8, self.smem, 128).iterator
+        x_at, raw_at, sq_at, cell_at, rs_at, bar_at = self.layout
+        xs = view(sm, x_at, BFloat16, 3584).iterator
+        raw = view(sm, raw_at, BFloat16, 1792).iterator
+        squares = view(sm, sq_at, Float32, 3584)
+        cells = view(sm, cell_at, Float32, 256)
+        rs_sum = view(sm, rs_at, Float32, 32)
+        bar = view(sm, bar_at, Uint64, 2).iterator
+        if tid == 0:
+            init_barriers(bar, 2)
+            # Per token: every slice's 28 square sums and the partner's slice.
+            gathered = batch * (16 * 28 * 4 + 224 * 2)
+            cute.arch.mbarrier_arrive_and_expect_tx(bar, gathered)
+            size = cutlass.select_(owner, Int32(1024), Int32(0))  # 8 chunks x 32 rows
+            cute.arch.mbarrier_arrive_and_expect_tx(bar + 1, size)
+        cute.arch.cluster_arrive_relaxed()
+        # Rows row0 + 4 warp + i, columns 448 chunk + 224 h + 8 lane .. +7 (the front
+        # GEMV lane's two runs) as FP32 (exact): [16 i + 8 h + j]. Gamma of both halves.
+        wf = cute.make_rmem_tensor(64, Float32)
+        g_own = cute.make_rmem_tensor(4, Uint32)
+        g_other = cute.make_rmem_tensor(4, Uint32)
+        rows8 = lat & (warp < 8) if self.rs_warp else lat  # the RS warp has no rows
+        if rows8:
+            base = weight.iterator + (row0 + 4 * warp) * 3584 + 448 * chunk + 8 * lane
+            for i in cutlass.range_constexpr(4):
+                for h in cutlass.range_constexpr(2):
+                    at = base + i * 3584 + 224 * h
+                    wword = load_words(at, count=4, evict_first=True, mutable=True)
+                    for k in cutlass.range_constexpr(4):
+                        wf[16 * i + 8 * h + 2 * k] = bf16(wword[k])
+                        wf[16 * i + 8 * h + 2 * k + 1] = bf16(wword[k], True)
+            gp = gamma.iterator + 448 * chunk + 8 * lane
+            own = load_words(gp + 224 * half, count=4)
+            other = load_words(gp + 224 - 224 * half, count=4)
+            for k in cutlass.range_constexpr(4):
+                g_own[k], g_other[k] = own[k], other[k]
+        # Lanes 0..27 of warp t poll token t's slice q; the owner's RS rows (8 per
+        # lane) are polled by lanes 28..31 of its warp 0, or by the RS warp.
+        xw = cute.make_rmem_tensor(4, Uint32)
+        s2, slot, rs_j = Float32(0), par * self.tp * capacity, lane - 28
+        if cutlass.const_expr(self.rs_warp):  # noqa: SIM102
+            if lat & (warp < batch):
+                lp = latent.iterator + (slot + warp) * 3584 + 224 * q + 8 * lane
+                lsum = self.sum_sources(self.poll(lp, capacity * 3584, lp, 0, False), 0)
+                s2 = self.latent_words(lsum, xw)
+        else:
+            if (lat & (warp < batch)) | ((warp == 0) & (lane >= 28) & owner):
+                ptr = latent.iterator + (slot + warp) * 3584 + 224 * q + 8 * lane
+                rs = (slot + chunk) * shard + row0 + 8 * max(rs_j, 0)
+                ptr = ptr if lat else shared.iterator + rs
+                stride = capacity * (3584 if lat else shard)
+                sums = self.sum_sources(self.poll(ptr, stride, ptr, 0, False), 0)
+                if lat:
+                    s2 = self.latent_words(sums, xw)
+                else:
+                    self.rs_words(sums, rs_sum, rs_j)
+        cute.arch.sync_warp()
+        cute.arch.cluster_wait()
+        if cutlass.const_expr(self.rs_warp):  # noqa: SIM102
+            if (warp == 8) & owner:
+                if lane < 4:
+                    late = shared.iterator + (slot + chunk) * shard + row0 + 8 * lane
+                    got = self.poll(late, capacity * shard, late, 0, False)
+                    self.rs_words(self.sum_sources(got, 0), rs_sum, lane)
+                named_barrier(2, 64, arrive=True)
+        self.push_squares(squares, s2, bar, (q, warp, lane))
+        if lat & (warp < batch):
+            bits = tuple(bits_float(xw[k]) for k in range(4))
+            push_float(raw + warp * 224 + 8 * lane, bits, bar, q ^ 1)
+        wait(bar)
+        cute.arch.sync_warp()
+        if warp < batch:
+            inverse = inv_rms(self.front_total(squares, warp, lane), eps)
+            if lat:
+                row = xs + warp * 448 + 8 * lane
+                self.front_scale(xw, g_own, inverse, row + 224 * half)
+                theirs = smem_words(raw + warp * 224 + 8 * lane)
+                self.front_scale(theirs, g_other, inverse, row + 224 - 224 * half)
+        if cutlass.const_expr(self.rs_warp):
+            if warp < 8:
+                named_barrier(1, 256)
+                self.chunk_partials(wf, xs, cells, bar, (lane, warp, chunk, half))
+        else:
+            cute.arch.sync_threads()
+            self.chunk_partials(wf, xs, cells, bar, (lane, warp, chunk, half))
+        if owner & (warp == 0):
+            if cutlass.const_expr(self.rs_warp):
+                named_barrier(2, 64)
+            cute.arch.sync_warp()
+            wait(bar + 1)
+            cute.arch.sync_warp()
+            total = Float32(0)
+            for c in cutlass.range_constexpr(8):
+                total += cells[32 * c + lane]
+            rounded = Float32(BFloat16(total))
+            out = Float32(BFloat16(rounded + rs_sum[lane]))
+            pair = pack_pair(out, shuffle(out, (lane + 1) & 31), policy="latent")
+            packed = tuple(shuffle(pair, (8 * lane + 2 * k) & 31) for k in range(4))
+            if lane < 4:
+                offset = chunk * 7168 + rank * shard + row0
+                multicast_words(output_mc + Int64(offset + 8 * lane) * 2, packed)
+        if cutlass.const_expr(not self.early):
+            cute.arch.griddepcontrol_launch_dependents()
+        # The previous layer's rows, off the output path.
+        self.rearm(args[0:2] + args[4:8], capacity, *args[15:17], block, tid)
+        cute.arch.griddepcontrol_wait()
+
+    @cute.jit
+    def chunk_partials(self, wf, xs, cells, bar, ids):
+        """The warp's rows of the chunk's GEMV, reduced like the front tail's, pushed
+        as 4-row vectors to each token's owner (CTA 2 t + half)."""
+        lane, warp, chunk, half = ids
+        # [token t, row i] at 4 t + i; lanes 28..31 stay zero like the front GEMV's.
+        acc = zeros(32, Float32)
+        if lane < 28:
+            self.front_gemv(wf, xs, acc, lane)
+        value, _ = scatter_reduce(acc, lane, 32)  # lane L: token L // 4, row L % 4
+        token = lane // 4
+        rows = tuple(shuffle(value, 4 * token + j) for j in range(4))
+        if ((lane % 4) == 0) & (token < self.batch):
+            dst = cells.iterator + 32 * chunk + 4 * warp
+            push_float(dst, rows, bar + 1, 2 * token + half)
+
+    @cute.jit
+    def front_total(self, squares, token, lane):
+        """`token`'s RMS sum as the front tail forms it: per front CTA c (448
+        columns) and warp h, the butterfly sum of the 32 lanes' 8-column square sums
+        (chunks 56 c + 32 h + lane, zero from 56), then the 16 sums from zero in
+        (c, h) order."""
+        values = cute.make_rmem_tensor(16, Float32)
+        row = token * 448 + lane
+        for p in cutlass.range_constexpr(16):
+            values[p] = Float32(0)
+            if cutlass.const_expr(p % 2 == 0):
+                values[p] = squares[row + 56 * (p // 2)]
+            else:
+                if lane < 24:
+                    values[p] = squares[row + 56 * (p // 2) + 32]
+        part, _ = scatter_reduce(values, lane, 16)  # sum p in lanes 2 p, 2 p + 1
+        total = Float32(0)
+        for p in cutlass.range_constexpr(16):
+            total += shuffle(part, 2 * p)
+        return total
+
+    def front_scale(self, words, gx, inverse, dst):
+        """The front tail's normalization of 8 columns: (x * inverse) * gamma."""
+        scaled = lambda k, h: bf16(words[k], h) * inverse * bf16(gx[k], h)
+        packed = [pack_pair(scaled(k, False), scaled(k, True)) for k in range(4)]
+        store_shared_words(dst, packed)
+
+    @cute.jit
+    def front_gemv(self, wf, xs, acc, lane):
+        """The front GEMV lane's chains for rows i and tokens t: columns 0..7 of the
+        first run, then of the second, each one FMA (BF16 inputs exact in FP32, one
+        rounding); token pairs share a packed FMA (IEEE per lane)."""
+        batch = self.batch
+        for h in cutlass.range_constexpr(2):
+            xv = [smem_words(xs + t * 448 + 224 * h + 8 * lane) for t in range(batch)]
+            for k in cutlass.range_constexpr(4):
+                for e in cutlass.range_constexpr(2):
+                    x = [bf16(xv[t][k], e == 1) for t in range(batch)]
+                    for i in cutlass.range_constexpr(4):
+                        w = wf[16 * i + 8 * h + 2 * k + e]
+                        for j in cutlass.range_constexpr(batch // 2):
+                            a, b = 4 * (2 * j) + i, 4 * (2 * j + 1) + i
+                            acc[a], acc[b] = fma2(
+                                (w, w), (x[2 * j], x[2 * j + 1]), (acc[a], acc[b])
+                            )
+                        if cutlass.const_expr(batch % 2 == 1):
+                            a = 4 * (batch - 1) + i
+                            acc[a] = fma(w, x[batch - 1], acc[a])
