@@ -17,6 +17,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
+    StateRole,
     resolve_block_hashes,
     trim_null_head,
 )
@@ -1794,6 +1795,11 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+            # Per request, the cached state its prefix-cache hit resumed from,
+            # with that state's hash to detect a later eviction.
+            self._resumed_states: dict[
+                str, tuple[KVCacheBlock, BlockHashWithGroupId]
+            ] = {}
 
     @classmethod
     def find_longest_cache_hit(
@@ -2283,6 +2289,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._req_chunk_ranges.pop(request_id, None)
             self._mid_block_states.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
+            self._resumed_states.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
             # the pool now, so drop its not-yet-offered hand-offs rather than
@@ -2323,12 +2330,17 @@ class MambaManager(SingleTypeKVCacheManager):
             replay_boundaries=replay_boundaries,
         )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
+        newly_cached_states: list[KVCacheBlock] = []
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(
                 request, num_tokens, retention_interval=retention_interval
             )
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)
+                cached = self.block_pool.cached_block_hash_to_block
+                partial_block = cached.get_one_block(partial_hash)
+                if partial_block is not None:
+                    newly_cached_states.append(partial_block)
         if num_cached_blocks_after > num_cached_blocks_before:
             blocks = self.req_to_blocks[request.request_id]
             for idx in range(num_cached_blocks_before, num_cached_blocks_after):
@@ -2340,6 +2352,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 if block.is_null or block.block_hash is None:
                     continue
                 self.cached_blocks_this_step.add(block.block_hash)
+                newly_cached_states.append(block)
                 if self.mamba_cache_mode == "align":
                     assert block.block_hash_num_tokens is not None
                     # Offer every retained boundary with its exact block.
@@ -2353,6 +2366,56 @@ class MambaManager(SingleTypeKVCacheManager):
                             block.block_hash_num_tokens,
                         )
                     )
+        if self.mamba_cache_mode == "align" and newly_cached_states:
+            self._tag_and_supersede(request, newly_cached_states)
+
+    def _tag_and_supersede(
+        self, request: Request, newly_cached_states: list[KVCacheBlock]
+    ) -> None:
+        """Tag the states this request just cached, then demote the state it
+        resumed from once it has cached a deeper one."""
+        deepest = 0
+        for block in newly_cached_states:
+            num_tokens = block.block_hash_num_tokens or 0
+            deepest = max(deepest, num_tokens)
+            if num_tokens == request.shared_prefix_boundary:
+                block.state_role = StateRole.JUNCTION
+            elif block.state_role == StateRole.NONE:
+                block.state_role = StateRole.TIP
+        resumed = self._resumed_states.get(request.request_id)
+        if resumed is None:
+            return
+        block, block_hash = resumed
+        if block.block_hash != block_hash:
+            # Evicted (and maybe reused) since the hit.
+            del self._resumed_states[request.request_id]
+            return
+        if deepest <= (block.block_hash_num_tokens or 0):
+            return
+        del self._resumed_states[request.request_id]
+        if block.state_role == StateRole.TIP:
+            self.block_pool.demote_block(block)
+
+    def add_local_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        super().add_local_computed_blocks(
+            request_id,
+            new_computed_blocks,
+            num_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if self.mamba_cache_mode != "align" or not self.enable_caching:
+            return
+        # A Mamba hit is a single state block after null padding.
+        for block in reversed(new_computed_blocks):
+            if not block.is_null and block.block_hash is not None:
+                self._resumed_states[request_id] = (block, block.block_hash)
+                break
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()

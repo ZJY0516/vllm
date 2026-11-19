@@ -9058,3 +9058,130 @@ def test_cpu_encoder_input_updates_preserve_shm_handles():
     )
     assert scheduler.schedule().encoder_input_updates == {request.request_id: {1: None}}
     assert request.mm_features[0].data is handle
+
+
+def _create_hybrid_mamba_scheduler(num_blocks: int, block_size: int = 16) -> Scheduler:
+    """FA + Mamba ("align" cache mode) scheduler with prefix caching."""
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=4,
+            max_num_batched_tokens=8192,
+            max_model_len=8192,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+            watermark=0.0,
+        ),
+        model_config=ModelConfig(
+            model="facebook/opt-125m",
+            dtype="float16",
+            seed=42,
+            skip_tokenizer_init=True,
+        ),
+        cache_config=CacheConfig(
+            block_size=block_size,
+            enable_prefix_caching=True,
+            mamba_cache_mode="align",
+        ),
+    )
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            new_kv_cache_group(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size, shapes=((1, 1),), dtypes=(torch.float32,)
+                ),
+                MambaManager.config(mamba_cache_mode="align"),
+            ),
+            new_kv_cache_group(
+                ["fa"],
+                AttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+        ],
+    )
+    return Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=block_size,
+        hash_block_size=block_size,
+        log_stats=False,
+    )
+
+
+def _make_hashed_request(request_id: str, prompt: list[int], max_tokens: int):
+    init_none_hash(sha256)
+    sampling_params = SamplingParams(ignore_eos=True, max_tokens=max_tokens)
+    sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
+    return Request(
+        request_id=request_id,
+        prompt_token_ids=prompt,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+
+
+def _run_turn(scheduler: Scheduler, request_id: str, prompt: list[int]) -> list[int]:
+    """Run one request to completion with 3 output tokens; return its tokens."""
+    request = _make_hashed_request(request_id, prompt, max_tokens=3)
+    scheduler.add_request(request)
+    while not request.is_finished():
+        output = scheduler.schedule()
+        num_scheduled = output.num_scheduled_tokens.get(request_id, 0)
+        done = request.num_computed_tokens + num_scheduled >= request.num_tokens
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request_id], sampled_token_ids=[[7] if done else []]
+            ),
+        )
+    return prompt + [7, 7, 7]
+
+
+def _prefix_hit(scheduler: Scheduler, prompt: list[int]) -> int:
+    request = _make_hashed_request("probe", prompt, max_tokens=1)
+    _, num_hit, *_ = scheduler.kv_cache_manager.get_computed_blocks(request)
+    return num_hit
+
+
+def test_superseded_mamba_state_is_evicted_before_idle_session():
+    """A conversation's old turn state is evicted before an idle session's
+    prefix: the next turn resumes from the newer state, not the old one."""
+    block_size = 16
+    scheduler = _create_hybrid_mamba_scheduler(num_blocks=64)
+    block_pool = scheduler.kv_cache_manager.block_pool
+    a1 = _run_turn(scheduler, "A1", [1] * (4 * block_size + 5))
+    b1 = _run_turn(scheduler, "B1", [2] * (4 * block_size + 5))
+    a2 = _run_turn(scheduler, "A2", a1 + [9] * (2 * block_size))
+
+    # A2 resumed from A1's state and cached a deeper one, so A1's is demoted.
+    (superseded,) = block_pool.demoted_block_queue.get_all_free_blocks()
+    assert superseded.block_hash_num_tokens == 4 * block_size
+
+    # Evict exactly one cached block: the superseded state goes first.
+    num_uncached = sum(
+        block.block_hash is None
+        for block in block_pool.free_block_queue.get_all_free_blocks()
+    )
+    block_pool.get_new_blocks(num_uncached + 1)
+    assert _prefix_hit(scheduler, b1 + [8] * 20) == 4 * block_size
+    assert _prefix_hit(scheduler, a2 + [9] * 20) == 6 * block_size
+
+
+def test_superseded_mamba_state_survives_without_memory_pressure():
+    """Demoted states are evicted only after the uncached free blocks, so an
+    edited turn still resumes from the old state when memory is plentiful."""
+    block_size = 16
+    scheduler = _create_hybrid_mamba_scheduler(num_blocks=256)
+    a1 = _run_turn(scheduler, "A1", [1] * (4 * block_size + 5))
+    _run_turn(scheduler, "A2", a1 + [9] * (2 * block_size))
+    _run_turn(scheduler, "C1", [3] * (4 * block_size + 5))
+    assert _prefix_hit(scheduler, a1 + [5] * (2 * block_size)) == 4 * block_size

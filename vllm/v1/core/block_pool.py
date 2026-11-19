@@ -21,6 +21,7 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    StateRole,
     generate_block_hash_extra_keys,
     generate_lookahead_block_hash_extra_keys,
     get_block_hash,
@@ -151,6 +152,9 @@ class BlockPool:
         # list of free blocks (including eviction candidates when caching is
         # enabled).
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # Free cached blocks holding superseded Mamba states. They are evicted
+        # after the uncached free blocks and before every other cached block.
+        self.demoted_block_queue = FreeKVCacheBlockQueue([])
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap(
@@ -693,7 +697,10 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self.demoted_block_queue.num_free_blocks == 0:
+            ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        else:
+            ret = self._popleft_n_with_demoted(num_blocks)
 
         if self._reuse_watchers:
             self._notify_reuse(ret)
@@ -720,6 +727,32 @@ class BlockPool:
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
         return ret
+
+    def _popleft_n_with_demoted(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Pop uncached free blocks first, then demoted states, then the LRU
+        cached blocks. Uncached blocks sit at the free queue's head."""
+        free_queue = self.free_block_queue
+        demoted_queue = self.demoted_block_queue
+        ret: list[KVCacheBlock] = []
+        for _ in range(num_blocks):
+            head = free_queue.fake_free_list_head.next_free_block
+            if free_queue.num_free_blocks > 0 and (
+                demoted_queue.num_free_blocks == 0
+                or (head is not None and head.block_hash is None)
+            ):
+                ret.append(free_queue.popleft())
+            else:
+                ret.append(demoted_queue.popleft())
+        return ret
+
+    def demote_block(self, block: KVCacheBlock) -> None:
+        """Mark a cached state block superseded. A free one moves to the
+        demoted queue now; one still in use goes there when it is freed."""
+        assert block.block_hash is not None
+        block.state_role = StateRole.SUPERSEDED
+        if block.ref_cnt == 0:
+            self.free_block_queue.remove(block)
+            self.demoted_block_queue.append(block)
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
         for block in blocks:
@@ -785,7 +818,12 @@ class BlockPool:
                 continue
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
-            if block.ref_cnt == 0:
+            if block.state_role == StateRole.SUPERSEDED:
+                # Resumed again (e.g. an edited turn): it is a tip once more.
+                if block.ref_cnt == 0:
+                    self.demoted_block_queue.remove(block)
+                block.state_role = StateRole.TIP
+            elif block.ref_cnt == 0:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
@@ -812,6 +850,7 @@ class BlockPool:
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
+        blocks_to_demote = []
         other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
         for block in ordered_blocks:
             if block.is_null:  # never pooled; its ref_cnt is not maintained
@@ -823,7 +862,9 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
-                if block.block_hash is None or not self.enable_caching or evict_first:
+                if block.state_role == StateRole.SUPERSEDED:
+                    blocks_to_demote.append(block)
+                elif block.block_hash is None or not self.enable_caching or evict_first:
                     # LIFO reuse of non-cached blocks for better GPU locality,
                     # and of cached ones when asked to evict them first.
                     blocks_to_evict_first.append(block)
@@ -835,6 +876,7 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        self.demoted_block_queue.append_n(blocks_to_demote)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks, evict_first=evict_first)
 
@@ -877,6 +919,10 @@ class BlockPool:
             )
             return False
 
+        # Demoted states become plain free blocks once their hashes are gone.
+        while self.demoted_block_queue.num_free_blocks:
+            self.free_block_queue.append(self.demoted_block_queue.popleft())
+
         # Remove all hashes so that no new blocks will hit. Clear in place: a
         # new map created after the startup gc.freeze() would not be frozen.
         self.cached_block_hash_to_block.clear()
@@ -907,7 +953,10 @@ class BlockPool:
             The number of free blocks.
 
         """
-        return self.free_block_queue.num_free_blocks
+        return (
+            self.free_block_queue.num_free_blocks
+            + self.demoted_block_queue.num_free_blocks
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

@@ -3,6 +3,7 @@
 """KV-Cache Utilities."""
 
 import copy
+import enum
 import hashlib
 import math
 import os
@@ -156,6 +157,23 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
     NONE_HASH = BlockHash(hash_fn(_NONE_HASH_SEED))
 
 
+class StateRole(enum.IntEnum):
+    """Role of a cached recurrent (Mamba) state block, set when it is cached.
+
+    A `TIP` is the deepest state a request cached on its prompt. A later
+    request that resumes from a tip and caches a deeper state makes it
+    `SUPERSEDED`: the conversation now resumes from the deeper state, so the
+    old one is evicted before other cached blocks. A `JUNCTION` is a
+    shared-prefix boundary that serves every prompt sharing it and is never
+    superseded.
+    """
+
+    NONE = 0
+    TIP = 1
+    JUNCTION = 2
+    SUPERSEDED = 3
+
+
 @dataclass(slots=True)
 class KVCacheBlock:
     """KV-cache block metadata."""
@@ -183,6 +201,9 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Role of a cached Mamba state block; cleared with the hash.
+    state_role: StateRole = StateRole.NONE
+
     def set_block_hash(
         self,
         block_hash: BlockHashWithGroupId,
@@ -198,6 +219,7 @@ class KVCacheBlock:
         """Reset the block hash when the block is evicted."""
         self.block_hash = None
         self.block_hash_num_tokens = None
+        self.state_role = StateRole.NONE
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
