@@ -233,6 +233,7 @@ class Qwen3DSparkModel(DFlashQwen3Model):
             )
         self._s31_ar_key: int | None = None
         _s31_backbone_init(self)
+        _drf_backbone_init(self)
 
     def forward(
         self,
@@ -240,6 +241,8 @@ class Qwen3DSparkModel(DFlashQwen3Model):
         positions: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(self, "_drf_norm", False):
+            return _drf_forward(self, input_ids, positions, input_embeds)
         if self._s31_ar_key is None:
             return super().forward(input_ids, positions, input_embeds)
         return _s31_forward(self, input_ids, positions, input_embeds)
@@ -290,6 +293,7 @@ class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
     def process_weights_after_loading(self) -> None:
         super().process_weights_after_loading()
         _s31_after_loading(self)
+        _drf_after_loading(self)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
@@ -674,3 +678,412 @@ def _s31_install_gemms(backbone) -> int:
             linear.quant_method = method_cls(method, key)
             count += 1
     return count
+
+
+# --------------------------------------------------------------------------------
+# K31_DRF_ATTN=1: each draft layer's attention block -- q RMSNorm,
+#      k RMSNorm, RoPE, the K/V cache write of the query rows and the paged
+#      sliding-window attention (FA4 prepare + forward + combine) -- runs as one
+#      launch (`specialized_decode.drafter.drf_swa.DraftSwaAttention`, Triton, PDL)
+#      through the custom op `vllm.drf_swa_attn`. q/k norm, RoPE and the cache
+#      write give the stock bits; the attention merges its splits in another order
+#      than FA4 (not bit-identical). Steps it does not serve (no attention
+#      metadata, non-causal or non-uniform batches, a quantized cache) take the
+#      stock path.
+# --------------------------------------------------------------------------------
+
+_DRF_ATTN: list = []
+
+
+def _drf_attn_eligible(attn) -> bool:
+    rope = attn.rotary_emb
+    return (
+        attn.sliding_window is not None
+        and attn.causal
+        and attn.attention_sink_bias is None
+        and attn.v_scale is None
+        and attn.head_dim == 64
+        and getattr(rope, "head_size", None) == attn.head_dim
+        and getattr(rope, "rotary_dim", None) == attn.head_dim
+        and getattr(rope, "is_neox_style", False)
+        and not getattr(rope, "use_flashinfer", False)
+        and attn.q_norm.variance_epsilon == attn.k_norm.variance_epsilon
+        and attn.qkv_proj.bias is None
+    )
+
+
+def _drf_backbone_init(backbone: "Qwen3DSparkModel") -> None:
+    backbone._drf_attn = False
+    if not _s31_on("K31_DRF_ATTN"):
+        return
+    attns = [layer.self_attn for layer in backbone.layers]
+    if not all(_drf_attn_eligible(a) for a in attns):
+        logger.info("drf DSpark draft attention: layers not eligible, stock path")
+        return
+    from vllm.config import get_current_vllm_config
+
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    if "drf_swa_attn" not in _S31_OPS:
+        direct_register_custom_op(
+            "drf_swa_attn", _drf_attn_impl, mutates_args=[], fake_impl=_drf_attn_fake
+        )
+        _S31_OPS.add("drf_swa_attn")
+    cfg = get_current_vllm_config()
+    max_reqs = int(getattr(cfg.scheduler_config, "max_num_seqs", 1) or 1)
+    for attn in attns:
+        attn._drf_key = len(_DRF_ATTN)
+        _DRF_ATTN.append({"attn": attn, "launcher": None, "max_reqs": max_reqs,
+                          "stock": 0, "fused": 0})
+        attn.forward = types.MethodType(_drf_attn_forward, attn)
+    backbone._drf_attn = True
+    logger.info(
+        "drf DSpark draft attention: one launch per layer (%d layers, max %d requests)",
+        len(attns), max_reqs,
+    )
+
+
+def _drf_after_loading(model: "Qwen3DSparkForCausalLM") -> None:
+    backbone = model.model
+    if getattr(model, "_drf_loaded", False):
+        return
+    model._drf_loaded = True
+    _drf_install_gemms(model)
+    if not getattr(backbone, "_drf_attn", False):
+        return
+    from vllm.models.kimi_k3.nvidia.specialized_decode.drafter.drf_swa import (
+        DraftSwaAttention,
+    )
+
+    shared = None
+    for state in _DRF_ATTN:
+        attn = state["attn"]
+        if state["launcher"] is not None:
+            continue
+        launcher = DraftSwaAttention(
+            attn.num_heads, attn.num_kv_heads, attn.head_dim, attn.sliding_window,
+            attn.q_norm.variance_epsilon, attn.scaling, attn.qkv_proj.weight.device,
+            max_reqs=state["max_reqs"],
+            block_n=int(os.environ.get("K31_DRF_ATTN_BLOCK", "256")),
+            tiles=int(os.environ.get("K31_DRF_ATTN_TILES", "1")),
+            use_pdl=os.environ.get("K31_DRF_ATTN_PDL", "1") != "0",
+            shared=shared,
+        )
+        shared = shared or launcher
+        state["launcher"] = launcher
+
+
+def _drf_attn_forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
+    """`DFlashQwen3Attention.forward` with q/k norm, RoPE, the cache write and
+    the attention in `vllm.drf_swa_attn`."""
+    qkv, _ = self.qkv_proj(hidden_states)
+    attn_output = torch.ops.vllm.drf_swa_attn(qkv, positions, self._drf_key)
+    output, _ = self.o_proj(attn_output)
+    return output
+
+
+def _drf_attn_stock(attn, qkv, positions):
+    q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+    q_shape, k_shape = q.shape, k.shape
+    q = attn.q_norm(
+        q.view(*q_shape[:-1], q_shape[-1] // attn.head_dim, attn.head_dim)
+    ).view(q_shape)
+    k = attn.k_norm(
+        k.view(*k_shape[:-1], k_shape[-1] // attn.head_dim, attn.head_dim)
+    ).view(k_shape)
+    q, k = attn.rotary_emb(positions, q, k)
+    return attn.attn(q, k, v)
+
+
+def _drf_attn_impl(qkv: torch.Tensor, positions: torch.Tensor, key: int) -> torch.Tensor:
+    from vllm.model_executor.layers.attention.attention import get_attention_context
+
+    state = _DRF_ATTN[key]
+    attn = state["attn"]
+    launcher = state["launcher"]
+    md, _, kv_cache, slot_mapping = get_attention_context(attn.attn.layer_name)
+    num_tokens = qkv.shape[0]
+    n = getattr(md, "max_query_len", 0) if md is not None else 0
+    ok = (
+        launcher is not None
+        and md is not None
+        and slot_mapping is not None
+        and getattr(md, "causal", None) is True
+        and n > 0
+        and num_tokens % n == 0
+        and qkv.dtype == torch.bfloat16
+        and qkv.stride(-1) == 1
+        and kv_cache.dtype == torch.bfloat16
+        and kv_cache.dim() == 4
+        and kv_cache.shape[-1] == 2 * attn.head_dim
+        and kv_cache.shape[1] == attn.num_kv_heads
+        and getattr(md, "dcp_context_kv_lens", None) is None
+    )
+    if ok:
+        num_reqs = num_tokens // n
+        ok = (
+            launcher.supports(num_reqs, n)
+            and md.query_start_loc.numel() >= num_reqs + 1
+            and md.seq_lens.numel() >= num_reqs
+            and md.block_table.shape[0] >= num_reqs
+            and slot_mapping.numel() >= num_tokens
+        )
+    if not ok:
+        state["stock"] += 1
+        if state["stock"] in (1, 1000) and key == 0:
+            logger.info("drf DSpark draft attention: stock path (%d calls)", state["stock"])
+        return _drf_attn_stock(attn, qkv, positions)
+    state["fused"] += 1
+    if state["fused"] in (1, 1000, 100000) and key == 0:
+        logger.info(
+            "drf DSpark draft attention: fused launch (%d calls, %d requests x %d rows, "
+            "page %d)", state["fused"], num_reqs, n, kv_cache.shape[2],
+        )
+    out = torch.empty(num_tokens, attn.q_size, dtype=qkv.dtype, device=qkv.device)
+    cos_sin = attn.rotary_emb._match_cos_sin_cache_dtype(qkv)
+    launcher(
+        qkv, positions, attn.q_norm.weight, attn.k_norm.weight, cos_sin, kv_cache,
+        md.block_table, md.seq_lens, md.query_start_loc, slot_mapping, out,
+        num_reqs, n,
+    )
+    return out
+
+
+def _drf_attn_fake(qkv: torch.Tensor, positions: torch.Tensor, key: int) -> torch.Tensor:
+    attn = _DRF_ATTN[key]["attn"]
+    return qkv.new_empty((qkv.shape[0], attn.q_size))
+
+
+# --------------------------------------------------------------------------------
+# K31_DRF_ACT=1: each draft layer's gate_up projection runs with the
+#      SiLU-and-mul in its epilogue (`specialized_decode.drafter.drf_gemm.DrfGemm`,
+#      gate/up weight rows interleaved per 16-row output tile in place at load,
+#      silu from a table made by vLLM's own silu_and_mul): bit-identical to the
+#      stock GEMV + act_and_mul, one launch fewer per layer.
+# K31_DRF_NORM=1 (TP > 1 without K31_S31AR): the residual add and the
+#      RMSNorms of the draft layers move into the projections around them: tp rank 0
+#      adds the residual to its o_proj / down_proj partial (the all-reduce returns
+#      the new residual stream r), and the next projection (qkv, gate_up) reads r
+#      with the RMSNorm weight folded into its weight columns and scales its
+#      accumulator by rsqrt(mean(r^2) + eps) (`DrfGemm(norm=True)`). Removes the
+#      ten fused_add_rms_norm launches and the first rms_norm; the final norm stays.
+#      Not bit-identical (roundings move); the context K/V path keeps its own
+#      unfolded copy of the K/V weights.
+# Rows past 32 take a torch fallback of the same math.
+# --------------------------------------------------------------------------------
+
+_DRF_GEMMS: list = []
+
+
+def _drf_tactic(n, k, tile):
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.decode import (
+        warp_tactic,
+    )
+    from vllm.models.kimi_k3.nvidia.specialized_decode.cutedsl.gemm.warp_splitk import (
+        WarpSplitKTactic,
+    )
+
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+    def tactic(m):
+        t = warp_tactic(m, n, k, sms)
+        return WarpSplitKTactic(tile, t.token_tile, t.k_tile, t.stages, t.b_loader_warps)
+
+    return tactic
+
+
+def _drf_register_gemm(weight, *, norm=False, resid=False, act=False, eps=1e-5,
+                       tactic_fn=None, tile=16) -> int:
+    from vllm.models.kimi_k3.nvidia.specialized_decode.drafter.drf_gemm import DrfGemm
+
+    engine = None
+    try:
+        engine = DrfGemm(weight, norm=norm, resid=resid, act=act, eps=eps,
+                         tactic_fn=tactic_fn)
+    except Exception as exc:  # pragma: no cover - capability fallback
+        logger.warning("drf DSpark draft GEMM %s on torch fallback: %s",
+                       tuple(weight.shape), exc)
+    n = weight.shape[0]
+    _DRF_GEMMS.append({
+        "engine": engine, "weight": weight, "norm": norm, "resid": resid,
+        "act": act, "eps": float(eps), "n_out": n // 2 if act else n, "tile": tile,
+        "kernel": 0, "fallback": 0,
+    })
+    return len(_DRF_GEMMS) - 1
+
+
+def _drf_gemm_fallback(st, x, residual):
+    w = st["weight"]
+    y = torch.mm(x, w.t())
+    if st["norm"]:
+        rstd = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + st["eps"])
+        y = (y.float() * rstd).to(x.dtype)
+    if st["resid"] and residual is not None:
+        y = (y.float() + residual.float()).to(x.dtype)
+    if st["act"]:
+        m = y.shape[0]
+        half = st["tile"] // 2
+        y4 = y.view(m, -1, 2, half)
+        gate = y4[:, :, 0, :].reshape(m, -1)
+        up = y4[:, :, 1, :].reshape(m, -1)
+        out = torch.empty(m, st["n_out"], dtype=x.dtype, device=x.device)
+        torch.ops._C.silu_and_mul(out, torch.cat([gate, up], dim=-1))
+        return out
+    return y
+
+
+def _drf_gemm_impl(
+    x: torch.Tensor, key: int, residual: torch.Tensor | None
+) -> torch.Tensor:
+    st = _DRF_GEMMS[key]
+    engine = st["engine"]
+    m = x.shape[0]
+    capturing = torch.cuda.is_current_stream_capturing()
+    if (
+        engine is not None
+        and 1 <= m <= 32
+        and (m in engine.codes or not capturing)
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.data_ptr() % 32 == 0
+        and (not st["resid"] or (residual is not None and residual.is_contiguous()
+                                 and residual.data_ptr() % 32 == 0))
+    ):
+        out = torch.empty(m, st["n_out"], dtype=x.dtype, device=x.device)
+        engine.run(x, out, residual if st["resid"] else None)
+        st["kernel"] += 1
+        return out
+    st["fallback"] += 1
+    if st["fallback"] in (1, 1000):
+        logger.info("drf DSpark draft GEMM %d: torch fallback (%d rows, %d calls)",
+                    key, m, st["fallback"])
+    return _drf_gemm_fallback(st, x, residual)
+
+
+def _drf_gemm_fake(
+    x: torch.Tensor, key: int, residual: torch.Tensor | None
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], _DRF_GEMMS[key]["n_out"]))
+
+
+def _drf_register_gemm_op() -> None:
+    if "drf_gemm" in _S31_OPS:
+        return
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    direct_register_custom_op(
+        "drf_gemm", _drf_gemm_impl, mutates_args=[], fake_impl=_drf_gemm_fake
+    )
+    _S31_OPS.add("drf_gemm")
+
+
+def _drf_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
+    """Qwen2MLP.forward with the SiLU-and-mul in the gate_up epilogue."""
+    h = torch.ops.vllm.drf_gemm(x, self._drf_gu_key, None)
+    out, _ = self.down_proj(h)
+    return out
+
+
+def _drf_install_gemms(model: "Qwen3DSparkForCausalLM") -> None:
+    backbone = model.model
+    want_norm = _s31_on("K31_DRF_NORM")
+    want_act = _s31_on("K31_DRF_ACT") or want_norm
+    backbone._drf_norm = False
+    if not (want_norm or want_act):
+        return
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    def plain(linear):
+        method = getattr(linear, "quant_method", None)
+        inner = getattr(method, "inner", method)
+        w = getattr(linear, "weight", None)
+        return (
+            isinstance(inner, UnquantizedLinearMethod)
+            and w is not None and w.dtype == torch.bfloat16 and w.dim() == 2
+            and getattr(linear, "bias", None) is None
+        )
+
+    layers = list(backbone.layers)
+    tp = get_tensor_model_parallel_world_size()
+    tile = int(os.environ.get("K31_DRF_ACT_TILE", "16" if tp >= 16 else "32"))
+    rank0 = get_tensor_model_parallel_rank() == 0
+    ok_act = all(
+        plain(layer.mlp.gate_up_proj) and plain(layer.mlp.down_proj)
+        and type(layer.mlp.act_fn).__name__ == "SiluAndMul"
+        and layer.mlp.gate_up_proj.weight.shape[0] % (2 * tile) == 0
+        for layer in layers
+    )
+    ok_norm = (
+        want_norm and ok_act and tp > 1 and backbone._s31_ar_key is None
+        and getattr(backbone, "_fused_kv_weight", None) is not None
+        and all(plain(layer.self_attn.qkv_proj) and plain(layer.self_attn.o_proj)
+                and layer.input_layernorm.weight.shape[0] == 7168 for layer in layers)
+    )
+    if not ok_act:
+        logger.info("drf DSpark draft GEMMs: layers not eligible, stock path")
+        return
+    _drf_register_gemm_op()
+    for layer in layers:
+        mlp = layer.mlp
+        w = mlp.gate_up_proj.weight
+        eps = layer.post_attention_layernorm.variance_epsilon
+        with torch.no_grad():
+            if ok_norm:
+                w.mul_(layer.post_attention_layernorm.weight.to(w.dtype)[None, :])
+            from vllm.models.kimi_k3.nvidia.specialized_decode.drafter.drf_gemm import (
+                permute_gate_up,
+            )
+
+            w.copy_(permute_gate_up(w, tile))
+        mlp._drf_gu_key = _drf_register_gemm(
+            w, norm=ok_norm, act=True, eps=eps, tactic_fn=_drf_tactic(*w.shape, tile),
+            tile=tile,
+        )
+        mlp.forward = types.MethodType(_drf_mlp_forward, mlp)
+        if ok_norm:
+            attn = layer.self_attn
+            wq = attn.qkv_proj.weight
+            with torch.no_grad():
+                wq.mul_(layer.input_layernorm.weight.to(wq.dtype)[None, :])
+            attn._drf_qkv_key = _drf_register_gemm(
+                wq, norm=True, eps=layer.input_layernorm.variance_epsilon,
+                tactic_fn=_drf_tactic(*wq.shape, 16),
+            )
+            attn._drf_o_key = _drf_register_gemm(attn.o_proj.weight, resid=rank0)
+            mlp._drf_down_key = _drf_register_gemm(mlp.down_proj.weight, resid=rank0)
+    backbone._drf_norm = ok_norm
+    logger.info(
+        "drf DSpark draft GEMMs: SiLU-mul in gate_up %s (tile %d), RMSNorm folded %s "
+        "(TP %d, rank0 residual %s)", True, tile, ok_norm, tp, rank0,
+    )
+
+
+def _drf_forward(backbone, input_ids, positions, input_embeds):
+    """`DFlashQwen3Model.forward` with the residual adds and RMSNorms inside the
+    projections (K31_DRF_NORM); same layers, same order, same all-reduces."""
+    from vllm.distributed import tensor_model_parallel_all_reduce
+
+    if input_embeds is None:
+        input_embeds = backbone.embed_input_ids(input_ids)
+    r = input_embeds.contiguous()
+    use_attn = getattr(backbone, "_drf_attn", False)
+    for layer in backbone.layers:
+        attn = layer.self_attn
+        mlp = layer.mlp
+        qkv = torch.ops.vllm.drf_gemm(r, attn._drf_qkv_key, None)
+        if use_attn:
+            a = torch.ops.vllm.drf_swa_attn(qkv, positions, attn._drf_key)
+        else:
+            a = _drf_attn_stock(attn, qkv, positions)
+        r = tensor_model_parallel_all_reduce(
+            torch.ops.vllm.drf_gemm(a.contiguous(), attn._drf_o_key, r)
+        )
+        h = torch.ops.vllm.drf_gemm(r, mlp._drf_gu_key, None)
+        r = tensor_model_parallel_all_reduce(
+            torch.ops.vllm.drf_gemm(h, mlp._drf_down_key, r)
+        )
+    return backbone.norm(r)
