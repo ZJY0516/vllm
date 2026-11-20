@@ -26,7 +26,13 @@ stream beside the front and MegaMoE) up to its FRONT_MAX tokens.
 
 Precision is the stock layer's at every stage (FP32 accumulation, BF16 outputs;
 the split-K order differs). K3 MLA layers run stock (per-kind policy:
-`DEP_KINDS`)."""
+`DEP_KINDS`).
+
+A linear whose weight is MXFP8 (E4M3 codes + E8M0 block scales; in the NVFP4
+checkpoint, the KDA input projection and o_proj) runs the stock layer's MXFP8 GEMM
+at every batch (its dynamic MXFP8 activation quantization and kernel, i.e. the
+stock decode's numerics for that linear) instead of needing a BF16 copy of the
+weight; BF16 linears are unchanged."""
 
 from typing import Any
 
@@ -89,6 +95,25 @@ DEP_OPROJ = {
 }
 
 
+def mxfp8_linear(linear) -> bool:
+    """Whether `linear` holds an MXFP8 weight (E4M3 codes with E8M0 block scales)
+    served by the stock MXFP8 linear kernel."""
+    weight = getattr(linear, "weight", None)
+    return (
+        weight is not None
+        and weight.dtype == torch.float8_e4m3fn
+        and getattr(linear, "weight_scale", None) is not None
+    )
+
+
+def output_rows(linear) -> int:
+    """The output features of a TP1 linear (an MXFP8 kernel may store its weight
+    transposed, so not `weight.shape[0]`)."""
+    if mxfp8_linear(linear):
+        return linear.output_size_per_partition
+    return linear.weight.shape[0]
+
+
 def dep_policies(table, batches):
     """{batch: tactic} of the split-K batches of `table` (cuBLAS ones left out)."""
     tactics = {b: _bins(table, b) for b in batches}
@@ -97,9 +122,14 @@ def dep_policies(table, batches):
 
 class DepProjection:
     """A TP1 linear: split-K at the batches its table gives a tactic, else cuBLAS
-    (`torch.mm` into the output: the stock linear's FP32-accumulated BF16 GEMM)."""
+    (`torch.mm` into the output: the stock linear's FP32-accumulated BF16 GEMM).
+    An MXFP8 `linear` runs the stock layer's MXFP8 GEMM at every batch."""
 
-    def __init__(self, weight, table, batches):
+    def __init__(self, weight, table, batches, linear=None):
+        self.mx = linear if linear is not None and mxfp8_linear(linear) else None
+        if self.mx is not None:
+            self.weight, self.split, self.batches = None, None, set()
+            return
         self.weight = weight
         policies = dep_policies(table, batches)
         self.split = (
@@ -108,6 +138,8 @@ class DepProjection:
         self.batches = set(policies)
 
     def run(self, x, out):
+        if self.mx is not None:
+            return self.mx.quant_method.apply(self.mx, x)
         if x.shape[0] in self.batches:
             assert self.split is not None
             return self.split.run(x, out)
@@ -127,7 +159,7 @@ class DepAttention:
         self.wide = batches
         self.projection = DepProjection(weight, DEP_PROJECTION, batches)
         o_weight = attention.o_proj.weight
-        self.output = DepProjection(o_weight, DEP_OPROJ, batches)
+        self.output = DepProjection(o_weight, DEP_OPROJ, batches, attention.o_proj)
         from ..cutedsl.dsa.prepared import PreparedDsa
 
         cap = max(batches)
@@ -189,12 +221,15 @@ class DepKda:
         attention = decoder.self_attn
         assert attention_kind(attention) == "kda"
         self.layer, self.attention = decoder, attention
-        weight = attention.in_proj_qkvgfab.weight
+        linear = attention.in_proj_qkvgfab
+        weight = linear.weight
         batches = runtime.wide
         self.wide = batches
-        self.projection = DepProjection(weight, DEP_PROJECTION, batches)
-        self.output = DepProjection(attention.o_proj.weight, DEP_OPROJ, batches)
-        pitch, q = weight.shape[0], runtime.q
+        self.projection = DepProjection(weight, DEP_PROJECTION, batches, linear)
+        self.output = DepProjection(
+            attention.o_proj.weight, DEP_OPROJ, batches, attention.o_proj
+        )
+        pitch, q = output_rows(linear), runtime.q
         # Gate mode 0 (the F_B GEMM inside the core) at TP1; verify keys are
         # (requests, q), decode keys the batch.
         policies = {b: (pitch, 0) for b in batches}
