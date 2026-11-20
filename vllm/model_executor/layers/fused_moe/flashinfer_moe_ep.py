@@ -43,6 +43,48 @@ def _kimi_k3_megamoe_enabled() -> bool:
     return os.environ.get("VLLM_K31_KIMI_MEGAMOE", "0") == "1"
 
 
+def _kimi_k3_workspace_pool_key(self, fleet_params) -> tuple:
+    """Share one Kimi K3 MegaMoE workspace across a model's MoE layers.
+
+    The key captures everything the workspace bakes in at allocation: device,
+    EP group and size, fleet geometry, quant kind, combine dtype, SiTU
+    constants, input norm and knobs. Per-layer weights are not baked in.
+    """
+    c = self._config
+    return (
+        self.kernel_name(),
+        torch.cuda.current_device(),
+        id(self.ep_comm_group) if self.ep_world_size > 1 else None,
+        self.ep_world_size,
+        fleet_params.num_experts,
+        fleet_params.max_tokens_per_rank,
+        fleet_params.token_hidden_size,
+        c.quant_kind,
+        c.combine_dtype,
+        c.situ_beta,
+        c.situ_linear_beta,
+        c.fast_situ,
+        c.input_norm_const,
+        c.apply_routing_weights_before_fc2,
+        repr(c.knobs),
+        repr(c.finalize_mode),
+    )
+
+
+def _install_kimi_k3_workspace_pool() -> None:
+    """FlashInfer 0.7.5's Kimi K3 MegaMoE backend has no workspace-pool key, so
+    each MoE layer would allocate its own workspace (several GiB each). Give it
+    the key the other MegaMoE backends define, unless it already has one."""
+    try:
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.kimi_k3.backend import (
+            KimiK3MegaKernelBackend,
+        )
+    except ImportError:
+        return
+    if "_workspace_pool_key" not in KimiK3MegaKernelBackend.__dict__:
+        KimiK3MegaKernelBackend._workspace_pool_key = _kimi_k3_workspace_pool_key
+
+
 FlashInferMoeEpKernel = Literal["cutedsl", "deep_gemm"]
 FlashInferMoeEpWeightFormat = Literal["nvfp4", "mxfp4", "fp8_block"]
 _WEIGHT_FORMATS: dict[QuantKey | None, FlashInferMoeEpWeightFormat] = {
@@ -435,6 +477,7 @@ class FlashInferMoeEp:
                     "VLLM_K31_KIMI_MEGAMOE=1 needs FlashInfer with "
                     "Sm100_KimiK3_MegaMoeConfig (>= 0.7.5rc1)"
                 )
+            _install_kimi_k3_workspace_pool()
             nvfp4 = weights.w13_scale.dtype == torch.float8_e4m3fn
             megakernel = api.Sm100_KimiK3_MegaMoeConfig(
                 intermediate_size=moe.intermediate_size,
