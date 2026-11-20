@@ -29,6 +29,7 @@ all-reduces; only accumulation orders differ.
 """
 
 import functools
+import os
 
 import cutlass
 import cutlass.cute as cute
@@ -85,7 +86,8 @@ def wide_batches(batches):
 # 752.0 / 620.2 (8-token units re-read the weights of experts with > 8 tokens); with
 # the sharded front B320 421.9 / 433.4. TRTLLM-Gen needs a finalized output (more rows
 # than the stock deferred-finalize limit, 128).
-ENGINES = "65-320:spec,321-1024:trtllm"
+# Override (runtime A/B): VLLM_K31_WIDE_ENGINES, a "rows:engine,..." table.
+ENGINES = os.environ.get("VLLM_K31_WIDE_ENGINES", "65-320:spec,321-1024:trtllm")
 # Shared expert placement per batch (side stream): "front" from the layer start, beside
 # the front GEMMs; "beside" after routing, beside the spec experts on the SMs their
 # ``BESIDE_GRID`` CTAs leave; "tail" after the experts, beside Finalize and the latent
@@ -395,10 +397,25 @@ class WideMoE:
         for b in state.batches:
             defers = routed.moe_config.should_defer_moe_finalize(b)
             names[b] = engine(b, defers or not monolithic)
+            if experts is None and names[b] == "spec":
+                # No spec routed engine (K31_NVFP4_WIDE): the stock layer serves b.
+                del names[b]
+                continue
             if names[b] == "spec" and self.shared.get(b) == "beside":
                 experts.grids[b] = BESIDE_GRID
         state.reserve(max((b for b, n in names.items() if n == "spec"), default=0))
+        if experts is None:
+            from vllm.logger import init_logger
+
+            init_logger(__name__).info_once(
+                "K31_NVFP4_WIDE: wide trtllm MoE plans for %s (monolithic %s); "
+                "other rows stock",
+                tuple(sorted(names)),
+                monolithic,
+            )
         for b in state.batches:
+            if b not in names:
+                continue
             name = names[b]
             ids, weights = state.ids[:b], state.weights[:b]
             if name == "trtllm":

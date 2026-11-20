@@ -3,6 +3,7 @@
 """The specialized decode executor over the stock Kimi K3 backbone: one routing
 decision per step, then every layer's prepared providers in one loop."""
 
+import os
 from functools import partial
 from typing import Any, NamedTuple
 
@@ -132,6 +133,10 @@ class SpecializedDecode:
         # Steps up to the model's specialized-vs-stock crossover (wider: stock).
         cap = step_cap(config.dsa, config.dcp > 1)
         cap = min(cap, PREPARED_MAX)
+        # K31_NVFP4_WIDE=1 (opt-in, NVFP4 checkpoints): no prepared steps, since
+        # their routed engine is MXFP4-only.
+        if os.environ.get("K31_NVFP4_WIDE") == "1":
+            cap = 0
         batches = {b for b in (*BATCHES, *verify) if b <= cap}
         self.batches, self.q = tuple(sorted(batches)), q
         # Wide verify steps (cap < rows <= ATTENTION_MAX): the stock layer loop with
@@ -305,7 +310,9 @@ class SpecializedDecode:
                 pack_dsa_projection(d.self_attn)
         self.packed = packed
         prefetch = self.prefetch = PrefetchController(self, layers, packed)
-        state = self.moe_state = MoEScratch(tp, device, batches)
+        nvwide = os.environ.get("K31_NVFP4_WIDE") == "1"
+        # K31_NVFP4_WIDE: no prepared steps; the prepared MoE scratch is unused.
+        state = self.moe_state = MoEScratch(tp, device, batches or (1,))
         mailbox, tail_box, moe_layers = (
             OprojMailbox(*owner),
             MoeTailBox(*owner),
@@ -323,10 +330,26 @@ class SpecializedDecode:
         for layer in layers:
             index, module = layer.layer_idx, layer.mlp
             boxes = (mailbox, small_batch, twoshot)
-            self.attention[index] = Attention(layer, self, prefetch, *boxes)
+            kind = attention_kind(layer.self_attn)
+            if not nvwide or (*batches, *self.wide_batches(kind)):
+                # K31_NVFP4_WIDE: kinds with no specialized rows run stock.
+                self.attention[index] = Attention(layer, self, prefetch, *boxes)
             if not layer.is_moe_layer:
                 reduce = all_reduce if module.down_proj.reduce_results else None
                 self.feed_forward[index] = PreparedDenseMLP(module, batches, reduce)
+                continue
+            if nvwide:
+                # No MXFP4 engine: wide trtllm plans (stock routed experts), else stock.
+                self.feed_forward[index] = None
+                if wide_state is not None:
+                    self.wide_moe[index] = WideMoE(
+                        module,
+                        None,
+                        wide_state,
+                        beta,
+                        linear_beta,
+                        packed=packed[index],
+                    )
                 continue
             args = (module, packed[index], front_box, state.front, batches, beta)
             shared = dict(plan=state.plan, counters=state.shared, q=self.q)
@@ -383,6 +406,8 @@ class SpecializedDecode:
                 self.feed_forward[layer.layer_idx].process_weights_after_loading(
                     layer.mlp
                 )
+            if layer.layer_idx not in self.attention:
+                continue  # K31_NVFP4_WIDE: this attention kind runs stock
             core = self.attention[layer.layer_idx].core
             # KDA keeps derived copies; MLA reads the backbone's tensors
             if isinstance(core, PreparedKda):
