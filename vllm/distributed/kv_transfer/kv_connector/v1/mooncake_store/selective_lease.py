@@ -9,6 +9,7 @@ outside a sliding window or states at earlier block boundaries. With
 (`batch_probe_key`) and leases only the keys the hit will load.
 """
 
+import os
 import time
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol, cast
@@ -22,13 +23,34 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.layout import (
 )
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 logger = init_logger(__name__)
 
 # Lease rounds before giving up on a hit whose keys keep being evicted between
 # probe and lease. Only a hit whose lease found every key is returned.
 _LEASE_ROUNDS = 2
+
+
+# Tail-window store of the draft sliding-window group (see worker.py).
+_K31_TAIL_STORE = (
+    os.environ.get("VLLM_DFLASH_SWA_TAIL_HITS", "0") == "1"
+    and os.environ.get("VLLM_DFLASH_SWA_TAIL_STORE", "0") == "1"
+)
+
+
+def _k31_tail_floor(spec, ref_tokens: int | None) -> int | None:
+    if not _K31_TAIL_STORE or ref_tokens is None:
+        return None
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        spec = next(iter(spec.kv_cache_specs.values()))
+    if isinstance(spec, SlidingWindowSpec) and spec.is_draft:
+        return ref_tokens - (spec.sliding_window - 1 + spec.extra_retained_tokens)
+    return None
 
 
 class _LeaseFailedError(Exception):
@@ -93,6 +115,7 @@ class SelectiveLookupLease:
             [set[tuple[int, bytes]]],
             tuple[MooncakeLookupResult, tuple[list[bool], ...]],
         ],
+        num_request_tokens: int | None = None,
     ) -> MooncakeLookupResult:
         """Lease the keys a load of `hit` reads and return the hit to load.
 
@@ -108,7 +131,7 @@ class SelectiveLookupLease:
             for _ in range(_LEASE_ROUNDS):
                 if hit.hit_length <= 0:
                     return hit
-                evicted = self._lease(block_hashes, hit, load_masks)
+                evicted = self._lease(block_hashes, hit, load_masks, num_request_tokens)
                 if not evicted:
                     return hit
                 exists_set = exists_set - evicted
@@ -126,6 +149,7 @@ class SelectiveLookupLease:
         block_hashes: Sequence[BlockHash],
         hit: MooncakeLookupResult,
         load_masks: tuple[list[bool], ...],
+        num_request_tokens: int | None = None,
     ) -> tuple[list[str], list[tuple[int, bytes]]]:
         """Keys a load of `hit` reads, in every rank namespace, and their
         `(group, hash)` pairs.
@@ -143,14 +167,19 @@ class SelectiveLookupLease:
                 continue
             mask = load_masks[g_idx]
             store_block_size = db.store_layout.block_size
+            tail_floor = _k31_tail_floor(
+                self.kv_cache_groups[g_idx].kv_cache_spec, num_request_tokens
+            )
             key_prefixes = self.lookup_key_prefixes[g_idx]
-            for start, _, block_hash in db.process_tokens(
+            for start, end, block_hash in db.process_tokens(
                 hit_length,
                 cast(list[BlockHash], block_hashes),
                 tail_key_boundary=tail_tokens.get(g_idx),
             ):
                 block_index = start // store_block_size
                 if block_index >= len(mask) or not mask[block_index]:
+                    continue
+                if tail_floor is not None and end <= tail_floor:
                     continue
                 hash_hex = block_hash.hex()
                 keys.extend(
@@ -165,6 +194,7 @@ class SelectiveLookupLease:
         block_hashes: Sequence[BlockHash],
         hit: MooncakeLookupResult,
         load_masks: tuple[list[bool], ...],
+        num_request_tokens: int | None = None,
     ) -> set[tuple[int, bytes]]:
         """Lease the keys a load of `hit` reads.
 
@@ -172,7 +202,9 @@ class SelectiveLookupLease:
         `_LeaseFailedError` when the lease RPC fails, including per-key error
         results.
         """
-        keys, key_meta = self.loaded_keys(block_hashes, hit, load_masks)
+        keys, key_meta = self.loaded_keys(
+            block_hashes, hit, load_masks, num_request_tokens
+        )
         if not keys:
             return set()
         start = time.perf_counter()

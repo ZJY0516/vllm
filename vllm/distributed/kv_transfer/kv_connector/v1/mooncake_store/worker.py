@@ -128,6 +128,31 @@ def _k31_draft_swa_reach(spec) -> int | None:
     return None
 
 
+_K31_TAIL_STORE = (
+    _K31_TAIL_LOOKUP and os.environ.get("VLLM_DFLASH_SWA_TAIL_STORE", "0") == "1"
+)
+
+
+def _k31_tail_floor(spec, ref_tokens: int | None) -> int | None:
+    """Draft sliding-window chunks ending at or below the returned token are
+    never read by a hit at or past `ref_tokens` (tail store); None keeps all."""
+    if not _K31_TAIL_STORE or ref_tokens is None:
+        return None
+    reach = _k31_draft_swa_reach(spec)
+    return None if reach is None else ref_tokens - reach
+
+
+def _k31_coord_tail_floor(coord, group_id: int, ref_tokens: int | None) -> int | None:
+    """`_k31_tail_floor` for a Store thread's group, or None when the
+    coordinator does not expose its groups."""
+    if not _K31_TAIL_STORE:
+        return None
+    groups = getattr(coord, "kv_cache_groups", None)
+    if groups is None or group_id >= len(groups):
+        return None
+    return _k31_tail_floor(groups[group_id].kv_cache_spec, ref_tokens)
+
+
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
 _T = TypeVar("_T")
 
@@ -843,10 +868,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
         put_step_rank = (self.tp_rank + group_id) % put_step
         block_size = db.store_layout.block_size
         block_start = (cdiv(num_tokens, block_size) - 1) * block_size
+        tail_floor = _k31_coord_tail_floor(self.coord, group_id, num_tokens)
         for start in range(block_start, num_tokens, db.chunk_size):
             if start // db.chunk_size % put_step != put_step_rank:
                 continue
             end = min(start + db.chunk_size, num_tokens)
+            if tail_floor is not None and end <= tail_floor:
+                continue
             yield block_start, start, end, block_hashes[end // hash_block_size - 1]
 
     def _boundary_puts(
@@ -1121,6 +1149,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 put_step_rank = (self.tp_rank + g_idx) % put_step
                 store_mask = store_masks[g_idx]
                 group_blocks = block_ids_per_group[g_idx]
+                tail_floor = _k31_coord_tail_floor(self.coord, g_idx, replay_boundary)
                 for start, end, block_hash in db.process_tokens(
                     checkpoint_len,
                     req_meta.block_hashes,
@@ -1138,6 +1167,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                             or not store_mask[mask_idx]
                         ):
                             continue
+                    if tail_floor is not None and end <= tail_floor:
+                        continue
                     if block_idx >= len(group_blocks) or (
                         group_blocks[block_idx] == NULL_BLOCK_ID
                     ):
@@ -1491,6 +1522,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             if not self.group_participates[g_idx]:
                 continue
             mask = load_mask_per_group[g_idx]
+            tail_floor = _k31_coord_tail_floor(
+                self.coord, g_idx, req_meta.num_prompt_tokens
+            )
             chunks: list[tuple[int, int]] = []
             store_shard_ids: list[StoreShardId] = []
             for start, end, block_hash in db.process_tokens(
@@ -1500,6 +1534,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             ):
                 block_index = start // db.store_layout.block_size
                 if block_index >= len(mask) or not mask[block_index]:
+                    continue
+                if tail_floor is not None and end <= tail_floor:
                     continue
                 boundary_tokens = (
                     tail_key_boundaries.get(g_idx) if end == token_len else None
@@ -2770,6 +2806,12 @@ class MooncakeStoreWorker:
         # shard, replicated groups one namespace per unique KV head).
         exists_set = set()
         present_tails: list[tuple[int, int]] = []
+        tail_floors = {
+            g: f
+            for g, grp in enumerate(self._kv_cache_groups)
+            if _K31_TAIL_STORE
+            and (f := _k31_tail_floor(grp.kv_cache_spec, num_tokens)) is not None
+        }
         pos = 0
         previous_page = None
         preceding_chunks_present = True
@@ -2785,7 +2827,11 @@ class MooncakeStoreWorker:
             if preceding_chunks_present and present:
                 exists_set.add((g_idx, hash_bytes))
             if end_token % self.token_dbs[g_idx].chunk_size == 0:
-                preceding_chunks_present &= present
+                floor = tail_floors.get(g_idx)
+                # Tail store: chunks below the drafter's window are not stored.
+                preceding_chunks_present &= present or (
+                    floor is not None and end_token <= floor
+                )
             elif present and self._keep_loaded_tail:
                 present_tails.append((g_idx, end_token))
             pos += count
@@ -2802,6 +2848,7 @@ class MooncakeStoreWorker:
                 functools.partial(
                     self._longest_hit, num_tokens, token_len, block_hashes
                 ),
+                num_request_tokens=num_tokens,
             )
         if present_tails and hit.hit_length > 0:
             hit = dataclasses.replace(
