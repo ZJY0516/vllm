@@ -9,6 +9,7 @@ from vllm import _custom_ops as ops
 from vllm import envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
@@ -28,8 +29,9 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
 
+logger = init_logger(__name__)
+
 _K31_CPU1 = os.environ.get("K31_CPU1") == "1"
-_K31_SEEN: list = []
 
 
 def _k31_install_fast_current_stream() -> None:
@@ -411,13 +413,9 @@ class GroupedTopKRouter(BaseRouter):
         ):
             # The compiled grouped_topk takes this branch and only wraps this op.
             grouped_topk_impl = partial(fused_grouped_topk, is_padding=is_padding)
-            if not _K31_SEEN:
-                _K31_SEEN.append(1)
-                from vllm.logger import init_logger
-
-                init_logger(__name__).info(
-                    "K31_CPU1: grouped top-k router calls the fused op directly"
-                )
+            logger.info_once(
+                "K31_CPU1: grouped top-k router calls the fused op directly"
+            )
         else:
             grouped_topk_impl = partial(grouped_topk, is_padding=is_padding)
 
