@@ -1501,11 +1501,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
         # Skip chunks the consumer's per-group spec wouldn't populate
         # locally (e.g. SWA pre-window) even if the producer stored them.
-        # Same request length as the lookup (a fresh prompt on the producer).
+        # Same request length as the lookup: the prompt for a fresh request,
+        # prompt + outputs for one resumed after preemption.
+        lookup_num_tokens = max(
+            req_meta.num_prompt_tokens or 0,
+            req_meta.load_spec.lookup_num_tokens,  # type: ignore[union-attr]
+        )
         load_mask_per_group = self.coord.load_mask(
             req_meta.block_hashes,
             token_len,
-            num_request_tokens=req_meta.num_prompt_tokens,
+            num_request_tokens=lookup_num_tokens or None,
         )
         tail_key_boundaries = {
             boundary.group_id: boundary.num_tokens
@@ -1523,7 +1528,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 continue
             mask = load_mask_per_group[g_idx]
             tail_floor = _k31_coord_tail_floor(
-                self.coord, g_idx, req_meta.num_prompt_tokens
+                self.coord, g_idx, lookup_num_tokens or None
             )
             chunks: list[tuple[int, int]] = []
             store_shard_ids: list[StoreShardId] = []

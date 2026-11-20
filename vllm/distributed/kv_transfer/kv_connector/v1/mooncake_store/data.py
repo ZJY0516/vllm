@@ -232,6 +232,9 @@ class LoadSpec:
     token_len: int = 0
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
     older_tail_boundaries: tuple[TailKeyBoundary, ...] = ()
+    # Request length the lookup was made with; larger than the prompt for a
+    # request resumed after preemption.
+    lookup_num_tokens: int = 0
 
 
 @dataclass

@@ -286,6 +286,7 @@ class MooncakeStoreScheduler:
             can_load=False,
             tail_key_boundaries=lookup_result.tail_key_boundaries,
             older_tail_boundaries=lookup_result.older_tail_boundaries,
+            lookup_num_tokens=request.num_tokens,
         )
 
         return need_to_allocate, self.load_async
