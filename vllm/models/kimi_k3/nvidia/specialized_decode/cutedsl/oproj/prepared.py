@@ -21,7 +21,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from ....specialized_decode.symm import multicast_rendezvous, peer_rendezvous
 from ..common.host import dynamic_fake, dynamic_view, fake, stream, to_cute
-from ..common.policy import batch_table
+from ..common.policy import STEP_CAP, W112, batch_table
 from .consumer import OprojConsumer, OprojFused
 from .producer import OprojProducer, OprojUmma
 
@@ -59,6 +59,10 @@ class OprojMailbox:
 # rows (eight requests at k = 4): decode-step A/B at 131K context, per token, -2.9% /
 # -0.6% at 35 / 40 rows.
 TWOSHOT = {8: "41-64:1", 16: "17-64:1"}
+# K31_W112: TP8 steps of 65-112 rows (the full step past 64 rows) on the two-shot
+# all-reduce too; its buffers then hold STEP_CAP rows (`TwoShot(cap=STEP_CAP)`).
+if W112:
+    TWOSHOT[8] = "41-112:1"
 
 
 def twoshot_batches(tp):
@@ -188,8 +192,12 @@ class PreparedOproj:
             kinds = ("fused",) if fused else ("producer", "consumer")
             twoshot = b in self.twoshots and not fused
             shape = (k, b, tp, nb, delta, mla)
+            # The two-shot buffers hold STEP_CAP rows, the multicast mailbox 64.
+            cap = STEP_CAP if twoshot else 64
             self.codes[b] = tuple(
-                compile_oproj(kind, *shape, publish and kind != "producer", 64, twoshot)
+                compile_oproj(
+                    kind, *shape, publish and kind != "producer", cap, twoshot
+                )
                 for kind in kinds
             )
             if fused:

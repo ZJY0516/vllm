@@ -22,6 +22,16 @@ def _remap_rows():
 
 REMAP_ROWS = _remap_rows()
 
+# K31_W112=1: TP8 verify steps of 65 to W112_ROWS rows run the whole specialized step
+# (o-projection with its all-reduce and AttnRes, MoE front, the wide experts engine
+# publishing into the MoE tail, the shared expert, the tail) instead of the wide step.
+# STEP_CAP: the rows of the step-sized mailboxes and scratch (the most rows such a step
+# takes); every kernel that indexes them is compiled for it. Default off: STEP_CAP 64,
+# every table and buffer as before.
+W112 = os.environ.get("K31_W112") == "1"
+W112_ROWS = 112
+STEP_CAP = W112_ROWS if W112 else 64
+
 
 def batch_table(spec):
     """Per-batch table of integers ("1-2:96,3-8:120"), tuples ("16:64.16.4.8") or names

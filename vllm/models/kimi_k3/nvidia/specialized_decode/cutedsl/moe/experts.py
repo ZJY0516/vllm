@@ -11,6 +11,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int8, Int16, Int32, Int64, Uint8, Uint32, Uint64
 
+from ..common.policy import STEP_CAP
 from ..common.primitives import (
     acquire_tensormap,
     alloc,
@@ -142,9 +143,10 @@ class ExpertsGeometry:
         self.ws_counter = self.ws_partial + 2 * 160 * 8 * 128 * 4
         self.ws_xflag = self.ws_counter + 160 * 4
         self.ws_stage = (self.ws_xflag + 160 * 4 + 255) // 256 * 256
-        # Publish stage rows [64 tokens x 16 slots, 3584] BF16, then grouped: call
-        # counters [160] and unit counts [2], hidden images [2, unit_cap].
-        self.ws_calls = self.ws_stage + 1024 * 3584 * 2
+        # Publish stage rows [STEP_CAP tokens x 16 slots, 3584] BF16 (the MoE tail's
+        # mailbox tokens, `policy.STEP_CAP`), then grouped: call counters [160] and
+        # unit counts [2], hidden images [2, unit_cap].
+        self.ws_calls = self.ws_stage + 16 * STEP_CAP * 3584 * 2
         self.ws_units = self.ws_calls + 1024
         # Pregrouped unit table (``ExpertsGroupKernel``): header (units, call, grouped
         # call), experts [unit_cap], rows [unit_cap, 8].
@@ -761,6 +763,12 @@ class ExpertsKernel(ExpertsGeometry):
             if fc2:
                 lo = cta * self.jobs * count // self.grid
                 hi = (cta + 1) * self.jobs * count // self.grid
+                if cutlass.const_expr(self.steal):  # window 3 reaches the victims
+                    stop = cta + self.victims + 1
+                    if stop > self.grid:
+                        stop = Int32(self.grid)
+                    if group:
+                        hi = stop * self.jobs * count // self.grid
                 first, last = (start + lo // self.jobs, start + (hi - 1) // self.jobs)
             unit = first + tid % 16
             if (lo < hi) & (unit <= last):
@@ -2462,8 +2470,8 @@ class ExpertsKernel(ExpertsGeometry):
     def finalize(self, workspace, weights, batch, box):
         """Each epilogue warp polls (and re-arms) the 16 staged rows of its 64-column
         lines and multicasts their weighted sum into latent slot (parity, rank) of the
-        [3, TP, 64, 3584] mailbox (two-shot: pushes every 8 columns to their owner);
-        lines stride over every CTA's epilogue warps."""
+        [3, TP, STEP_CAP, 3584] mailbox (two-shot: pushes every 8 columns to their
+        owner); lines stride over every CTA's epilogue warps."""
         _, warp, lane, cta = thread()
         for line in range(cta * 8 + warp - 4, batch * 56, self.grid * 8):
             token, column = line // 56, line % 56 * 64
@@ -2490,7 +2498,8 @@ class ExpertsKernel(ExpertsGeometry):
                     push(*box, token, column + 8 * lane, packed)
                 else:
                     mc, parity, rank = box
-                    offset = ((parity * self.tp + rank) * 64 + token) * 3584 + column
+                    offset = (parity * self.tp + rank) * STEP_CAP + token
+                    offset = offset * 3584 + column
                     offset += 8 * lane
                     multicast_words(mc + Int64(offset) * 2, packed)
 

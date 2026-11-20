@@ -59,6 +59,9 @@ from ..common.primitives import (
 from ..gemm.ws_gemm import positive_zero, positive_zero32
 
 GRID, ROWS = 120, 112  # CTAs; CTAs with 64 down rows
+# SharedDown past 64 rows (K31_W112): its shared-memory budget, and the fewest ring
+# stages the whole batch's h image must leave (else the CTAs take two token halves).
+WIDE_DOWN_BUDGET, WIDE_DOWN_STAGES = 224 * 1024, 8
 # With the MoE front rows: the K split by TP and a deeper ring that still fits beside
 # three o-proj consumer CTAs (<= 30 KB each; the kernel launches at the consumer's
 # entry and loads its first ring meanwhile).
@@ -517,20 +520,27 @@ class SharedUmma(SharedBase):
                         total = total + parts[cell * self.n + self.slot(t, j)]
                     rows[(t * 2 + half) * (width + 1) + j] = total
         named_barrier(1, 128)
-        if tid < 2 * batch:
-            t, half = tid // 2, tid % 2
-            row = 64 * f + 32 * half + width * rank
-            values = [rows[tid * (width + 1) + v] for v in range(width)]
-            if row < valid:
-                for v in c.range_constexpr(width // 4):
-                    words = tuple(positive_zero32(values[4 * v + i]) for i in range(4))
-                    offset = t * pitch + 3584 + 2 * (slot + row + 4 * v)
+        # (token, half) items: one per thread up to 64 rows, more past it.
+        for r in c.range_constexpr((2 * batch + 127) // 128):
+            item = tid + 128 * r if r else tid
+            if item < 2 * batch:
+                t, half = item // 2, item % 2
+                row = 64 * f + 32 * half + width * rank
+                values = [rows[item * (width + 1) + v] for v in range(width)]
+                if row < valid:
+                    for v in c.range_constexpr(width // 4):
+                        words = tuple(
+                            positive_zero32(values[4 * v + i]) for i in range(4)
+                        )
+                        offset = t * pitch + 3584 + 2 * (slot + row + 4 * v)
+                        multicast_words(mc + Int64(offset) * 2, words, kind="bf16x2")
+                elif (row >= split) & (row - split < shard):
+                    pairs = range(0, width, 2)
+                    words = tuple(
+                        positive_zero(values[i], values[i + 1]) for i in pairs
+                    )
+                    offset = t * pitch + base + row - split
                     multicast_words(mc + Int64(offset) * 2, words, kind="bf16x2")
-            elif (row >= split) & (row - split < shard):
-                pairs = range(0, width, 2)
-                words = tuple(positive_zero(values[i], values[i + 1]) for i in pairs)
-                offset = t * pitch + base + row - split
-                multicast_words(mc + Int64(offset) * 2, words, kind="bf16x2")
 
 
 class SharedDown(SharedBase):
@@ -542,6 +552,20 @@ class SharedDown(SharedBase):
 
     def __init__(self, tp, batch, sms, budget=200 * 1024):
         super().__init__(tp, batch)
+        # Past 64 rows (K31_W112) h [N, hidden] does not fit beside the ring: the
+        # CTAs take two token halves (`kernel_halves`), the first `rows` tokens and
+        # the rest, `sms` / 2 CTAs each; each CTA stages its half's h once and runs
+        # every `sms` / 2-th tile over it (N = `rows` rounded to 8). Each output
+        # element is the same K-ordered MMA chain as with the whole batch.
+        self.halves, self.rows = 1, batch
+        if batch > 64:
+            budget = WIDE_DOWN_BUDGET
+            ring = budget - self.down * self.n * 128 - self.n * 68 * 4
+            if ring // 8192 < WIDE_DOWN_STAGES:
+                self.halves, self.rows = 2, -(-batch // 2)
+                self.n = (self.rows + 7) // 8 * 8
+                self.columns = max(32, 1 << (self.n - 1).bit_length())
+                assert sms % 2 == 0, sms
         self.sms, self.image = sms, self.down * self.n * 128  # h as B tiles
         ring = budget - self.image - self.n * 68 * 4
         self.stages = min(24, ring // 8192)  # W [64, 64] K blocks (8 KB)
@@ -549,7 +573,115 @@ class SharedDown(SharedBase):
     @cute.jit
     def __call__(self, *args):
         options = dict(pdl=False, min_blocks_per_mp=1)
-        launch(self.kernel, args, self.sms, 192, **options)
+        if c.const_expr(self.halves == 1):
+            launch(self.kernel, args, self.sms, 192, **options)
+        else:
+            launch(self.kernel_halves, args, self.sms, 192, **options)
+
+    @cute.jit
+    def load_half(self, tile, source, column, t0, valid):
+        """`load_rows` of rows [t0, t0 + valid) (valid <= `rows`) into tile rows
+        [0, valid); the tile's later rows are left alone (their columns are never
+        pushed)."""
+        tid, _, _, _ = thread()
+        for i in c.range_constexpr((self.rows * 8 + 127) // 128):
+            item = tid + 128 * i
+            if item < valid * 8:
+                row, chunk = item // 8, item % 8
+                dst = tile + row // 8 * 1024 + row % 8 * 128 + (chunk ^ row % 8) * 16
+                copy_g2s(dst, at(source, t0 + row, column + chunk * 8))
+
+    @cute.jit
+    def push_half(self, mailbox, staging, values, row0, t0, valid):
+        """`push` of the half's `valid` tokens, landing at token rows t0 + t."""
+        peers, parity, rank, capacity = mailbox
+        tid, warp, lane, _ = thread()
+        tile = view(staging, 0, Float32, (self.n, 68), (68, 1))
+        if lane < 16:
+            for t in c.range_constexpr(self.n):
+                tile[t, 16 * warp + lane] = values[t]
+        named_barrier(1, 128)
+        shard: Constexpr = 7168 // self.tp
+        peer, column = row0 // shard, row0 % shard
+        for i in c.range_constexpr((self.n * 8 + 127) // 128):
+            item = tid + 128 * i
+            if item < valid * 8:
+                t, part = item // 8, item % 8
+                reduced = []
+                for half in c.range_constexpr(2):
+                    words = smem_words(at(tile, t, part * 8 + half * 4))
+                    reduced += [bits_float(w) for w in words]
+                packed = tuple(
+                    pack_pair(reduced[2 * v], reduced[2 * v + 1], policy="latent")
+                    for v in range(4)
+                )
+                row = (parity * self.tp + rank) * capacity + t0 + t
+                offset = Int64(row * shard + column + part * 8)
+                store_relaxed(peers[peer] + offset * 2, packed)
+        named_barrier(1, 128)
+
+    @cute.kernel
+    def kernel_halves(self, args):
+        """`kernel` over two token halves: CTA `cta` takes half cta // (sms / 2) and
+        every sms / 2-th tile from cta % (sms / 2)."""
+        h, maps = args[0:2]
+        tid, warp, lane, cta = thread()
+        stages, columns = self.stages, self.columns
+        smem = c.utils.SmemAllocator()
+        image = alloc(smem, c.Uint8, self.image, 1024).iterator
+        ring = alloc(smem, c.Uint8, stages * 8192, 1024).iterator
+        staging = alloc(smem, c.Uint8, self.n * 68 * 4, 16).iterator
+        bars = alloc(smem, c.Uint64, 2 * stages + 5, 8).iterator
+        slot = alloc(smem, Uint32, 1)
+        acc_full, acc_empty, ready = (bars + 2 * stages + i for i in (0, 2, 4))
+        if tid == 0:
+            for s in c.range_constexpr(stages):
+                cute.arch.mbarrier_init(bars + s, 1)
+                cute.arch.mbarrier_init(bars + stages + s, 1)
+            for i in c.range_constexpr(2):
+                cute.arch.mbarrier_init(acc_full + i, 1)
+                cute.arch.mbarrier_init(acc_empty + i, 128)
+            cute.arch.mbarrier_init(ready, 128)
+            cute.arch.mbarrier_init_fence()
+        if warp == 4:
+            cute.arch.alloc_tmem(2 * columns, slot.iterator)
+            cute.arch.relinquish_tmem_alloc_permit()
+        fence_tmem(before=True)
+        cute.arch.sync_threads()
+        fence_tmem()
+        tmem = slot[0]
+        per: Constexpr = self.sms // 2  # CTAs per half
+        half, part = cta // per, cta % per
+        t0 = half * self.rows
+        valid = c.select_(half == 0, Int32(self.rows), Int32(self.batch - self.rows))
+        tiles = (ROWS - part + per - 1) // per
+        if warp < 4:
+            for j in c.range_constexpr(self.down):
+                self.load_half(image + j * self.n * 128, h, 64 * j, t0, valid)
+            cute.arch.cp_async_mbarrier_arrive_noinc(ready)
+            for i in c.range(tiles, unroll=1):
+                wait(acc_full + i % 2, i // 2 % 2, scope="cta")
+                fence_tmem()
+                values = self.accumulated(tmem + Uint32(i % 2 * columns))
+                cute.arch.mbarrier_arrive(acc_empty + i % 2)
+                row0 = 64 * (part + i * per)
+                self.push_half(args[2:6], staging, values, row0, t0, valid)
+        elif warp == 4:
+            self.multiply(image, ring, bars, tmem, tiles)
+        elif lane == 0:
+            down = maps.iterator + 128
+            acquire_tensormap(down)  # in the thread that issues its TMAs
+            for i in c.range(tiles, unroll=1):
+                row0 = 64 * (part + i * per)
+                for j in c.range(self.down, unroll=1):
+                    g = i * self.down + j
+                    s = g % stages
+                    if g >= stages:
+                        wait(bars + stages + s, (g // stages - 1) % 2, scope="cta")
+                    self.load_weight(
+                        ring + s * 8192, down, bars + s, row0, row0 + 32, 64 * j
+                    )
+        release_tmem(tmem, 2 * columns, warp, 4)
 
     @cute.kernel
     def kernel(self, args):

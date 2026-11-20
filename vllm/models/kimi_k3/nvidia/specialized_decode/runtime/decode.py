@@ -24,6 +24,7 @@ from ..cutedsl.attn_res.prepared import (
     statistics_rows,
 )
 from ..cutedsl.common.embedding import PreparedEmbedding
+from ..cutedsl.common.policy import STEP_CAP, W112
 from ..cutedsl.common.twoshot import TwoShot
 from ..cutedsl.kda.prepared import PreparedKda
 from ..cutedsl.moe.dense import PreparedDenseMLP
@@ -129,10 +130,18 @@ class SpecializedDecode:
         # Verify steps decode q tokens per request at M = requests * q tokens; FULL
         # verify graphs round each capture size up to whole requests.
         rounded = {round_up(s, q) for s in config.capture_sizes}
-        verify = {m for m in rounded if m <= PREPARED_MAX}
+        # K31_W112: TP8 verify steps up to STEP_CAP rows also take the full step
+        # (`providers.step_cap`); the layers' attention kinds bound it.
+        limit, present = PREPARED_MAX, None
+        parallel = get_current_vllm_config().parallel_config
+        if W112 and not parallel.enable_expert_parallel:
+            decoders = backbone.layers[backbone.start_layer : backbone.end_layer]
+            present = {attention_kind(d.self_attn) for d in decoders}
+            limit = STEP_CAP
+        verify = {m for m in rounded if m <= limit}
         # Steps up to the model's specialized-vs-stock crossover (wider: stock).
-        cap = step_cap(config.dsa, config.dcp > 1)
-        cap = min(cap, PREPARED_MAX)
+        cap = step_cap(config.dsa, config.dcp > 1, get_tp_group().world_size, present)
+        cap = min(cap, limit)
         # K31_NVFP4_WIDE=1 (opt-in, NVFP4 checkpoints): no prepared steps, since
         # their routed engine is MXFP4-only.
         if os.environ.get("K31_NVFP4_WIDE") == "1":
@@ -211,9 +220,10 @@ class SpecializedDecode:
             (self.final if index == end else self.before[index]).bind_aux()
         self.bind_statistics_ahead(layers)
         empty = partial(torch.empty, device=self.device, dtype=torch.bfloat16)
-        self.hidden = (empty((64, 7168)), empty((64, 7168)))
-        self.prefix = empty((64, 7168))
-        self.blocks = empty((64, backbone.num_attn_res_blocks, 7168))
+        rows = max((PREPARED_MAX, *self.batches))
+        self.hidden = (empty((rows, 7168)), empty((rows, 7168)))
+        self.prefix = empty((rows, 7168))
+        self.blocks = empty((rows, backbone.num_attn_res_blocks, 7168))
 
     def bind_statistics_ahead(self, layers):
         """For the `statistics_rows` of this (TP, DCP), each KDA layer that follows
@@ -318,8 +328,8 @@ class SpecializedDecode:
             MoeTailBox(*owner),
             list(packed),
         )
-        twoshot = TwoShot(*owner)
-        front_box = OprojMailbox(*owner, (1, 64, 3584 + 2 * 896))
+        twoshot = TwoShot(*owner, cap=STEP_CAP)
+        front_box = OprojMailbox(*owner, (1, STEP_CAP, 3584 + 2 * 896))
         small_batch = small_batch_chain.SmallBatchBox(*owner)
         self.attention = {}
         self.feed_forward = {}
@@ -353,6 +363,8 @@ class SpecializedDecode:
                 continue
             args = (module, packed[index], front_box, state.front, batches, beta)
             shared = dict(plan=state.plan, counters=state.shared, q=self.q)
+            if state.wide_experts is not None:  # K31_W112 rows past PREPARED_MAX
+                shared.update(listed=state.wide_experts)
             front = SharedFront(*args, linear_beta, **shared)
             routed = module.experts.routed_experts
             w13, w2 = (
@@ -473,6 +485,8 @@ class SpecializedDecode:
         q = self.q if any(getattr(md, "num_spec_decodes", 0) for md in rows) else 1
         # Wide steps verify (TP8 / TP16); DEP steps also decode one token each.
         if b % q or (wide and q == 1 and not self.dep):
+            return None
+        if q == 1 and b > PREPARED_MAX and not wide:  # K31_W112: verify steps only
             return None
         metadata = [decode_metadata(d.self_attn, context, q, b) for d in self.layers]
         if any(md is None for md in metadata):

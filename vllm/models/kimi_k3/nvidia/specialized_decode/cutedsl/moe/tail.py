@@ -500,8 +500,9 @@ class WaveMoeTail(MoeTail):
         # slice's 28 lane sums, more one sum); per owned line its partials [16 slices,
         # 64] and RS rows [64]; two barriers.
         n, s = self.groups + self.groups % (2 // self.lines), self.slots
-        # Past one group each (warp, slice) row holds the groups' sums, padded to v4.
-        self.padded = -(-self.groups // 4) * 4
+        # Past one group each (warp, slice) row holds the groups' sums, padded to a
+        # power of two of at least four (`scatter_sums` halves them: 4, 8, 16 values).
+        self.padded = max(4, 1 << (self.groups - 1).bit_length())
         self.squares = 3584 if n == 1 else 128 * max(n, self.padded)
         partials = 7680 * n + 4 * self.squares
         self.offsets: tuple = (3584 * n, 7680 * n, partials, partials + 4096 * s)
@@ -708,8 +709,9 @@ class WaveMoeTail(MoeTail):
             wait(bar)
             cute.arch.sync_warp()
             late = (squares, eps)
+        # Warp s % 8 writes owned line s (past 64 rows at TP8 a CTA owns up to 14).
         for s in cutlass.range_constexpr(self.slots):
-            if owns(s) & (warp == s):
+            if owns(s) & (warp == s % 8):
                 self.write_line(owned[s], bar, output_mc, line, s, late)
         if cutlass.const_expr(not self.early):
             cute.arch.griddepcontrol_launch_dependents()

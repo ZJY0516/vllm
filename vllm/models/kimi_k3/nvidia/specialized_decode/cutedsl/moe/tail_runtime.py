@@ -20,14 +20,14 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8
 from cutlass.cute.runtime import make_fake_stream
 
 from ..common.host import fake, prepare_shared_carveout, stream, tensor_maps, to_cute
-from ..common.policy import batch_table
+from ..common.policy import STEP_CAP, W112, batch_table
 from ..common.twoshot import TwoShot
 from ..oproj.prepared import OprojMailbox
 from .tail import MoeTail, WaveMoeTail, WaveMoeTailExact
 
 # MoE tail mailbox tokens (padded decode batches); small-batch front_poll G/W/S rows per
 # parity.
-CAP, POLL_CAP = 64, 8
+CAP, POLL_CAP = STEP_CAP, 8
 # Two-shot latent all-reduce batches per TP (B9+): 2-/4-node GB300, us/layer of RS push
 # + experts + WaveMoeTail, max over ranks, multicast vs two-shot: TP8 B16 41.74/42.80,
 # B32 52.20/53.18, B64 79.27/81.50; TP16 B16 33.98/34.49, B32 42.19/42.52, B64
@@ -43,6 +43,10 @@ EARLY = {8: "1-64:1", 16: "9-64:1"}
 # mma.sync vs tcgen05, B16/32/64: TP8 4.53/5.80/9.05 vs 4.45/5.26/7.80, TP16 two-shot
 # 4.50/5.39/7.75 vs 4.52/5.46/7.21).
 UMMA = {8: "9-64:1", 16: "33-64:1"}
+# K31_W112: the TP8 full step's 65-112 rows run the published tcgen05 tail too,
+# releasing the next AttnRes at entry.
+if W112:
+    UMMA[8], EARLY[8] = "9-112:1", "1-112:1"
 # Front-mode MoeTail batches per (TP size, DCP size). TAIL_GATE: one CTA barrier
 # between the CTA's front tasks (routed finalize, shared-shard stores) and its
 # latent/RS poll. POLL_NS: the latent/RS poll's sleep between rounds, ns (absent:

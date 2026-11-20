@@ -59,9 +59,15 @@ class PreparedDenseMLP:
         self.scalars = tuple(map(cutlass.Float32, (mlp.act_fn.beta, linear)))
         if padded != hidden:
             down = torch.nn.functional.pad(down.detach(), (0, padded - hidden))
-        self.gates = gate_up.new_empty((64, 2 * hidden))
-        self.hidden_rows = gate_up.new_empty((64, padded))
-        tile = {b: next(n for n in (8, 16, 32, 64) if b <= n) for b in batches}
+        rows = max((64, *batches))
+        self.gates = gate_up.new_empty((rows, 2 * hidden))
+        self.hidden_rows = gate_up.new_empty((rows, padded))
+        # Past 64 rows (K31_W112 full steps): cuBLAS gate/up and down around the same
+        # SiTU kernel.
+        self.wide = frozenset(b for b in batches if b > 64)
+        tile = {
+            b: next(n for n in (8, 16, 32, 64) if b <= n) for b in batches if b <= 64
+        }
         up_tiles = {8: (64, 8, 4, 8), 16: (64, 16, 2, 8), 32: (64, 32, 2, 8)}
         up_tiles[64] = (64, 64, 2, 5)
         down_tiles = {8: (128, 8, 1, 6), 16: (128, 16, 1, 6), 32: (128, 32, 1, 5)}
@@ -81,10 +87,17 @@ class PreparedDenseMLP:
 
     def run(self, x, out):
         gate, hidden = self.gates[: x.shape[0]], self.hidden_rows[: x.shape[0]]
-        self.gate.run(x, gate)
+        wide = x.shape[0] in self.wide
+        if wide:
+            torch.mm(x, self.gate.weight.t(), out=gate)
+        else:
+            self.gate.run(x, gate)
         views = (dynamic_view(gate), dynamic_view(hidden))
         self.activation(*views, *self.scalars, stream(self.device))
-        self.down.run(hidden, out)
+        if wide:
+            torch.mm(hidden, self.down.weight.t(), out=out)
+        else:
+            self.down.run(hidden, out)
         if self.reduce is not None:
             reduced = self.reduce(out)
             if reduced.data_ptr() != out.data_ptr():

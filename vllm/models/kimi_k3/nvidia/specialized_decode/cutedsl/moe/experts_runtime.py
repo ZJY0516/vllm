@@ -16,7 +16,7 @@ import torch
 from cutlass.cute.runtime import make_fake_stream
 
 from ..common.host import check_residency, fake, stream, tensor_maps, to_cute
-from ..common.policy import batch_table
+from ..common.policy import STEP_CAP, W112, batch_table
 from .experts import (
     LIST_WORDS,
     PREFETCH_ROWS,
@@ -66,6 +66,12 @@ def stealing(batch):
 
 
 STEAL = "9-64:1"
+# K31_W112 (`policy.W112`): the full step's 65-112 rows (the wide listed engine)
+# balance their FC2(B) tail by claims too (`ExpertsKernel.list_windows` gives window 3
+# the victims' units). A stolen grain is computed exactly as by its owner.
+# K31_W112_STEAL=0 keeps them static.
+if W112 and os.environ.get("K31_W112_STEAL", "1") == "1":
+    STEAL = "9-112:1"
 
 
 def static(batch):
@@ -139,7 +145,8 @@ def compile_experts(tp, experts, batch, grid, device, publish=False, *knobs):
     flat = lambda n, dtype=c.Uint8, align=16: fake((n,), (1,), dtype, align)
     box = (c.Int64(0), c.Int32(0), c.Int32(0)) if publish else ()
     if publish == "twoshot":  # receive slots, owners' bases, parity x TP + rank
-        box = (fake((3 * tp, 64, 3584 // tp)), fake((tp,), None, c.Int64), c.Int32(0))
+        recv = fake((3 * tp, STEP_CAP, 3584 // tp))
+        box = (recv, fake((tp,), None, c.Int64), c.Int32(0))
     x, ids = fake((batch, 3584), (3584, 1)), flat(batch * 16, c.Int32)
     ids = flat(LIST_WORDS, c.Int32) if moe.listed else ids  # the routing lists
     x = flat(plan_bytes(moe.plan_rows)) if moe.grouped else x  # grouped: MXFP8 plan

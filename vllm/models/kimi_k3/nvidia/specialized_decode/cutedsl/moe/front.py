@@ -15,7 +15,7 @@ from cutlass.cute.runtime import make_fake_stream
 
 from ..common.host import fake, stream, to_cute
 from ..common.mailbox import poll, rearm
-from ..common.policy import batch_table
+from ..common.policy import STEP_CAP, W112, batch_table
 from ..common.primitives import (
     alloc,
     asm,
@@ -414,6 +414,24 @@ SHARED_TACTICS = {
         "1-8:128.8.1.3,9-16:64.16.1.3,17-32:64.32.1.3,33-64:64.64.1.3",
     ),
 }
+# K31_W112: TP8 rows 65-112 (the full step past 64 rows) take the 33-64 rows' shape:
+# the fused shared expert, split (its down rows on SharedDown beside the routed
+# experts), with the MoE front rows merged into the gate/up kernel. Their routing is
+# the wide engine's (`SharedFront` `listed`). The split-K tactics are only the tables'
+# completion (those rows never run the split-K chain). SharedDown SMs (taken from the
+# routed experts' grid): 65-88 rows the whole batch on three SMs; 89-112 rows two
+# token halves on two SMs each (`shared.SharedDown`). K31_W112_SD=<table> overrides
+# (rows that run halves need an even SM count).
+W112_SD = os.environ.get("K31_W112_SD", "65-88:3,89-112:4")
+if W112:
+    FUSED = "9-112:1"
+    SPLIT += "," + W112_SD
+    SPLITS[8] = tuple(table + "," + W112_SD for table in SPLITS[8])
+    MERGED[8] = "33-112:1"
+    SHARED_TACTICS[768] = (
+        SHARED_TACTICS[768][0] + ",65-112:64.64.4.5",
+        SHARED_TACTICS[768][1] + ",65-112:64.64.1.6",
+    )
 
 
 @functools.cache
@@ -445,14 +463,20 @@ def front_geometry(batch, n, ks, kb=None, tg=None, rt=None, ch=None):
 
 @functools.cache
 def compile_route(
-    batch, shared, renorm, roles, device, polled=False, plan=False, early=None
+    batch, shared, renorm, roles, device, polled=False, plan=False, early=None,
+    rows=64,
 ):  # fmt: skip
-    """`early` (default: B<=2) releases the persistent experts at entry."""
+    """`early` (default: B<=2) releases the persistent experts at entry; `rows`: the
+    front mailbox's rows."""
     early = batch <= 2 if early is None else early
     kernel = RouteSitu(batch, shared, renorm, early, roles, polled, plan)
     f32 = c.Float32
     args: tuple = (fake((batch, 896), None, f32), fake((896,), None, f32))
-    args += (fake((batch, 16), None, c.Int32), fake((batch, 16)), fake((1, 64, WIDTH)))
+    args += (
+        fake((batch, 16), None, c.Int32),
+        fake((batch, 16)),
+        fake((1, rows, WIDTH)),
+    )
     args += (fake((batch, 3584)), fake((batch, 2 * shared), None, f32))
     args += (fake((batch, shared)), *(f32(v) for v in (1, 4, 25)))
     args += (fake((PLAN_BYTES,), None, c.Uint8),) * plan + (make_fake_stream(),)
@@ -461,11 +485,12 @@ def compile_route(
 
 
 @functools.cache
-def compile_publish(n, split, valid, batch, device, ks, geometry=None):
-    """Front GEMM that only publishes; routing then runs in the polled kernel."""
+def compile_publish(n, split, valid, batch, device, ks, geometry=None, rows=64):
+    """Front GEMM that only publishes; routing then runs in the polled kernel.
+    `rows`: the front mailbox's rows."""
     rt, kq, staged, tg, ch = geometry or front_geometry(batch, n, ks)
     kernel = WsGemm(n, 7168, batch, rt, kq, staged, split, valid, ks, tg, ch)
-    args: tuple = (fake((batch, 7168)), fake((n, 7168)), fake((1, 64, WIDTH)))
+    args: tuple = (fake((batch, 7168)), fake((n, 7168)), fake((1, rows, WIDTH)))
     args += (c.Int64(0), c.Int32(0), c.Int32(0), fake((batch, 896), None, c.Float32))
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args, make_fake_stream())
@@ -474,11 +499,14 @@ def compile_publish(n, split, valid, batch, device, ks, geometry=None):
 class SharedFront:
     def __init__(
         self, moe, packed, box, storage, batches, beta, linear_beta, plan=None,
-        counters=None, q=1,
+        counters=None, q=1, listed=None,
     ):  # fmt: skip
         """`plan`: the experts' plan buffer, written by the routing kernel at B>8;
         `counters`: the fused shared expert's model-owned barrier counters; `q`: the
-        deployment's verify length (its SPLITS entries)."""
+        deployment's verify length (its SPLITS entries); `listed` (K31_W112): the
+        wide experts' buffers (workspace, plan, routing lists) of the batches past
+        64 rows, which route with `wide.WideRouteSharded` from the front mailbox
+        (top16, the experts' routing lists and their wide MXFP8 plan)."""
         experts = moe.shared_experts
         gate_up, down = experts.gate_up_proj.weight, experts.down_proj.weight
         self.shared = shared = gate_up.shape[0] // 2
@@ -523,17 +551,38 @@ class SharedFront:
         push = batch_table(DOWN_PUSH[tp])
         pushed = [b for b in batches if push.get(b) and b not in fused]
         self.pushed = {b: self.down.push_kernel(b, tp) for b in pushed}
+        # K31_W112 batches past 64 rows (merged): (routing kernel, its arguments,
+        # the routing lists the experts take in place of the ids).
+        self.listed: dict[int, tuple] = {}
+        rows = box.buffer.shape[1]  # the front mailbox's rows (STEP_CAP)
         for b in batches:
             views = tuple(t[:b] for t in storage)
             logits, gate, ids, weights, h, _, latent = map(to_cute, views)
-            front = compile_publish(n, n - shard, valid, b, dev, front_ks(b, n))
+            if listed is not None and b > 64 and b in self.merged:
+                from .wide import compile_sharded_route
+
+                route = compile_sharded_route(b, renorm, tp, dev, rows)
+                wide = (listed["plan"], listed["lists"], listed["workspace"])
+                tail = (*map(to_cute, wide), self.scalars[0])
+                work = (self.box[0], bias, ids, weights, *tail)
+                self.listed[b] = route, work, listed["lists"]
+                args = (logits, bias, ids, weights, self.box[0], latent, gate, h)
+                gate = compile_shared(tp, b, dev, True, geometry)
+                code = gate, compile_down(tp, b, dev, self.split[b])
+                self.plans[b] = views, None, None, None, args + self.scalars, (), code
+                continue
+            front = compile_publish(
+                n, n - shard, valid, b, dev, front_ks(b, n), rows=STEP_CAP
+            )
             planned = plan is not None and b > 8
             roles = (True, True, False)
             released = b in self.early or b in release or None
             route = compile_route(
-                b, shared, renorm, roles, dev, True, planned, released
+                b, shared, renorm, roles, dev, True, planned, released, STEP_CAP
             )
-            situ = compile_route(b, shared, renorm, (False, False, True), dev)
+            situ = compile_route(
+                b, shared, renorm, (False, False, True), dev, rows=STEP_CAP
+            )
             args = (logits, bias, ids, weights, self.box[0], latent, gate, h)
             extra = (to_cute(plan),) if planned else ()
             code = None
@@ -560,6 +609,10 @@ class SharedFront:
             code[0](*work, s)
         else:
             front(to_cute(x), self.packed, *self.box, args[0], s)
+        if x.shape[0] in self.listed:  # the wide routing; the experts take the lists
+            sharded, routing, lists = self.listed[x.shape[0]]
+            sharded(*routing, s)
+            return lists, views[3], views[6]
         route(*args, *extra, s)
         return views[2], views[3], views[6]
 
@@ -567,7 +620,7 @@ class SharedFront:
         return batch in self.merged
 
     def planned(self, batch):
-        return bool(self.plans[batch][5])
+        return batch in self.listed or bool(self.plans[batch][5])
 
     def gated(self, batch):
         """`EARLY_ROUTE` batches: their split-K shared expert runs on the urgent

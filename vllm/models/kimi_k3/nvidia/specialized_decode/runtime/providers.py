@@ -13,6 +13,7 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     trtllm_gen_query_heads,
 )
 
+from ..cutedsl.common.policy import W112, W112_ROWS
 from ..cutedsl.dsa.attn_ds import TOPK
 from ..cutedsl.dsa.index import DIM, HEADS
 from ..cutedsl.dsa.prepared import QUERY_HEADS, PreparedDsa, dsa_on_flashinfer
@@ -89,12 +90,17 @@ WIDE_ROWS = {
 }
 
 
-def step_cap(dsa: bool, dcp: bool) -> int:
+def step_cap(dsa: bool, dcp: bool, tp: int = 0, present=None) -> int:
     """The most rows a specialized decode step takes: the crossover of every
     attention layer kind of the model (K3: MLA; K3.1: MLA and DSA), within what the
-    step's providers serve (PREPARED_MAX)."""
+    step's providers serve (PREPARED_MAX). K31_W112 (`policy.W112`): a TP8 model
+    whose layers (`present`: their attention kinds) include no MLA-kind layer serves
+    up to W112_ROWS."""
     kinds = ("mla", "dsa") if dsa else ("mla",)
-    return min(PREPARED_MAX, *(SPECIALIZED_ROWS[kind, dcp] for kind in kinds))
+    cap = PREPARED_MAX
+    if W112 and tp == 8 and present is not None and "mla" not in present:
+        kinds, cap = tuple(k for k in kinds if k in present), W112_ROWS
+    return min((cap, *(SPECIALIZED_ROWS[kind, dcp] for kind in kinds)))
 
 
 def wide_caps(dcp: bool, recoverssm: bool = False) -> dict[str, int]:
@@ -194,7 +200,10 @@ class Attention:
             self.core = PreparedDsa(attention, pitches, rows, **policy)
         elif kind == "kda":
             mode = lambda b: (1 if b == 1 else 2 if b <= 8 else 0) if tp == 8 else 0
-            policies = {b: (pitch, mode(b)) for b in runtime.batches}
+            # Plain decode steps (q = 1) take the full step up to PREPARED_MAX rows.
+            policies = {
+                b: (pitch, mode(b)) for b in runtime.batches if b <= PREPARED_MAX
+            }
             q = runtime.q  # verify steps: B requests x q tokens (wide steps: verify)
             verify = [b // q for b in batches if q > 1 and b % q == 0]
             policies.update({(b, q): (pitch, int(tp == 8)) for b in verify})
@@ -383,7 +392,7 @@ def dcp_box(runtime, heads, dsa=False, flashinfer=False, partials="default"):
         # if WIDE_ROWS ever widens MLA).
         kind = "dsa" if dsa else "mla"
         wide = runtime.wide_batches(kind)
-        cap = max(PREPARED_MAX, *runtime.batches, *wide)
+        cap = max((PREPARED_MAX, *runtime.batches, *wide))
         if cap > ATTENTION_MAX:
             raise ValueError(f"DCP mailboxes of {cap} rows: at most {ATTENTION_MAX}")
         box = DcpBox(

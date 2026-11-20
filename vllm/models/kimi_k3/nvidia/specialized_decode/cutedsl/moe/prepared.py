@@ -38,9 +38,15 @@ class MoEScratch:
             # The experts' plan (MXFP8 x), written by the routing kernel at B>8.
             self.plan = self.experts["plan"]
             self.shared = shared_scratch(self.device)  # fused shared-expert counters
+            # K31_W112 batches past 64 rows: the wide experts engine's own workspace,
+            # plan and routing lists (never shared with the B <= 64 engines).
+            self.wide_experts = None
+            if any(b > 64 for b in batches):
+                self.wide_experts = expert_scratch(tp, self.device, wide=True)
         self.views = {}
         for b in batches:
-            self.views[b] = (self.latent[:b], self.expanded[: b * 16], self.experts)
+            experts = self.experts if b <= 64 else self.wide_experts
+            self.views[b] = (self.latent[:b], self.expanded[: b * 16], experts)
 
     def join(self):
         """The main stream waits for the urgent side stream (once per step)."""
@@ -81,7 +87,9 @@ class PreparedMoE:
             twoshot = b in tail.twoshots
             table = None if prefetch is None else prefetch.ahead(layer_idx, b)
             args = (b, buffers, expanded, publish, planned, twoshot, True)
-            experts.prepare(*args, ahead=table is not None)
+            # K31_W112 batches past 64 rows: the wide engine over the routing lists.
+            listed = b in front.listed
+            experts.prepare(*args, ahead=table is not None, listed=listed)
             if table is not None and experts.ahead[b]:
                 self.ahead[b] = table
 
@@ -104,7 +112,8 @@ class PreparedMoE:
                 shared, beside = self.front.shared_expert(x, self.tail)
                 beside()
                 state.shared_done.record(state.stream)
-            self.experts.group(ids)
+            if b not in self.front.listed:  # listed: `ids` are the routing lists
+                self.experts.group(ids)
             return self.finish(b, out, latent, ids, weights, shared, consume)
         state.begin.record(main)
         side = state.urgent if self.front.gated(b) else state.stream
