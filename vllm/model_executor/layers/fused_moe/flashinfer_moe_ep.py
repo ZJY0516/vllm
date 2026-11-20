@@ -47,8 +47,9 @@ def _kimi_k3_workspace_pool_key(self, fleet_params) -> tuple:
     """Share one Kimi K3 MegaMoE workspace across a model's MoE layers.
 
     The key captures everything the workspace bakes in at allocation: device,
-    EP group and size, fleet geometry, quant kind, combine dtype, SiTU
-    constants, input norm and knobs. Per-layer weights are not baked in.
+    EP group and size, fleet geometry, intermediate size and top-k, quant kind,
+    combine dtype, SiTU constants, input norm and knobs. Per-layer weights are
+    not baked in.
     """
     c = self._config
     return (
@@ -59,6 +60,8 @@ def _kimi_k3_workspace_pool_key(self, fleet_params) -> tuple:
         fleet_params.num_experts,
         fleet_params.max_tokens_per_rank,
         fleet_params.token_hidden_size,
+        c.intermediate_size,
+        c.top_k,
         c.quant_kind,
         c.combine_dtype,
         c.situ_beta,
