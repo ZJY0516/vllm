@@ -47,6 +47,8 @@ _supported_weight_quant_schemes: frozenset[QuantKey] = frozenset(
     (kNvfp4Static, kMxfp4Static, kFp8Static128BlockSym)
 )
 
+# SiTU is accepted here; flashinfer_moe_ep_unsupported_reasons limits it to the
+# NVFP4 CuTeDSL kernel and the Kimi K3 MegaMoE provider (VLLM_K31_KIMI_MEGAMOE=1).
 _supported_activations: frozenset[MoEActivation] = frozenset(
     (MoEActivation.SILU, MoEActivation.SITU)
 )

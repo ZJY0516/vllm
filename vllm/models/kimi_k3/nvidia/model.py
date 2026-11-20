@@ -3,6 +3,7 @@
 """Kimi-K3 multimodal model implementation for vLLM."""
 
 import math
+import os
 from collections.abc import Hashable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -774,7 +775,15 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % config.moe_layer_freq == 0
         )
 
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        # The FlashInfer Kimi K3 MegaMoE (VLLM_K31_KIMI_MEGAMOE=1, opt-in) also takes
+        # sequence-parallel MoE inputs, like DeepGEMM MegaMoE.
+        use_mega_moe = (
+            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+            or (
+                os.environ.get("VLLM_K31_KIMI_MEGAMOE", "0") == "1"
+                and vllm_config.kernel_config.moe_backend == "flashinfer_moe_ep_cutedsl"
+            )
+        )
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel
@@ -1052,7 +1061,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
         parallel_config = vllm_config.parallel_config
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        # The FlashInfer Kimi K3 MegaMoE (VLLM_K31_KIMI_MEGAMOE=1, opt-in) also takes
+        # sequence-parallel MoE inputs, like DeepGEMM MegaMoE.
+        use_mega_moe = (
+            vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+            or (
+                os.environ.get("VLLM_K31_KIMI_MEGAMOE", "0") == "1"
+                and vllm_config.kernel_config.moe_backend == "flashinfer_moe_ep_cutedsl"
+            )
+        )
         self.use_sequence_parallel = (
             parallel_config.pipeline_parallel_size == 1
             and parallel_config.enable_expert_parallel

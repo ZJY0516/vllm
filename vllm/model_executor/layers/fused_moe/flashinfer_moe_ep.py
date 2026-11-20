@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -33,6 +34,14 @@ from vllm.utils.deep_gemm import _import_deep_gemm
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+
+# VLLM_K31_KIMI_MEGAMOE=1 (opt-in): run SiTU (Kimi K3/K3.1) routed experts on the
+# FlashInfer >= 0.7.5 Kimi K3 MegaMoE provider (`Sm100_KimiK3_MegaMoeConfig`) with
+# the checkpoint's packed weights (MXFP4 x MXFP8 or NVFP4).
+def _kimi_k3_megamoe_enabled() -> bool:
+    return os.environ.get("VLLM_K31_KIMI_MEGAMOE", "0") == "1"
+
 
 FlashInferMoeEpKernel = Literal["cutedsl", "deep_gemm"]
 FlashInferMoeEpWeightFormat = Literal["nvfp4", "mxfp4", "fp8_block"]
@@ -167,12 +176,20 @@ def flashinfer_moe_ep_unsupported_reasons(
         unsupported.append("expert bias")
     if moe.swiglu_alpha is not None or moe.swiglu_beta is not None:
         unsupported.append("custom SwiGLU alpha or beta")
-    # SiTU is passed to the NVFP4 CuTeDSL megakernel only; the other kernel
-    # configs are built without it.
-    if moe.activation == MoEActivation.SITU and (
-        spec.kernel != "cutedsl" or weight_format != "nvfp4"
+    # SiTU is passed to the NVFP4 CuTeDSL megakernel, and to the Kimi K3
+    # MegaMoE provider (VLLM_K31_KIMI_MEGAMOE=1) for NVFP4 or MXFP4 weights;
+    # the other kernel configs are built without it.
+    if moe.activation == MoEActivation.SITU and not (
+        spec.kernel == "cutedsl"
+        and (
+            weight_format == "nvfp4"
+            or (weight_format == "mxfp4" and _kimi_k3_megamoe_enabled())
+        )
     ):
-        unsupported.append("SiTU activation outside the NVFP4 CuTeDSL kernel")
+        unsupported.append(
+            "SiTU activation outside the NVFP4 CuTeDSL kernel and the Kimi K3 "
+            "MegaMoE provider"
+        )
     if (
         spec.kernel == "deep_gemm"
         and moe.routing_method is not RoutingMethodType.DeepseekV4
@@ -258,7 +275,8 @@ def mxfp4_moe_ep_weights(
     w2_scale: torch.Tensor,
 ) -> FlashInferMoeEpWeights:
     spec = flashinfer_moe_ep_backend_spec(moe_backend)
-    if spec.kernel == "deep_gemm":
+    if spec.kernel == "deep_gemm" or _kimi_k3_megamoe_enabled():
+        # The Kimi K3 MegaMoE provider takes the packed MXFP4 data and E8M0 scales.
         return FlashInferMoeEpWeights(w13, w2, w13_scale, w2_scale)
     return FlashInferMoeEpWeights(
         w13=_dequant_mxfp4_experts(w13, w13_scale),
@@ -347,6 +365,11 @@ class _FlashInferMoeEpApi:
         self.MoEWeightPack = MoEWeightPack
         self.Nvfp4CutedslMegaMoeConfig = Nvfp4CutedslMegaMoeConfig
         self.Sm90PullFp8MegaMoeConfig = Sm90PullFp8MegaMoeConfig
+        try:
+            from flashinfer.moe_ep import Sm100_KimiK3_MegaMoeConfig
+        except ImportError:
+            Sm100_KimiK3_MegaMoeConfig = None
+        self.Sm100_KimiK3_MegaMoeConfig = Sm100_KimiK3_MegaMoeConfig
 
 
 def _load_flashinfer_moe_ep_api() -> _FlashInferMoeEpApi:
@@ -385,9 +408,18 @@ class FlashInferMoeEp:
             process_group=ep_group.device_group,
             device=torch.accelerator.current_device_index(),
         )
+        max_tokens_per_rank = moe.max_num_tokens
+        if spec.kernel == "cutedsl" and self._use_kimi_k3(moe, weights):
+            # Sequence-parallel prefill hands each rank 1/TP of a step's tokens;
+            # the Kimi workspace is sized by this capacity (13.45 GiB at 16384),
+            # so cap it (VLLM_K31_KIMI_MEGAMOE_CAPACITY).
+            max_tokens_per_rank = min(
+                moe.max_num_tokens,
+                int(os.environ.get("VLLM_K31_KIMI_MEGAMOE_CAPACITY", "4096")),
+            )
         fleet_params = api.FleetParams(
             num_experts=moe.num_experts,
-            max_tokens_per_rank=moe.max_num_tokens,
+            max_tokens_per_rank=max_tokens_per_rank,
             token_hidden_size=moe.hidden_dim,
         )
         if block_fp8:
@@ -396,6 +428,28 @@ class FlashInferMoeEp:
                 top_k=moe.experts_per_token,
                 fp8_scale_mode="blockwise",
                 gate_up_clamp=moe.swiglu_limit,
+            )
+        elif spec.kernel == "cutedsl" and self._use_kimi_k3(moe, weights):
+            if api.Sm100_KimiK3_MegaMoeConfig is None:
+                raise RuntimeError(
+                    "VLLM_K31_KIMI_MEGAMOE=1 needs FlashInfer with "
+                    "Sm100_KimiK3_MegaMoeConfig (>= 0.7.5rc1)"
+                )
+            nvfp4 = weights.w13_scale.dtype == torch.float8_e4m3fn
+            megakernel = api.Sm100_KimiK3_MegaMoeConfig(
+                intermediate_size=moe.intermediate_size,
+                top_k=moe.experts_per_token,
+                quant_kind="nvfp4" if nvfp4 else "mxfp4_mxfp8",
+                combine_dtype=os.environ.get("VLLM_K31_KIMI_MEGAMOE_COMBINE", "bf16"),
+                activation="situ",
+                situ_beta=moe.activation_situ_beta,
+                situ_linear_beta=moe.activation_situ_linear_beta,
+                apply_routing_weights_before_fc2=apply_topk_in_fc1,
+                input_norm_const=(
+                    float(epilogue.input_norm_const)
+                    if nvfp4 and epilogue.input_norm_const is not None
+                    else 1.0
+                ),
             )
         elif spec.kernel == "cutedsl":
             # In-kernel fc2 reduce keeps its default (off); FlashInfer 0.7.1rc1
@@ -477,12 +531,23 @@ class FlashInferMoeEp:
             ]
         self._device = weights.w13.device
         self._hidden_size = moe.hidden_dim
-        self._max_num_tokens = moe.max_num_tokens
+        self._max_num_tokens = max_tokens_per_rank
         self._num_experts = moe.num_experts
         self._top_k = moe.experts_per_token
         self._epilogue: FlashInferMoeEpEpilogue | None = epilogue
         self._return_workspace_view = moe.routing_method is RoutingMethodType.DeepseekV4
         self._block_fp8 = block_fp8
+
+    @staticmethod
+    def _use_kimi_k3(moe: FusedMoEConfig, weights: FlashInferMoeEpWeights) -> bool:
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+        return (
+            _kimi_k3_megamoe_enabled()
+            and moe.activation == MoEActivation.SITU
+            and weights.w13_scale is not None
+            and weights.w13.dtype == torch.uint8
+        )
 
     @property
     def can_overlap_shared_experts(self) -> bool:
@@ -590,10 +655,17 @@ class FlashInferMoeEp:
         """
         if self._mega_layer is None:
             raise RuntimeError("FlashInfer MoE-EP layer was destroyed")
+        transformed = self._mega_layer._transformed
+        if hasattr(transformed, "quant_kind"):
+            # Kimi K3 MegaMoE keeps its own interleaved weights and swizzled scales.
+            return (
+                transformed.w13,
+                transformed.w13_scale,
+                transformed.w2,
+                transformed.w2_scale,
+            )
         # The SM90 FP8 legs carry two (unused in blockwise mode) dequant scales.
-        (fc1_weight, fc1_sf, *_), (fc2_weight, fc2_sf, *_) = (
-            self._mega_layer._transformed
-        )
+        (fc1_weight, fc1_sf, *_), (fc2_weight, fc2_sf, *_) = transformed
         # Block-FP8 weights keep their dtype, so the layer holds the kernel's
         # FP8 runtime layout that preprocessed-weight loading rebuilds from.
         as_bytes = not self._block_fp8
