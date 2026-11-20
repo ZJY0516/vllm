@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 
 import torch
 
@@ -223,6 +224,11 @@ def _flashinfer_mxfp8_quantize():
     if current_platform.has_device_capability(100) and has_flashinfer():
         from flashinfer import mxfp8_quantize
 
+        if os.environ.get("K31_CPU1") == "1":
+            # Opt-in: skip the API wrappers (logging, backend checks) per call.
+            import inspect
+
+            return inspect.unwrap(mxfp8_quantize)
         return mxfp8_quantize
     return None
 

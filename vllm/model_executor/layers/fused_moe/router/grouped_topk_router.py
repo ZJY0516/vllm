@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from functools import partial
 
 import torch
@@ -26,6 +27,49 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
+
+_K31_CPU1 = os.environ.get("K31_CPU1") == "1"
+_K31_SEEN: list = []
+
+
+def _k31_install_fast_current_stream() -> None:
+    """K31_CPU1=1 (opt-in): torch.cuda.current_stream() and
+    _get_device_index(None, True) for the current device without the generic
+    device-module lookups (same values); other arguments go to torch."""
+    import torch.cuda as tc
+
+    if getattr(tc, "_k31_fast_stream", False):
+        return
+    get_dev = torch._C._cuda_getDevice
+    get_cur = torch._C._cuda_getCurrentStream
+    stream_cls = tc.Stream
+    lazy_init = tc._lazy_init
+    orig_current_stream = tc.current_stream
+    orig_get_device_index = tc._get_device_index
+
+    def current_stream(device=None):
+        lazy_init()
+        if device is None:
+            idx = get_dev()
+        elif type(device) is int:
+            idx = device
+        else:
+            return orig_current_stream(device)
+        sd = get_cur(idx)
+        return stream_cls(stream_id=sd[0], device_index=sd[1], device_type=sd[2])
+
+    def get_device_index(device, optional=False, allow_cpu=False):
+        if device is None and optional:
+            return get_dev()
+        return orig_get_device_index(device, optional, allow_cpu)
+
+    tc.current_stream = current_stream
+    tc._get_device_index = get_device_index
+    tc._k31_fast_stream = True
+
+
+if _K31_CPU1 and current_platform.is_cuda():
+    _k31_install_fast_current_stream()
 
 
 def fused_grouped_topk(
@@ -357,6 +401,23 @@ class GroupedTopKRouter(BaseRouter):
                 rocm_aiter_grouped_topk,
                 num_fused_shared_experts=self.num_fused_shared_experts,
             )
+        elif (
+            _K31_CPU1
+            and envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK
+            and current_platform.is_cuda()
+            and self.num_expert_group <= 32
+            and self.top_k <= 32
+            and self.e_score_correction_bias is not None
+        ):
+            # The compiled grouped_topk takes this branch and only wraps this op.
+            grouped_topk_impl = partial(fused_grouped_topk, is_padding=is_padding)
+            if not _K31_SEEN:
+                _K31_SEEN.append(1)
+                from vllm.logger import init_logger
+
+                init_logger(__name__).info(
+                    "K31_CPU1: grouped top-k router calls the fused op directly"
+                )
         else:
             grouped_topk_impl = partial(grouped_topk, is_padding=is_padding)
 

@@ -1261,6 +1261,13 @@ if has_flashinfer():
         "flashinfer_mxfp8_quantize_8x4", _flashinfer_mxfp8_quantize_8x4
     )
 
+    # K31_CPU1=1 (opt-in): once a problem shape has gone through the decorated
+    # mm_mxfp8 API, later calls with that shape use the undecorated function
+    # (same kernels, without the per-call backend checks and API wrappers).
+    _mm_mxfp8_fast = os.environ.get("K31_CPU1") == "1"
+    _mm_mxfp8_seen: set[tuple] = set()
+    _mm_mxfp8_inner: list = []
+
     def _mm_mxfp8(
         A: torch.Tensor,
         B: torch.Tensor,
@@ -1271,6 +1278,39 @@ if has_flashinfer():
         use_8x4_sf_layout: bool = False,
     ) -> torch.Tensor:
         from flashinfer import mm_mxfp8 as mm_mxfp8_
+
+        if _mm_mxfp8_fast:
+            key = (
+                A.shape[0],
+                A.shape[1],
+                B.shape[1],
+                B.stride(0),
+                B.stride(1),
+                A.dtype,
+                out_dtype,
+                backend,
+                use_8x4_sf_layout,
+                A.device.index,
+                A_scale.shape,
+                B_scale.shape,
+            )
+            kwargs = dict(
+                out=None,
+                out_dtype=out_dtype,
+                backend=backend,
+                use_8x4_sf_layout=use_8x4_sf_layout,
+            )
+            if key in _mm_mxfp8_seen:
+                if not _mm_mxfp8_inner:
+                    import inspect
+
+                    _mm_mxfp8_inner.append(inspect.unwrap(mm_mxfp8_))
+                return _mm_mxfp8_inner[0](A, B, A_scale, B_scale, **kwargs)
+            out = mm_mxfp8_(A, B, A_scale, B_scale, **kwargs)
+            if len(_mm_mxfp8_seen) > 65536:
+                _mm_mxfp8_seen.clear()
+            _mm_mxfp8_seen.add(key)
+            return out
 
         return mm_mxfp8_(
             A,
