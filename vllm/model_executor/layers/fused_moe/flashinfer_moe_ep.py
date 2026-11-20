@@ -18,6 +18,7 @@ from vllm.config.kernel import (
 )
 from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -166,6 +167,12 @@ def flashinfer_moe_ep_unsupported_reasons(
         unsupported.append("expert bias")
     if moe.swiglu_alpha is not None or moe.swiglu_beta is not None:
         unsupported.append("custom SwiGLU alpha or beta")
+    # SiTU is passed to the NVFP4 CuTeDSL megakernel only; the other kernel
+    # configs are built without it.
+    if moe.activation == MoEActivation.SITU and (
+        spec.kernel != "cutedsl" or weight_format != "nvfp4"
+    ):
+        unsupported.append("SiTU activation outside the NVFP4 CuTeDSL kernel")
     if (
         spec.kernel == "deep_gemm"
         and moe.routing_method is not RoutingMethodType.DeepseekV4
@@ -393,10 +400,22 @@ class FlashInferMoeEp:
         elif spec.kernel == "cutedsl":
             # In-kernel fc2 reduce keeps its default (off); FlashInfer 0.7.1rc1
             # renamed in_kernel_fc2_reduce to enable_in_kernel_fc2_reduce.
+            # SiTU (Kimi) rides the megakernel's activation / beta fields.
+            situ = getattr(moe.activation, "value", moe.activation) == "situ"
+            situ_kwargs = (
+                dict(
+                    activation="situ",
+                    situ_beta=moe.activation_situ_beta,
+                    situ_linear_beta=moe.activation_situ_linear_beta,
+                )
+                if situ
+                else {}
+            )
             megakernel = api.Nvfp4CutedslMegaMoeConfig(
                 intermediate_size=moe.intermediate_size,
                 top_k=moe.experts_per_token,
                 gate_up_clamp=moe.swiglu_limit,
+                **situ_kwargs,
                 fast_math=True,
                 apply_topk_in_fc1=apply_topk_in_fc1,
                 combine_dtype="bf16",
