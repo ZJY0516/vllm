@@ -38,6 +38,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
+from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
 )
@@ -917,6 +918,14 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+        _, recurrent_state_shape = self.get_state_shape()
+        scatter_states.register_warmup(
+            state_shape=recurrent_state_shape,
+            state_dtype=recurrent_state_dtype,
+            indices_dtype=torch.int32,
+            max_num_tokens=vllm_config.scheduler_config.max_num_seqs,
+        )
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
         assert isinstance(spec, MambaSpec)
@@ -1494,8 +1503,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=non_spec_query_start_loc,
                         out=non_spec_out,
                     )
-                recurrent_state[non_spec_state_indices_tensor] = (
-                    last_recurrent_state.to(recurrent_state.dtype)
+                scatter_states(
+                    recurrent_state,
+                    last_recurrent_state,
+                    non_spec_state_indices_tensor,
                 )
             else:
                 # Pure non-speculative decode.
