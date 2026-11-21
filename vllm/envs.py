@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     VLLM_STEP5_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_HYBRID_EP_MOE: bool = False
+    VLLM_KIMI_K3_FRONT_SITU_GEMM: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_ENABLE_GEMM_RS: bool = False
@@ -1755,6 +1756,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (EpMoeLayer) up to its FRONT_MAX tokens per rank.
     "VLLM_KIMI_K3_HYBRID_EP_MOE": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_HYBRID_EP_MOE", "0"))
+    ),
+    # Kimi K3 MegaMoE layers, prefill-sized batches: compute the shared expert's
+    # gate_up GEMM with its SiTU-and-mul epilogue and the latent down projection
+    # in one SM100 GEMM launch (bitwise equal to the stock cuBLAS GEMMs +
+    # situ_and_mul at the token counts it serves).
+    "VLLM_KIMI_K3_FRONT_SITU_GEMM": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_FRONT_SITU_GEMM", "0"))
     ),
     # Kimi K3 only, and unrelated to the MoE flags above. Tap the pre-norm
     # AttnRes mixture, rather than the post-mixture sum, as the auxiliary

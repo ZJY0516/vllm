@@ -142,6 +142,11 @@ logger = init_logger(__name__)
 # so it falls back to sequential.
 _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
 
+# Token counts served by the fused shared gate_up + SiTU + latent down GEMM
+# (VLLM_KIMI_K3_FRONT_SITU_GEMM). Below it cuBLAS picks split-K kernels for these
+# shapes, so the stock path keeps its exact results there.
+_FRONT_SITU_MIN_TOKENS = 256
+
 
 def shard_sequence_parallel_mlp(
     hidden_size: int,
@@ -297,8 +302,10 @@ class KimiMLP(nn.Module):
             # which sums across TP and restores the sequence sharding.
             x = sp_all_gather(x)
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        return self.down(self.act_fn(gate_up))
 
+    def down(self, x):
+        """The down projection of the activated intermediate (forward's tail)."""
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(x):
             return self.gemm_rs_ar.apply(x, self.down_proj)
 
@@ -609,6 +616,25 @@ class KimiMoE(nn.Module):
                 moe_intermediate_size // self.tp_size
             )
 
+    def _route(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Router logits, or for MegaMoE the grouped top-k (weights, ids)."""
+        router_logits, _ = self.gate(hidden_states)
+        if not self.use_mega_moe:
+            return router_logits, None
+        return fused_grouped_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.experts.top_k,
+            renormalize=self.moe_renormalize,
+            e_score_correction_bias=self.gate.e_score_correction_bias.data,
+            num_expert_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            scoring_func=self.moe_router_activation_func,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+
     def _maybe_overlap_router_and_down_proj(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -630,24 +656,7 @@ class KimiMoE(nn.Module):
             logits and `topk_ids` is `None`.
 
         """
-
-        def _router(
-            hidden_states: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            router_logits, _ = self.gate(hidden_states)
-            if not self.use_mega_moe:
-                return router_logits, None
-            return fused_grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=self.experts.top_k,
-                renormalize=self.moe_renormalize,
-                e_score_correction_bias=self.gate.e_score_correction_bias.data,
-                num_expert_group=self.num_expert_group,
-                topk_group=self.topk_group,
-                scoring_func=self.moe_router_activation_func,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
+        _router = self._route
 
         down_proj = self.routed_expert_down_proj
         if down_proj is None:
@@ -707,12 +716,84 @@ class KimiMoE(nn.Module):
         self.__dict__["_hybrid_ep"] = ep
         return ep
 
+    def _front_situ_gemm(self):
+        """One SM100 GEMM for the shared expert's gate_up with its SiTU-and-mul
+        epilogue and the latent down projection (VLLM_KIMI_K3_FRONT_SITU_GEMM), for
+        a MegaMoE layer whose BF16 shared expert runs on this rank's tokens. Returns
+        `x -> (act, latent)`, or None if not eligible. Built on first use."""
+        front = self.__dict__.get("_front_situ", 0)
+        if front != 0:
+            return front
+        se = self.shared_experts
+        down = self.routed_expert_down_proj
+        front = None
+        if (
+            self.use_mega_moe
+            and se is not None
+            and down is not None
+            and not se.shard_sequence_parallel
+            and isinstance(se.act_fn, SituAndMul)
+            and current_platform.is_device_capability_family(100)
+            and all(
+                isinstance(m.quant_method, UnquantizedLinearMethod)
+                and m.weight.dtype == torch.bfloat16
+                and m.weight.is_contiguous()
+                for m in (se.gate_up_proj, down)
+            )
+        ):
+            from .ops.cute_dsl.front_situ_gemm import compile_front_situ_gemm
+
+            w_gu, w_lat = se.gate_up_proj.weight, down.weight
+            inter, latent = w_gu.shape[0] // 2, w_lat.shape[0]
+            kernel = compile_front_situ_gemm(
+                inter,
+                w_gu.shape[1],
+                latent,
+                beta=se.act_fn.beta,
+                linear_beta=se.act_fn.linear_beta,
+            )
+
+            def front(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                act = x.new_empty(x.shape[0], inter)
+                latent_x = x.new_empty(x.shape[0], latent)
+                kernel(x, w_gu, w_lat, act, latent_x)
+                return act, latent_x
+
+            logger.info_once(
+                "Kimi K3 MegaMoE layers: fused shared gate_up SiTU + latent down "
+                "GEMM from %d tokens",
+                _FRONT_SITU_MIN_TOKENS,
+            )
+        self.__dict__["_front_situ"] = front
+        return front
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         ep = self._hybrid_ep_layer() if self.use_mega_moe else None
         if ep is not None and ep.serves(num_tokens):
             return ep.run(hidden_states)
+        front = (
+            self._front_situ_gemm()
+            if self.use_mega_moe
+            and num_tokens >= _FRONT_SITU_MIN_TOKENS
+            and envs.VLLM_KIMI_K3_FRONT_SITU_GEMM
+            else None
+        )
+        if front is not None:
+            assert self.routed_output_transform is not None
+            # Router, then one GEMM for the shared gate_up (SiTU-and-mul epilogue)
+            # and the latent down projection; the shared down projection follows
+            # the routed experts as in the stock order.
+            router_output, topk_ids = self._route(hidden_states)
+            act, routed_hidden_states = front(hidden_states.contiguous())
+            final_hidden_states = self.experts(
+                routed_hidden_states, router_output, topk_ids
+            )
+            final_hidden_states = self.routed_output_transform(
+                final_hidden_states, residual=self.shared_experts.down(act)
+            )
+            return final_hidden_states.view(num_tokens, hidden_size)
         # Overlap the gate with the routed down projection; the returned hidden
         # states are already down-projected. Keep the original ``hidden_states``
         # for the shared experts.
