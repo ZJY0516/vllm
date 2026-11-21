@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_HYBRID_EP_MOE: bool = False
     VLLM_KIMI_K3_FRONT_SITU_GEMM: bool = False
     VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL: bool = False
+    VLLM_KIMI_K3_FLASHINFER_KDA_PERSISTENT: bool = True
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_MLA_FUSED_Q_QUANT_PAD: bool = False
@@ -1774,6 +1775,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # offsets that are not multiples of 32 keep FlashKDA.
     "VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL", "0"))
+    ),
+    # With VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL: batches without prefix
+    # checkpoints use FlashInfer's persistent KDA prefill kernel, launched with
+    # a schedule built from host offsets once per step. 0 keeps the CuTe DSL
+    # chunked kernel for every batch.
+    "VLLM_KIMI_K3_FLASHINFER_KDA_PERSISTENT": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_FLASHINFER_KDA_PERSISTENT", "1"))
     ),
     # Kimi K3 only, and unrelated to the MoE flags above. Tap the pre-norm
     # AttnRes mixture, rather than the post-mixture sum, as the auxiliary

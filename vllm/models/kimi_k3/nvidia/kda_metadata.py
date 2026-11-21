@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from functools import cache
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 import vllm.envs as envs
@@ -49,6 +50,91 @@ if TYPE_CHECKING:
 @cache
 def _metadata_launch_pdl() -> bool:
     return current_platform.is_arch_support_pdl()
+
+
+@cache
+def flashinfer_persistent_kda_available() -> bool:
+    """Whether FlashInfer's persistent KDA prefill kernel can be imported."""
+    try:
+        from flashinfer.cute_dsl.availability import is_cute_dsl_experimental_available
+        from flashinfer.kda_kernels.persistent import forward  # noqa: F401
+    except (ImportError, RuntimeError):
+        return False
+    return is_cute_dsl_experimental_available()
+
+
+def build_flashinfer_kda_persistent_plan(
+    query_start_loc_cpu: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_heads: int,
+    device: torch.device,
+) -> tuple | None:
+    """Launch schedule for FlashInfer's persistent KDA prefill kernel.
+
+    FlashInfer's own entry point copies the offsets to the host on every call
+    and then searches for a schedule that splits chains across CTAs. Here
+    every (sequence, head) chain runs whole. Longest sequences first, a
+    sequence's chains go to the least loaded of at most SM-count CTAs; the
+    schedule is built from host offsets once per step and sent to the device
+    in one non-blocking copy. Returns None when the batch does not have more
+    tokens than sequences.
+    """
+    from flashinfer.kda_kernels.persistent import forward as fi_persistent
+
+    lens = np.diff(query_start_loc_cpu.numpy()).astype(np.int64)
+    num_seqs = len(lens)
+    if num_seqs == 0 or lens.min() < 1 or lens.sum() <= num_seqs:
+        return None
+    chunk = fi_persistent.C_TOK
+    num_chains = num_seqs * num_heads
+    num_ctas = min(num_chains, fi_persistent._sm_count(device))
+    cost = (lens + chunk - 1) // chunk + fi_persistent.PIECE_OVERHEAD
+    loads = np.zeros(num_ctas, dtype=np.int64)
+    cta_of = np.empty(num_chains, dtype=np.int64)
+    rank = np.empty(num_chains, dtype=np.int64)
+    assigned = 0
+    for seq in np.argsort(-lens, kind="stable"):
+        for head0 in range(0, num_heads, num_ctas):
+            heads = np.arange(head0, min(head0 + num_ctas, num_heads))
+            if len(heads) < num_ctas:
+                ctas = np.argpartition(loads, len(heads) - 1)[: len(heads)]
+            else:
+                ctas = np.arange(num_ctas)
+            chains = seq * num_heads + heads
+            cta_of[chains] = ctas
+            rank[chains] = np.arange(assigned, assigned + len(heads))
+            assigned += len(heads)
+            loads[ctas] += cost[seq]
+    chains = np.lexsort((rank, cta_of))
+    slot_offsets = np.searchsorted(cta_of[chains], np.arange(num_ctas + 1))
+    n = num_chains
+    host = np.empty(num_ctas + 1 + 5 * n, dtype=np.int32)
+    host[: num_ctas + 1] = slot_offsets
+    body = host[num_ctas + 1 :].reshape(5, n)
+    body[0] = chains
+    body[1] = 0
+    body[2] = lens[chains // num_heads]
+    body[3:] = -1
+    sched = torch.from_numpy(host).pin_memory().to(device, non_blocking=True)
+    soff = sched[: num_ctas + 1]
+    schain, spt0, sptn, ssrc, sdst = sched[num_ctas + 1 :].view(5, n).unbind(0)
+    # No chain is split, so the handoff buffers are never read.
+    mid = torch.empty(1, 128, 128, dtype=torch.float32, device=device)
+    flags = torch.zeros(1, dtype=torch.int32, device=device)
+    return (
+        query_start_loc,
+        soff,
+        schain,
+        spt0,
+        sptn,
+        ssrc,
+        sdst,
+        num_ctas,
+        mid,
+        flags,
+        False,
+        bool((lens % chunk == 0).all()),
+    )
 
 
 @triton.jit(do_not_specialize=["num_spec_decodes", "batch_size"])
@@ -191,6 +277,9 @@ class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     non_spec_token_start: int | None = None
     flashinfer_prefill_query_start_loc: torch.Tensor | None = None
     flashinfer_prefill_seq_order: torch.Tensor | None = None
+    # FlashInfer persistent KDA prefill schedule, see
+    # build_flashinfer_kda_persistent_plan.
+    flashinfer_persistent_plan: tuple | None = None
     recoverssm_commit: KDARecoverSSMCommitMetadata | None = None
     recoverssm_context: "KDARecoverSSMCommitContext | None" = field(
         default=None, repr=False, compare=False
@@ -255,6 +344,13 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         # int64 offsets; build them once per step rather than per layer.
         self.build_int64_prefill_offsets = (
             self.use_flashinfer_prefill or envs.VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL
+        )
+        self.kda_num_heads = kv_cache_spec.shapes[1][0]
+        self.build_persistent_plan = (
+            envs.VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL
+            and current_platform.is_device_capability_family(100)
+            and self.kda_num_heads % 8 == 0
+            and flashinfer_persistent_kda_available()
         )
         self.use_recoverssm = vllm_config.cache_config.use_kda_recoverssm
         self.spec_state_slots = 1 if self.use_recoverssm else self.num_spec + 1
@@ -637,6 +733,21 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 request_rows = active_non_spec_mask_cpu.nonzero().flatten().tolist()
             checkpoint = self.checkpoint_builder.build(m, request_rows)
 
+        flashinfer_persistent_plan = None
+        if (
+            self.build_persistent_plan
+            and num_prefills > 0
+            and checkpoint is None
+            and non_spec_query_start_loc_cpu is not None
+            and non_spec_query_start_loc is not None
+        ):
+            flashinfer_persistent_plan = build_flashinfer_kda_persistent_plan(
+                non_spec_query_start_loc_cpu,
+                non_spec_query_start_loc,
+                self.kda_num_heads,
+                self.device,
+            )
+
         return KimiK3KDAMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -658,6 +769,7 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_token_start=non_spec_token_start,
             flashinfer_prefill_query_start_loc=flashinfer_prefill_query_start_loc,
             flashinfer_prefill_seq_order=flashinfer_prefill_seq_order,
+            flashinfer_persistent_plan=flashinfer_persistent_plan,
             recoverssm_commit=recoverssm_commit,
             recoverssm_context=(
                 self._get_recoverssm_context()

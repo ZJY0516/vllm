@@ -583,6 +583,45 @@ def _flashinfer_fp32_kda_prefill(
     )
 
 
+def _flashinfer_fp32_kda_prefill_persistent(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    state: torch.Tensor,
+    out: torch.Tensor,
+    plan: tuple,
+) -> None:
+    """FlashKDA's prefill contract on FlashInfer's persistent KDA kernel.
+
+    Launched with the step's schedule from build_flashinfer_kda_persistent_plan
+    rather than through recurrent_kda, which reads the offsets on the host.
+    ``state`` is advanced in place. No checkpoints.
+    """
+    from flashinfer.kda_kernels.persistent.forward import fwd
+
+    fwd(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g.contiguous(),
+        beta.contiguous(),
+        q.shape[-1] ** -0.5,
+        out,
+        A_log.contiguous(),
+        dt_bias.contiguous(),
+        lower_bound,
+        initial_state=state,
+        final_state=state,
+        cu_seqlens=plan[0],
+        plan=plan,
+    )
+
+
 def _flashinfer_kda_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1585,25 +1624,45 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                             prefill_cu_seqlens = non_spec_query_start_loc.to(
                                 torch.int64
                             )
-                        _flashinfer_fp32_kda_prefill(
-                            q=q_ns,
-                            k=k_ns,
-                            v=v_ns,
-                            g=g1_ns,
-                            beta=beta_ns,
-                            A_log=self.A_log,
-                            dt_bias=self.dt_bias,
-                            lower_bound=self.gate_lower_bound,
-                            state=initial_state,
-                            cu_seqlens=prefill_cu_seqlens,
-                            out=flashkda_out,
-                            checkpoint_state=(
-                                checkpoint_state
-                                if flashinfer_checkpoint is not None
-                                else None
-                            ),
-                            checkpoint_args=flashinfer_checkpoint,
-                        )
+                        plan = m.flashinfer_persistent_plan
+                        if (
+                            plan is not None
+                            and checkpoint is None
+                            and envs.VLLM_KIMI_K3_FLASHINFER_KDA_PERSISTENT
+                        ):
+                            _flashinfer_fp32_kda_prefill_persistent(
+                                q=q_ns,
+                                k=k_ns,
+                                v=v_ns,
+                                g=g1_ns,
+                                beta=beta_ns,
+                                A_log=self.A_log,
+                                dt_bias=self.dt_bias,
+                                lower_bound=self.gate_lower_bound,
+                                state=initial_state,
+                                out=flashkda_out,
+                                plan=plan,
+                            )
+                        else:
+                            _flashinfer_fp32_kda_prefill(
+                                q=q_ns,
+                                k=k_ns,
+                                v=v_ns,
+                                g=g1_ns,
+                                beta=beta_ns,
+                                A_log=self.A_log,
+                                dt_bias=self.dt_bias,
+                                lower_bound=self.gate_lower_bound,
+                                state=initial_state,
+                                cu_seqlens=prefill_cu_seqlens,
+                                out=flashkda_out,
+                                checkpoint_state=(
+                                    checkpoint_state
+                                    if flashinfer_checkpoint is not None
+                                    else None
+                                ),
+                                checkpoint_args=flashinfer_checkpoint,
+                            )
                         core_attn_out_non_spec = flashkda_out
                         # The kernel advanced the gathered states in place.
                         last_recurrent_state = initial_state
