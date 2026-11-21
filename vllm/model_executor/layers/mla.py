@@ -5,12 +5,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.platforms import current_platform
+from vllm.v1.attention.ops.mla_fused_q_gate import sigmoid_gate_mul_
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.index_group import (
@@ -253,7 +255,22 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         if self.g_proj is not None:
-            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
+            gate = self.g_proj(hidden_states)[0]
+            if (
+                envs.VLLM_MLA_FUSED_OUTPUT_GATE
+                and not torch.compiler.is_compiling()
+                and attn_out.dim() == 2
+                and attn_out.shape == gate.shape
+                and attn_out.dtype == gate.dtype
+                and attn_out.dtype in (torch.bfloat16, torch.float16)
+                and attn_out.stride(1) == 1
+                and gate.stride(1) == 1
+            ):
+                # Same bits as the two ops below, in one launch; attn_out is
+                # this layer's fresh attention output, so it is updated in place.
+                attn_out = sigmoid_gate_mul_(attn_out, gate)
+            else:
+                attn_out = attn_out * gate.sigmoid()
 
         if skip_o_proj:
             return attn_out

@@ -296,6 +296,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.mla_fused_q_gate import mla_q_concat_quant_pad
 from vllm.v1.attention.ops.mxfp4_mla import row_bytes as mxfp4_row_bytes
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
@@ -650,6 +651,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 "Serving with it would silently run full attention."
             )
         self.q_pad_num_heads = getattr(self.impl, "q_pad_num_heads", None)
+        # Set by forward_impl around `forward_mqa` when the query it passes is
+        # a head-padded fp8 buffer (VLLM_MLA_FUSED_Q_QUANT_PAD).
+        self.mqa_q_padded_heads: int | None = None
         self.is_amx_bmm_enabled = getattr(self.impl, "uses_amx_bmm", False)
         # AMX reads kv_b_proj's weight directly and never calls it live; the
         # reference CPU MLA backend calls it but isn't perf-critical. Skip
@@ -1161,6 +1165,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 if self.is_aiter_fused_decode_query_enabled
                 else None
             )
+            # Set when one kernel built the padded fp8 query (see below).
+            fused_q_pad_heads: int | None = None
             if fused_q_heads is not None:
                 mqa_q = rocm_aiter_ops.fused_bf16_bmm_cat_quant_pad_mla(
                     mqa_q_nope, self.W_UK_T, mqa_q_pe, self._q_scale, fused_q_heads
@@ -1226,8 +1232,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     torch.bmm(
                         mqa_q_nope, W_UK_T, out=mqa_q_cat[..., :L].transpose(0, 1)
                     )
-                    mqa_q_cat[..., L:].copy_(mqa_q_pe)
-                    mqa_ql_nope, mqa_q_pe = mqa_q_cat, mqa_q_pe[..., :0]
+                    fused_q_pad_heads = self._fused_q_quant_pad_heads(
+                        N, qrep_decode, shardq
+                    )
+                    if fused_q_pad_heads is not None:
+                        # The RoPE copy, the fp8 quant and the backend's head
+                        # padding in one kernel; the backend takes the padded
+                        # buffer as it is.
+                        mqa_q = mla_q_concat_quant_pad(
+                            mqa_q_cat[..., :L],
+                            mqa_q_pe,
+                            self._q_scale,
+                            fused_q_pad_heads,
+                        )[:, :N]
+                    else:
+                        mqa_q_cat[..., L:].copy_(mqa_q_pe)
+                        mqa_ql_nope, mqa_q_pe = mqa_q_cat, mqa_q_pe[..., :0]
                 else:
                     # Write the (N, B, L) bmm result straight into a
                     # token-major (B, N, L) buffer so the MQA query is already
@@ -1236,7 +1256,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_ql_nope = mqa_q_nope.new_empty((B, N, L))
                     torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope.transpose(0, 1))
 
-            if fused_q_heads is None:
+            if fused_q_heads is None and fused_q_pad_heads is None:
                 if fp8_attention and self.impl.supports_quant_query_input:
                     assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                     assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
@@ -1312,9 +1332,14 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     mqa_metadata = shardq.attn_metadata
                     if gathered_context is not None:
                         mqa_kv_cache = gathered_context.mla_view(kv_cache)
-                attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
-                    mqa_q, mqa_kv_cache, mqa_metadata, self
-                )
+                # The backend reads this to take the padded query as it is.
+                self.mqa_q_padded_heads = fused_q_pad_heads
+                try:
+                    attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                        mqa_q, mqa_kv_cache, mqa_metadata, self
+                    )
+                finally:
+                    self.mqa_q_padded_heads = None
                 if shardq is not None:
                     attn_out = unshard_out(attn_out, shardq, decode_out)
 
@@ -1486,6 +1511,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 DeepseekV32IndexerMetadataBuilder.get_decode_threshold(vllm_config),
             ),
         )
+
+    def _fused_q_quant_pad_heads(
+        self, num_heads: int, qrep_decode: bool, shardq: object | None
+    ) -> int | None:
+        """Head count of the padded fp8 query `mla_q_concat_quant_pad` builds
+        for this step's MQA rows, or None to keep the unfused ops. Only for a
+        backend that takes such a query as it is (`fused_query_pad_heads`), and
+        only where nothing reshapes the query before `forward_mqa` (no DCP, no
+        ShardQ, no query replication)."""
+        if not envs.VLLM_MLA_FUSED_Q_QUANT_PAD:
+            return None
+        if (
+            qrep_decode
+            or shardq is not None
+            or self.impl.dcp_world_size > 1
+            or self.q_pad_num_heads is not None
+        ):
+            return None
+        pad_heads = getattr(self.impl, "fused_query_pad_heads", None)
+        return None if pad_heads is None else pad_heads(num_heads)
 
     def _use_sparse_mha(self, attn_metadata: "MLACommonMetadata") -> bool:
         if self.hisparse_cache is not None:

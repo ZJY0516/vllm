@@ -860,6 +860,16 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             self.prims_ts_format = _PRIMS_TS_FORMATS[kv_cache_dtype]
             self.prims_ts_buckets = _prims_ts_row_buckets(vllm_config)
 
+    def fused_query_pad_heads(self, num_heads: int) -> int | None:
+        """Head count of the query `_forward_mqa_kernel` runs for `num_heads`
+        heads. The MLA layer may hand it a head slice of a buffer of that many
+        heads with zero padding heads (`layer.mqa_q_padded_heads`), which is
+        then used without a padding copy. None on prims_ts, which takes the
+        query as it comes."""
+        if self.use_prims_ts:
+            return None
+        return trtllm_gen_query_heads(num_heads)
+
     def _prepare_mqa_kernel(
         self,
         layer: AttentionLayer,
@@ -1073,10 +1083,19 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             -1, math.gcd(block_stride_rows, block_size, 64), kv_rows.shape[-1]
         )
 
-        num_heads = q.shape[1]
+        num_tokens, num_heads, head_dim = q.shape
         padded_heads = trtllm_gen_query_heads(num_heads)
         if padded_heads != num_heads:
-            q = _pad_query_heads(q, padded_heads)
+            if getattr(layer, "mqa_q_padded_heads", None) == padded_heads:
+                # The caller wrote the zero padding heads (see
+                # `fused_query_pad_heads`): `q` is a head slice of that buffer.
+                assert q.stride() == (padded_heads * head_dim, head_dim, 1)
+                q = q.as_strided(
+                    (num_tokens, padded_heads, head_dim),
+                    (padded_heads * head_dim, head_dim, 1),
+                )
+            else:
+                q = _pad_query_heads(q, padded_heads)
 
         # Single-token sparse decode. trtllm-gen requires the q_len_per_request
         # dim, but the sparse attention mask is fully per-token (each query token

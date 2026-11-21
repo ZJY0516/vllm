@@ -224,6 +224,8 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_FRONT_SITU_GEMM: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
+    VLLM_MLA_FUSED_Q_QUANT_PAD: bool = False
+    VLLM_MLA_FUSED_OUTPUT_GATE: bool = False
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1774,6 +1776,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use the SM100 BF16 GEMM-AR kernel for eligible Kimi-K3 row-parallel
     # attention projections. All TP ranks must belong to one NVLink domain.
     "VLLM_KIMI_K3_GEMM_AR": lambda: bool(int(os.getenv("VLLM_KIMI_K3_GEMM_AR", "1"))),
+    # MLA fp8-query MQA path (FlashInfer sparse MLA on trtllm-gen, no DCP):
+    # build the padded fp8 query in one kernel instead of a RoPE copy, the
+    # static fp8 quant and a head-padding copy. Bitwise identical; off by
+    # default while it is measured.
+    "VLLM_MLA_FUSED_Q_QUANT_PAD": lambda: bool(
+        int(os.getenv("VLLM_MLA_FUSED_Q_QUANT_PAD", "0"))
+    ),
+    # MLA output gate (Kimi-K3 g_proj): apply `attn_out * gate.sigmoid()` in
+    # one kernel instead of two. Bitwise identical; off by default while it is
+    # measured.
+    "VLLM_MLA_FUSED_OUTPUT_GATE": lambda: bool(
+        int(os.getenv("VLLM_MLA_FUSED_OUTPUT_GATE", "0"))
+    ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3
     # attention/shared-expert projections, DeepSeek-V4.1 ``wo_b``). All TP
