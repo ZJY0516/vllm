@@ -296,7 +296,10 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.ops.dcp import MLADCPManager
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
-from vllm.v1.attention.ops.mla_fused_q_gate import mla_q_concat_quant_pad
+from vllm.v1.attention.ops.mla_fused_q_gate import (
+    mla_q_absorb_quant_pad,
+    mla_q_concat_quant_pad,
+)
 from vllm.v1.attention.ops.mxfp4_mla import row_bytes as mxfp4_row_bytes
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
@@ -1228,26 +1231,40 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     # contiguous tensor instead of concatenating first (that
                     # concat is ~1 ms per layer of a 32k-token prefill).
                     R = mqa_q_pe.shape[-1]
-                    mqa_q_cat = mqa_q_nope.new_empty((B, N, L + R))
-                    torch.bmm(
-                        mqa_q_nope, W_UK_T, out=mqa_q_cat[..., :L].transpose(0, 1)
-                    )
                     fused_q_pad_heads = self._fused_q_quant_pad_heads(
                         N, qrep_decode, shardq
                     )
-                    if fused_q_pad_heads is not None:
-                        # The RoPE copy, the fp8 quant and the backend's head
-                        # padding in one kernel; the backend takes the padded
-                        # buffer as it is.
-                        mqa_q = mla_q_concat_quant_pad(
-                            mqa_q_cat[..., :L],
+                    if fused_q_pad_heads is not None and envs.VLLM_MLA_FUSED_Q_ABSORB:
+                        # The NoPE absorb as well: one kernel from q to the
+                        # padded fp8 query, no bf16 concat buffer.
+                        mqa_q = mla_q_absorb_quant_pad(
+                            mqa_q_nope.transpose(0, 1),
                             mqa_q_pe,
+                            W_UK_T,
                             self._q_scale,
                             fused_q_pad_heads,
                         )[:, :N]
                     else:
-                        mqa_q_cat[..., L:].copy_(mqa_q_pe)
-                        mqa_ql_nope, mqa_q_pe = mqa_q_cat, mqa_q_pe[..., :0]
+                        mqa_q_cat = mqa_q_nope.new_empty((B, N, L + R))
+                        torch.bmm(
+                            mqa_q_nope,
+                            W_UK_T,
+                            out=mqa_q_cat[..., :L].transpose(0, 1),
+                        )
+                        if fused_q_pad_heads is not None:
+                            # The RoPE copy, the fp8 quant and the backend's
+                            # head padding in one kernel; the backend takes
+                            # the padded buffer as it is.
+                            mqa_q = mla_q_concat_quant_pad(
+                                mqa_q_cat[..., :L],
+                                mqa_q_pe,
+                                self._q_scale,
+                                fused_q_pad_heads,
+                            )[:, :N]
+                        else:
+                            mqa_q_cat[..., L:].copy_(mqa_q_pe)
+                            mqa_ql_nope = mqa_q_cat
+                            mqa_q_pe = mqa_q_pe[..., :0]
                 else:
                     # Write the (N, B, L) bmm result straight into a
                     # token-major (B, N, L) buffer so the MQA query is already
@@ -1520,7 +1537,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         backend that takes such a query as it is (`fused_query_pad_heads`), and
         only where nothing reshapes the query before `forward_mqa` (no DCP, no
         ShardQ, no query replication)."""
-        if not envs.VLLM_MLA_FUSED_Q_QUANT_PAD:
+        if not (envs.VLLM_MLA_FUSED_Q_QUANT_PAD or envs.VLLM_MLA_FUSED_Q_ABSORB):
             return None
         if (
             qrep_decode

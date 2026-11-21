@@ -228,6 +228,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_MLA_FUSED_Q_QUANT_PAD: bool = False
     VLLM_MLA_FUSED_OUTPUT_GATE: bool = False
+    VLLM_MLA_FUSED_Q_ABSORB: bool = False
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1805,6 +1806,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # measured.
     "VLLM_MLA_FUSED_OUTPUT_GATE": lambda: bool(
         int(os.getenv("VLLM_MLA_FUSED_OUTPUT_GATE", "0"))
+    ),
+    # With the fused fp8 query (as VLLM_MLA_FUSED_Q_QUANT_PAD, which it
+    # implies), also absorb the NoPE query (the W_UK_T bmm) in the same kernel.
+    # Bitwise identical; off by default while it is measured.
+    "VLLM_MLA_FUSED_Q_ABSORB": lambda: bool(
+        int(os.getenv("VLLM_MLA_FUSED_Q_ABSORB", "0"))
     ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3

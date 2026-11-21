@@ -152,6 +152,153 @@ def mla_q_concat_quant_pad(
 
 
 @triton.jit
+def _mla_q_absorb_quant_pad_kernel(
+    q_nope_ptr,
+    pe_ptr,
+    w_ptr,
+    out_ptr,
+    scale_ptr,
+    num_tokens,
+    q_stride_t,
+    q_stride_h,
+    pe_stride_t,
+    pe_stride_h,
+    w_stride_h,
+    w_stride_p,
+    w_stride_l,
+    num_heads,
+    padded_heads,
+    FP8_MAX: tl.constexpr,
+    QK_NOPE_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_L: tl.constexpr,
+):
+    head = tl.program_id(1)
+    rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    row_ok = rows < num_tokens
+    rows64 = rows.to(tl.int64)
+    out_rows = out_ptr + (rows64 * padded_heads + head)[:, None] * (NOPE_DIM + ROPE_DIM)
+    nope_cols = tl.arange(0, BLOCK_L)
+    rope_cols = tl.arange(0, ROPE_DIM)
+    if head >= num_heads:
+        # Padding head: fp8 zeros.
+        zero = tl.zeros((BLOCK_T, BLOCK_L), dtype=out_ptr.dtype.element_ty)
+        for l0 in tl.static_range(0, NOPE_DIM, BLOCK_L):
+            tl.store(out_rows + l0 + nope_cols[None, :], zero, mask=row_ok[:, None])
+        tl.store(
+            out_rows + NOPE_DIM + rope_cols[None, :],
+            tl.zeros((BLOCK_T, ROPE_DIM), dtype=out_ptr.dtype.element_ty),
+            mask=row_ok[:, None],
+        )
+        return
+
+    scale = tl.load(scale_ptr + tl.zeros([1, 1], dtype=tl.int32))
+    inv_scale = tl.where(
+        scale == 0.0, 0.0, _div_rn(tl.full([1, 1], 1.0, tl.float32), scale)
+    )
+    p_cols = tl.arange(0, QK_NOPE_DIM)
+    q_nope = tl.load(
+        q_nope_ptr + rows64[:, None] * q_stride_t + head * q_stride_h + p_cols[None, :],
+        mask=row_ok[:, None],
+        other=0.0,
+    )
+    w_head = w_ptr + head.to(tl.int64) * w_stride_h
+    for l0 in tl.static_range(0, NOPE_DIM, BLOCK_L):
+        w = tl.load(
+            w_head
+            + p_cols[:, None] * w_stride_p
+            + (l0 + nope_cols)[None, :] * w_stride_l
+        )
+        # The absorbed NoPE query as the bf16 bmm writes it, then the quant.
+        acc = tl.dot(q_nope, w, out_dtype=tl.float32)
+        ql = acc.to(q_nope_ptr.dtype.element_ty).to(tl.float32)
+        ql = tl.minimum(tl.maximum(ql * inv_scale, -FP8_MAX), FP8_MAX)
+        tl.store(
+            out_rows + l0 + nope_cols[None, :],
+            ql.to(out_ptr.dtype.element_ty),
+            mask=row_ok[:, None],
+        )
+    rope = tl.load(
+        pe_ptr
+        + rows64[:, None] * pe_stride_t
+        + head * pe_stride_h
+        + rope_cols[None, :],
+        mask=row_ok[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    rope = tl.minimum(tl.maximum(rope * inv_scale, -FP8_MAX), FP8_MAX)
+    tl.store(
+        out_rows + NOPE_DIM + rope_cols[None, :],
+        rope.to(out_ptr.dtype.element_ty),
+        mask=row_ok[:, None],
+    )
+
+
+def mla_q_absorb_quant_pad(
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    w_uk_t: torch.Tensor,
+    scale: torch.Tensor,
+    padded_heads: int,
+    block_t: int = 128,
+    block_l: int = 64,
+    num_warps: int = 8,
+    num_stages: int = 2,
+) -> torch.Tensor:
+    """`mla_q_concat_quant_pad` that also absorbs the NoPE query: head n of
+    `q_nope` [T, N, P] times `w_uk_t[n]` [P, L] (the MQA path's
+    `torch.bmm(q_nope, W_UK_T)`, fp32 accumulation rounded to the input dtype),
+    then `[ql_nope | q_pe]` quantized to fp8 with the static per-tensor
+    `scale` into a new contiguous `[T, padded_heads, L + R]` buffer whose heads
+    past N are zero."""
+    num_tokens, num_heads, qk_nope_dim = q_nope.shape
+    w_heads, w_p, nope_dim = w_uk_t.shape
+    rope_dim = q_pe.shape[-1]
+    assert (w_heads, w_p) == (num_heads, qk_nope_dim)
+    assert q_pe.shape[:2] == (num_tokens, num_heads)
+    assert q_nope.stride(-1) == 1 and q_pe.stride(-1) == 1
+    assert q_nope.dtype == w_uk_t.dtype == q_pe.dtype
+    assert padded_heads >= num_heads
+    assert scale.numel() == 1 and scale.dtype == torch.float32
+    for dim in (qk_nope_dim, nope_dim, rope_dim):
+        assert triton.next_power_of_2(dim) == dim
+    fp8_dtype = current_platform.fp8_dtype()
+    out = q_nope.new_empty(
+        (num_tokens, padded_heads, nope_dim + rope_dim), dtype=fp8_dtype
+    )
+    if num_tokens == 0:
+        return out
+    _mla_q_absorb_quant_pad_kernel[(triton.cdiv(num_tokens, block_t), padded_heads)](
+        q_nope,
+        q_pe,
+        w_uk_t,
+        out,
+        scale,
+        num_tokens,
+        q_nope.stride(0),
+        q_nope.stride(1),
+        q_pe.stride(0),
+        q_pe.stride(1),
+        w_uk_t.stride(0),
+        w_uk_t.stride(1),
+        w_uk_t.stride(2),
+        num_heads,
+        padded_heads,
+        FP8_MAX=torch.finfo(fp8_dtype).max,
+        QK_NOPE_DIM=qk_nope_dim,
+        NOPE_DIM=nope_dim,
+        ROPE_DIM=rope_dim,
+        BLOCK_T=block_t,
+        BLOCK_L=block_l,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out
+
+
+@triton.jit
 def _sigmoid_gate_mul_kernel(
     x_ptr,
     gate_ptr,

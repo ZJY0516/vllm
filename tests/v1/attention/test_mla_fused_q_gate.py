@@ -8,6 +8,7 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.v1.attention.ops.mla_fused_q_gate import (
+    mla_q_absorb_quant_pad,
     mla_q_concat_quant_pad,
     sigmoid_gate_mul_,
 )
@@ -109,6 +110,36 @@ def test_q_concat_quant_pad_special_values():
     ref = _unfused_q(ql_nope, q_pe, scale, 128)
     assert fused.dtype == fp8
     assert torch.equal(fused.view(torch.uint8), ref.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "num_tokens", [1, 2, 7, 63, 64, 65, 128, 193, 513, 1024, 2048, 4096]
+)
+@pytest.mark.parametrize("num_heads,padded_heads", [(96, 128), (96, 96), (64, 64)])
+@pytest.mark.parametrize("scale", [1.0, 0.37])
+def test_q_absorb_quant_pad_bitwise(num_tokens, num_heads, padded_heads, scale):
+    """The absorbed variant against forward_impl's fp8 MQA path: the W_UK_T bmm
+    into the token-major concat buffer, then the concat, quant and pad."""
+    torch.manual_seed(num_tokens)
+    device = "cuda"
+    qk_nope, rope_dim, kv_lora = 128, 64, 512
+    q = (torch.randn(num_tokens, num_heads, qk_nope + rope_dim, device=device) * 2).to(
+        torch.bfloat16
+    )
+    # W_UK_T (N, P, L) as the layer holds it: a permuted view of (L, N, P).
+    w_uk = (torch.randn(kv_lora, num_heads, qk_nope, device=device) * 0.05).to(
+        torch.bfloat16
+    )
+    w_uk_t = w_uk.permute(1, 2, 0)
+    q_nope, q_pe = q.split([qk_nope, rope_dim], dim=-1)
+    scale_t = torch.tensor([scale], dtype=torch.float32, device=device)
+
+    cat = q.new_empty((num_tokens, num_heads, kv_lora + rope_dim))
+    torch.bmm(q_nope.transpose(0, 1), w_uk_t, out=cat[..., :kv_lora].transpose(0, 1))
+    ref = _unfused_q(cat[..., :kv_lora], q_pe, scale_t, padded_heads)
+    out = mla_q_absorb_quant_pad(q_nope, q_pe, w_uk_t, scale_t, padded_heads)
+    assert out.shape == ref.shape and out.is_contiguous()
+    assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8))
 
 
 def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:

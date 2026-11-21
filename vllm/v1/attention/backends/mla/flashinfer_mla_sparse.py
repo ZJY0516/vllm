@@ -864,10 +864,11 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         """Head count of the query `_forward_mqa_kernel` runs for `num_heads`
         heads. The MLA layer may hand it a head slice of a buffer of that many
         heads with zero padding heads (`layer.mqa_q_padded_heads`), which is
-        then used without a padding copy. None on prims_ts, which takes the
-        query as it comes."""
+        then used without a padding copy. prims_ts runs any head count, so
+        there it is `num_heads` (the fused kernel then only concatenates and
+        quantizes)."""
         if self.use_prims_ts:
-            return None
+            return num_heads
         return trtllm_gen_query_heads(num_heads)
 
     def _prepare_mqa_kernel(
