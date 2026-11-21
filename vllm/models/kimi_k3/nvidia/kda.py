@@ -546,39 +546,72 @@ def _flashinfer_fp32_kda_prefill(
     checkpoint_state: torch.Tensor | None = None,
     checkpoint_args: tuple[int, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
-    """FlashKDA's prefill contract on FlashInfer's CuTe DSL kernel.
+    """FlashKDA's prefill contract on FlashInfer's CuTe DSL BT16 kernel.
 
-    ``state`` holds the gathered initial states and is advanced in place to the
-    final states. Checkpoint row ``i`` receives row ``i``'s state at its offset.
+    Runs the vendored copy in ops/third_party/flashinfer_kda, which takes
+    exp2(-g) as ex2.approx(-g) like FlashKDA (FlashInfer 0.7.4 takes the
+    approximate reciprocal of exp2(g)). The launch is the one recurrent_kda
+    (backend="cute-dsl") makes for these arguments. ``state`` holds the
+    gathered initial states and is advanced in place to the final states.
+    Checkpoint row ``i`` receives row ``i``'s state at its offset.
     """
+    import cutlass
+
+    from vllm.models.kimi_k3.nvidia.ops.third_party.flashinfer_kda.kda_chunked_bt16 import (  # noqa: E501
+        compile as compile_kda_bt16,
+    )
+
+    with_checkpoints = checkpoint_args is not None
+    kernel = compile_kda_bt16(
+        dtype=cutlass.BFloat16,
+        state_dtype=cutlass.Float32,
+        gate_dtype=cutlass.BFloat16,
+        safe_gate=True,
+        gate_lower_bound=float(lower_bound),
+        has_state_in=True,
+        has_state_out=True,
+        has_state_ckpt=with_checkpoints,
+        has_state_indices=False,
+        has_checkpoint_state_indices=with_checkpoints,
+        mode=None,
+    )
+    num_heads = q.shape[2]
+    workspace_bytes = kernel.workspace_size(cu_seqlens, num_heads)
+    workspace = (
+        torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
+        if workspace_bytes
+        else None
+    )
     kwargs = {}
     if checkpoint_args is not None:
         assert checkpoint_state is not None
         interval, starts, rows = checkpoint_args
         kwargs = dict(
-            state_checkpoints=checkpoint_state,
+            state_ckpt=checkpoint_state,
             checkpoint_cu_starts=starts,
             checkpoint_state_indices=rows,
-            checkpoint_every_n_tokens=interval,
+            ckpt_interval=interval,
         )
-    flashinfer_recurrent_kda(
-        q=q.contiguous(),
-        k=k.contiguous(),
-        v=v.contiguous(),
-        g=g.contiguous(),
-        beta=beta.contiguous(),
-        A_log=A_log.contiguous(),
-        dt_bias=dt_bias.contiguous(),
-        scale=q.shape[-1] ** -0.5,
-        initial_state=state,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        use_gate_in_kernel=True,
-        lower_bound=lower_bound,
-        cu_seqlens=cu_seqlens,
-        output=out,
-        beta_is_logit=True,
-        backend="cute-dsl",
+    kernel(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g.contiguous(),
+        A_log.contiguous(),
+        dt_bias.contiguous().reshape(num_heads, q.shape[-1]),
+        beta.contiguous(),
+        cu_seqlens,
+        state,
+        out,
+        state,
+        workspace,
+        torch.cuda.current_stream(q.device).cuda_stream,
+        q.shape[-1] ** -0.5,
+        state_indices=None,
+        seq_order=None,
+        planned_cu_chunks=None,
+        planned_total_chunks=None,
+        generate_planned_metadata=False,
         **kwargs,
     )
 
@@ -600,11 +633,18 @@ def _flashinfer_fp32_kda_prefill_persistent(
 
     Launched with the step's schedule from build_flashinfer_kda_persistent_plan
     rather than through recurrent_kda, which reads the offsets on the host.
-    ``state`` is advanced in place. No checkpoints.
+    The launch arguments are those of FlashInfer's ``fwd()`` except
+    ``rcp_decor=False``: the kernel then takes its inverse decay with ex2, as
+    FlashKDA takes exp2(-g), instead of an approximate reciprocal of the
+    forward decay. ``state`` is advanced in place. No checkpoints.
     """
-    from flashinfer.kda_kernels.persistent.forward import fwd
+    from flashinfer.kda_kernels.persistent.forward import _launch_forward
 
-    fwd(
+    (cu32, soff, schain, spt0, sptn, ssrc, sdst, G, mid, flags, has_split, full) = plan
+    if has_split:
+        flags.zero_()
+    one_sequence = cu32.numel() == 2
+    _launch_forward(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -617,8 +657,20 @@ def _flashinfer_fp32_kda_prefill_persistent(
         lower_bound,
         initial_state=state,
         final_state=state,
-        cu_seqlens=plan[0],
-        plan=plan,
+        cu_seqlens=cu32,
+        sched=(soff, schain, spt0, sptn, ssrc, sdst, G, mid, flags, 1),
+        gate2=1 if one_sequence else 0,
+        has_split=has_split,
+        beta_tma=True,
+        qk_rowpair=4 if one_sequence else 8,
+        rcp_decor=False,
+        restore_tail=False,
+        reg_mode=2,
+        full_chunks=full,
+        lower_bound_m5=lower_bound == -5.0,
+        approximate_split=False,
+        gate_roll=not one_sequence,
+        partial_tma=not one_sequence,
     )
 
 
