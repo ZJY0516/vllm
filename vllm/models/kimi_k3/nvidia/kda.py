@@ -10,6 +10,7 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -20,6 +21,9 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
+)
+from vllm.model_executor.layers.mamba.checkpoint import (
+    MambaPrefillCheckpointMetadata,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.kda_checkpoint import (
@@ -76,6 +80,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_packed_fused_kda_decode,
     has_flashinfer_recurrent_kda,
 )
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import (
@@ -450,6 +455,132 @@ def _flashkda_prefill(
         checkpoint_offsets.contiguous() if checkpoint_offsets is not None else None,
     )
     return out, final_state
+
+
+def is_flashinfer_fp32_kda_prefill_supported(
+    head_dim: int,
+    input_dtype: torch.dtype,
+    recurrent_state_dtype: torch.dtype,
+    lower_bound: float | None,
+) -> bool:
+    """Whether FlashInfer's CuTe DSL KDA prefill can replace FlashKDA here.
+
+    Unlike the "flashinfer" prefill backend, this keeps the FP32 recurrent state
+    and FlashKDA's checkpoint layout, so it only swaps the prefill kernel.
+    """
+    if not current_platform.is_cuda() or not has_flashinfer_recurrent_kda():
+        return False
+    if not current_platform.is_device_capability_family(100):
+        return False
+    try:
+        from flashinfer.kda_prefill_cute import _is_cute_dsl_kda_runtime_available
+    except ImportError:
+        return False
+    return (
+        _is_cute_dsl_kda_runtime_available()
+        and head_dim == 128
+        and input_dtype == torch.bfloat16
+        and recurrent_state_dtype == torch.float32
+        and lower_bound is not None
+        and -5.0 <= lower_bound < 0.0
+    )
+
+
+# FlashInfer writes checkpoints every N tokens of a sequence, N a multiple of 32.
+_FLASHINFER_KDA_CHECKPOINT_INTERVALS = (128, 64, 32)
+
+
+def _flashinfer_kda_checkpoint_args(
+    checkpoint: MambaPrefillCheckpointMetadata, device: torch.device
+) -> tuple[int, torch.Tensor, torch.Tensor] | None:
+    """Express FlashKDA's one checkpoint per row as FlashInfer's periodic ones.
+
+    Row ``i`` wants the state after ``offsets[i]`` tokens (0: none). With a
+    period that divides every offset, each row's completed period boundaries
+    map to destination row ``i`` at its offset and to -1, which FlashInfer
+    skips, elsewhere. Returns None when no supported period divides the
+    offsets, so the caller keeps FlashKDA for that batch.
+    """
+    offsets, query_lens = checkpoint.offsets, checkpoint.query_lens
+    if offsets is None or query_lens is None:
+        return None
+    positive = [offset for offset in offsets if offset > 0]
+    interval = next(
+        (
+            n
+            for n in _FLASHINFER_KDA_CHECKPOINT_INTERVALS
+            if all(offset % n == 0 for offset in positive)
+        ),
+        None,
+    )
+    if interval is None:
+        return None
+    starts = [0]
+    rows: list[int] = []
+    for row, (query_len, offset) in enumerate(zip(query_lens, offsets)):
+        count = query_len // interval
+        starts.append(starts[-1] + count)
+        rows.extend(
+            row if offset == (boundary + 1) * interval else -1
+            for boundary in range(count)
+        )
+    return (
+        interval,
+        async_tensor_h2d(starts, device=device, dtype=torch.int64),
+        async_tensor_h2d(rows or [-1], device=device, dtype=torch.int32),
+    )
+
+
+def _flashinfer_fp32_kda_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: torch.Tensor,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_args: tuple[int, torch.Tensor, torch.Tensor] | None = None,
+) -> None:
+    """FlashKDA's prefill contract on FlashInfer's CuTe DSL kernel.
+
+    ``state`` holds the gathered initial states and is advanced in place to the
+    final states. Checkpoint row ``i`` receives row ``i``'s state at its offset.
+    """
+    kwargs = {}
+    if checkpoint_args is not None:
+        assert checkpoint_state is not None
+        interval, starts, rows = checkpoint_args
+        kwargs = dict(
+            state_checkpoints=checkpoint_state,
+            checkpoint_cu_starts=starts,
+            checkpoint_state_indices=rows,
+            checkpoint_every_n_tokens=interval,
+        )
+    flashinfer_recurrent_kda(
+        q=q.contiguous(),
+        k=k.contiguous(),
+        v=v.contiguous(),
+        g=g.contiguous(),
+        beta=beta.contiguous(),
+        A_log=A_log.contiguous(),
+        dt_bias=dt_bias.contiguous(),
+        scale=q.shape[-1] ** -0.5,
+        initial_state=state,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        output=out,
+        beta_is_logit=True,
+        backend="cute-dsl",
+        **kwargs,
+    )
 
 
 def _flashinfer_kda_prefill(
@@ -843,6 +974,25 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             None
         )
         self._checkpoint_exporter: FlashKDAPrefillCheckpointExporter | None = None
+        # FlashInfer's FP32-state kernel can stand in for FlashKDA's prefill
+        # (VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL, read per call).
+        self._flashinfer_fp32_prefill_supported = (
+            self.kda_prefill_backend == "flashkda"
+            and is_flashinfer_fp32_kda_prefill_supported(
+                self.head_dim,
+                vllm_config.model_config.dtype,
+                recurrent_state_dtype,
+                self.gate_lower_bound,
+            )
+        )
+        if (
+            self._flashinfer_fp32_prefill_supported
+            and envs.VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL
+        ):
+            logger.info_once(
+                "KDA prefill: FlashInfer CuTe DSL kernel with FP32 state in place "
+                "of FlashKDA (eager calls)."
+            )
         if self.kda_prefill_backend == "flashkda":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             N = vllm_config.scheduler_config.max_num_seqs
@@ -924,6 +1074,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             state_dtype=recurrent_state_dtype,
             indices_dtype=torch.int32,
             max_num_tokens=vllm_config.scheduler_config.max_num_seqs,
+        )
+
+    def _use_flashinfer_fp32_prefill(self, num_tokens: int, num_sequences: int) -> bool:
+        """Whether this FlashKDA prefill call runs on FlashInfer's kernel instead.
+
+        Eager only: captured calls keep FlashKDA, whose launches read the
+        sequence offsets on the device. FlashInfer serves batches with more
+        tokens than sequences.
+        """
+        return (
+            self._flashinfer_fp32_prefill_supported
+            and envs.VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL
+            and num_tokens > num_sequences
+            and not torch.cuda.is_current_stream_capturing()
         )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
@@ -1399,7 +1563,61 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     )[:, : q_ns.shape[1]]
                     if non_spec_out is not None:
                         flashkda_out = non_spec_out
-                    if checkpoint is not None:
+                    use_flashinfer = self._use_flashinfer_fp32_prefill(
+                        q_ns.shape[1], initial_state.shape[0]
+                    )
+                    flashinfer_checkpoint = None
+                    if use_flashinfer and checkpoint is not None:
+                        flashinfer_checkpoint = _flashinfer_kda_checkpoint_args(
+                            checkpoint, q_ns.device
+                        )
+                        use_flashinfer = flashinfer_checkpoint is not None
+                    if use_flashinfer:
+                        assert non_spec_query_start_loc is not None
+                        num_sequences = initial_state.shape[0]
+                        if checkpoint is not None:
+                            assert checkpoint.checkpoint_offsets.shape == (
+                                num_sequences,
+                            )
+                            checkpoint_state = checkpoint_state[:num_sequences]
+                        prefill_cu_seqlens = m.flashinfer_prefill_query_start_loc
+                        if prefill_cu_seqlens is None:
+                            prefill_cu_seqlens = non_spec_query_start_loc.to(
+                                torch.int64
+                            )
+                        _flashinfer_fp32_kda_prefill(
+                            q=q_ns,
+                            k=k_ns,
+                            v=v_ns,
+                            g=g1_ns,
+                            beta=beta_ns,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                            lower_bound=self.gate_lower_bound,
+                            state=initial_state,
+                            cu_seqlens=prefill_cu_seqlens,
+                            out=flashkda_out,
+                            checkpoint_state=(
+                                checkpoint_state
+                                if flashinfer_checkpoint is not None
+                                else None
+                            ),
+                            checkpoint_args=flashinfer_checkpoint,
+                        )
+                        core_attn_out_non_spec = flashkda_out
+                        # The kernel advanced the gathered states in place.
+                        last_recurrent_state = initial_state
+                        if checkpoint is not None:
+                            assert self._checkpoint_exporter is not None
+                            self._checkpoint_exporter.export(
+                                checkpoint,
+                                raw_qkv=mixed_qkv_ns,
+                                conv_state=conv_state,
+                                recurrent_checkpoint=checkpoint_state,
+                                recurrent_state=recurrent_state,
+                                cu_seqlens=non_spec_query_start_loc,
+                            )
+                    elif checkpoint is not None:
                         assert non_spec_query_start_loc is not None
                         num_sequences = initial_state.shape[0]
                         assert checkpoint.checkpoint_offsets.shape == (num_sequences,)

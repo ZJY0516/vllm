@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_HYBRID_EP_MOE: bool = False
     VLLM_KIMI_K3_FRONT_SITU_GEMM: bool = False
+    VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_MLA_FUSED_Q_QUANT_PAD: bool = False
@@ -1765,6 +1766,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # situ_and_mul at the token counts it serves).
     "VLLM_KIMI_K3_FRONT_SITU_GEMM": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_FRONT_SITU_GEMM", "0"))
+    ),
+    # Kimi K3 KDA layers with the FlashKDA prefill backend: run eager prefill
+    # through FlashInfer's CuTe DSL KDA prefill kernel, which keeps the FP32
+    # recurrent state, instead of FlashKDA. Same recurrence; the outputs and
+    # states are not bitwise equal to FlashKDA. Graph capture and checkpoint
+    # offsets that are not multiples of 32 keep FlashKDA.
+    "VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL", "0"))
     ),
     # Kimi K3 only, and unrelated to the MoE flags above. Tap the pre-norm
     # AttnRes mixture, rather than the post-mixture sum, as the auxiliary

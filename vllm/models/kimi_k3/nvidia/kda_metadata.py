@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -249,6 +250,11 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         self.use_flashinfer_prefill = (
             isinstance(additional_config, dict)
             and additional_config.get("kda_prefill_backend") == "flashinfer"
+        )
+        # FlashInfer's FP32-state KDA prefill (opt-in under FlashKDA) also takes
+        # int64 offsets; build them once per step rather than per layer.
+        self.build_int64_prefill_offsets = (
+            self.use_flashinfer_prefill or envs.VLLM_KIMI_K3_FLASHINFER_FP32_KDA_PREFILL
         )
         self.use_recoverssm = vllm_config.cache_config.use_kda_recoverssm
         self.spec_state_slots = 1 if self.use_recoverssm else self.num_spec + 1
@@ -609,14 +615,17 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
 
         flashinfer_prefill_query_start_loc = None
         flashinfer_prefill_seq_order = None
-        if self.use_flashinfer_prefill and num_prefills > 0:
+        if self.build_int64_prefill_offsets and num_prefills > 0:
             assert non_spec_query_start_loc is not None
             flashinfer_prefill_query_start_loc = non_spec_query_start_loc.to(
                 torch.int64
             )
             num_non_spec_requests = non_spec_query_start_loc.shape[0] - 1
             num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
-            if num_non_spec_tokens > num_non_spec_requests:
+            if (
+                self.use_flashinfer_prefill
+                and num_non_spec_tokens > num_non_spec_requests
+            ):
                 flashinfer_prefill_seq_order = torch.argsort(
                     flashinfer_prefill_query_start_loc.diff(), descending=True
                 ).to(torch.int32)
