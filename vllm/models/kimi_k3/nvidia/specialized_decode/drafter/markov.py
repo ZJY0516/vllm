@@ -478,6 +478,10 @@ def sample_sequential(spec, model, num_reqs: int, head_hidden: torch.Tensor) -> 
         sample_hidden = head_hidden[spec.sample_indices[:num_sample]]
         local = sharded.local_logits(model, sample_hidden)
         if local.shape[-1] == sharded.vs:
+            steps = sharded.steps
+            if steps is not None and steps.serves(num_reqs, n_spec, local):
+                steps.run(spec, num_reqs, local, w1, w2)
+                return True
             noise = sharded.fork_noise(spec, num_reqs, n_spec)
             if noise is not None:
                 sharded.join()
@@ -809,6 +813,7 @@ class ShardedMarkov:
         )
         self.noise = None
         self.stream = None
+        self.steps = None  # ShardedMarkovSteps (K31_MK1), built by `_sharded`
         torch.accelerator.synchronize(device)
         torch.distributed.barrier(group=comm.group)
 
@@ -1035,4 +1040,611 @@ def _sharded(spec, model, w2, device):
             comm.tp,
             sharded.vs,
         )
+        if os.environ.get(STEPS_ENV, "0") == "1":
+            # Collective: every rank builds it here, at the same first draft.
+            head_w1 = model.model.markov_head.markov_w1.weight
+            sharded.steps = ShardedMarkovSteps.build(
+                sharded, spec, spec.num_speculative_steps, head_w1, w2
+            )
     return sharded
+
+
+# --------------------------------------------------------------------------------
+# Vocabulary-sharded steps, all draft steps in one launch (K31_MK1=1)
+# --------------------------------------------------------------------------------
+STEPS_ENV = "K31_MK1"
+STEPS_CTAS_ENV = "K31_MK1_CTAS"  # CTA count override (tuning), 0 = default
+# Variant (tests): default one tile per CTA only; "any" also fewer CTAs (each over
+# several tiles).
+STEPS_MODE_ENV = "K31_MK1_MODE"
+STEPS_VT_ENV = "K31_MK1_VT"  # vocabulary entries per tile (tuning), default VT
+STEPS_WARPS_ENV = "K31_MK1_WARPS"  # warps per CTA (tuning), default 4
+# Requests the one-launch steps serve (more take ShardedMarkov's launches).
+STEPS_RMAX = 4
+# A rank's best (key, token) of a row as one ordered word: the key's order bits
+# (32) above the inverted token id (18): the integer maximum is the largest key and,
+# among equal keys, the smallest token, as the stock first-max argmax. A mailbox
+# word carries the call's tag above them (bits 50-62, so the word stays positive).
+_TOKEN_BITS = tl.constexpr(18)
+_TAG_SHIFT = tl.constexpr(50)
+_TAG_MOD = tl.constexpr(8191)
+
+
+@triton.jit
+def _store_sys_b64(addr, value, ok):
+    # A relaxed system-scope 64-bit store to `addr` where `ok` (peer mailboxes).
+    return tl.inline_asm_elementwise(
+        "{ .reg .pred p; setp.ne.s32 p, $3, 0; "
+        "@p st.relaxed.sys.global.b64 [$1], $2; mov.b64 $0, $2; }",
+        "=l,l,l,r",
+        [addr, value, ok],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _launch_dependents():
+    # griddepcontrol.launch_dependents (a no-op for a dependent without PDL).
+    tl.inline_asm_elementwise(
+        "griddepcontrol.launch_dependents; // $0",
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+# Every integer but the request count and the rank is fixed for a speculator, so
+# the launched kernel is the one compiled (and checked) at build: specialized on
+# them (measured faster in A/B: graph replay of the 16-rank K=7 call).
+@triton.jit(do_not_specialize=["num_rows", "rank"])
+def _markov_shard_steps_kernel(
+    input_ids_ptr,
+    anchor_idx_ptr,
+    w1_ptr,  # markov_w1 [V1, RANK]
+    w2_ptr,  # this rank's markov_w2 rows [V / TP, RANK]
+    base_ptr,  # local base logits of (row, step) at row * s0 + step * s1 + v
+    base_stride0,
+    base_stride1,
+    out_ptr,  # local final logits [rows, k, V / TP]
+    out_stride0,
+    out_stride1,
+    idx_map_ptr,
+    idx_stride,
+    pos_ptr,
+    pos_stride,
+    temp_ptr,
+    seeds_ptr,
+    noise_ptr,  # [RMAX, K, V / TP] FP32 scratch
+    words_ptr,  # [2, K, RMAX, ctas] int64: every program's tagged best word
+    count_ptr,  # [K] int64 arrivals per step (only grows)
+    box_ptr,  # this rank's mailbox [2, K, RMAX, W] int64
+    peers_ptr,  # [W] int64: every rank's mailbox address
+    tokens_ptr,
+    tokens_stride,
+    num_rows,
+    vocab,  # the range's length
+    voff,  # the range's first token id
+    num_tiles,
+    rank,
+    ctas,
+    K: tl.constexpr,
+    W: tl.constexpr,
+    W_POW2: tl.constexpr,
+    RANK: tl.constexpr,
+    VT: tl.constexpr,
+    RB: tl.constexpr,
+    RMAX: tl.constexpr,
+    SALT: tl.constexpr,
+    CTAS_POW2: tl.constexpr,
+    RK_POW2: tl.constexpr,  # a power of two >= RMAX * K
+    HOIST: tl.constexpr,  # one tile per program, its markov_w2 tile loaded once
+):
+    # The K steps of `ShardedMarkov.run` in one grid of `ctas` programs, each owning
+    # the VT-entry tiles pid, pid + ctas, ... of the rank's range. Per step and tile:
+    # ``_markov_shard_step_kernel``'s bias, add, rounding, cache-bound logits and key
+    # (FP32 keys, the noise up to its last log read back as with
+    # ``_markov_noise_shard_kernel``); the program's first-max over its tiles as an
+    # ordered word (key order bits, inverted token), tagged with the call. The step's
+    # token is the largest word over the ranks (`_markov_global_select_kernel`'s
+    # first largest key): the last program of the rank to arrive (step counter)
+    # takes the largest of the rank's words and stores it into this rank's slot of
+    # every rank's mailbox; every program polls the W slots. The waits (the words
+    # of this rank's programs, the mailbox) are on programs of the same grid on
+    # every rank, all resident (cooperative launch, checked when built): other
+    # kernels can delay them but not block them.
+    pid = tl.program_id(0)
+    # The call: every program adds 1 to the step-0 counter per call and this one
+    # has not yet, so it reads [call * ctas, call * ctas + ctas - 1].
+    call = tl.load(count_ptr, volatile=True) // ctas
+    tag = call % _TAG_MOD + 1
+    par = call % 2
+    rows = tl.arange(0, RB)
+    rmask = rows < num_rows
+    rows64 = rows.to(tl.int64)
+    k = tl.arange(0, RANK)
+    r4 = tl.arange(0, RMAX)
+    j = tl.arange(0, W_POW2)
+    g = tl.arange(0, CTAS_POW2)
+    slot_mask = (r4[:, None] < num_rows) & (j[None, :] < W)
+    peers = tl.load(peers_ptr + j, mask=j < W, other=0)
+    # Step 0's previous token, and (one tile per program) the program's markov_w2
+    # tile and step 0's inputs that do not depend on a token: issued first, they
+    # load while the noise is checked.
+    anchor = tl.load(anchor_idx_ptr + rows, mask=rmask, other=0)
+    prev = tl.load(input_ids_ptr + anchor, mask=rmask, other=0).to(tl.int64)
+    if HOIST:
+        vh = pid * VT + tl.arange(0, VT)
+        vhmask = vh < vocab
+        hmask = rmask[:, None] & vhmask[None, :]
+        wh = tl.load(
+            w2_ptr + vh[:, None].to(tl.int64) * RANK + k[None, :],
+            mask=vhmask[:, None],
+            other=0.0,
+        )
+        req_n = tl.load(idx_map_ptr + rows64 * idx_stride, mask=rmask, other=-1)
+        req_n = req_n.to(tl.int64)
+        temp_n = tl.load(temp_ptr + req_n, mask=req_n >= 0, other=0.0).to(tl.float32)
+        base_n = tl.load(
+            base_ptr + rows64[:, None] * base_stride0 + vh[None, :],
+            mask=hmask,
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+    # The noise of the sampled rows (zero temperature: no noise), every step.
+    rk = tl.arange(0, RK_POW2)
+    rkm = rk < num_rows * K
+    rk_req = tl.load(
+        idx_map_ptr + (rk // K).to(tl.int64) * idx_stride + rk % K, mask=rkm, other=-1
+    ).to(tl.int64)
+    rk_temp = tl.load(temp_ptr + rk_req, mask=rkm & (rk_req >= 0), other=0.0)
+    if tl.sum(tl.where(rk_temp.to(tl.float32) != 0.0, 1, 0)) > 0:
+        for rs in range(0, num_rows * K):
+            r = rs // K
+            st = rs % K
+            req = tl.load(idx_map_ptr + r.to(tl.int64) * idx_stride + st).to(tl.int64)
+            t_rs = tl.load(temp_ptr + req, mask=req >= 0, other=0.0).to(tl.float32)
+            if t_rs != 0.0:
+                seed = spec_step_seed(
+                    tl.load(seeds_ptr + req, mask=req >= 0, other=0), st
+                )
+                pos = tl.load(pos_ptr + r.to(tl.int64) * pos_stride + st) - 1
+                pos = pos.to(tl.int64) + SALT
+                row = noise_ptr + (r * K + st).to(tl.int64) * vocab
+                for t in range(pid, num_tiles, ctas):
+                    v = t * VT + tl.arange(0, VT)
+                    arg = _gumbel_log_arg32(seed, pos, v + voff)
+                    tl.store(row + v, arg, mask=v < vocab)
+        tl.debug_barrier()
+    if HOIST:
+        arg_n = tl.load(
+            noise_ptr + (rows64[:, None] * K) * vocab + vh[None, :],
+            mask=hmask & (temp_n[:, None] != 0.0),
+            other=1.0,
+        )
+    for step in range(0, K):
+        emb = tl.load(
+            w1_ptr + prev[:, None] * RANK + k[None, :], mask=rmask[:, None], other=0.0
+        )
+        if HOIST:
+            temp = temp_n
+        else:
+            req = tl.load(
+                idx_map_ptr + rows64 * idx_stride + step, mask=rmask, other=-1
+            )
+            req = req.to(tl.int64)
+            temp = tl.load(temp_ptr + req, mask=req >= 0, other=0.0).to(tl.float32)
+        noisy = temp[:, None] != 0.0
+        best_val = tl.full([RB], float("-inf"), tl.float32)
+        best_idx = tl.zeros([RB], tl.int64)
+        if HOIST:
+            acc = tl.dot(emb, tl.trans(wh))
+            base = base_n
+            dt = base.dtype
+            hlogits = _add_rn(base.to(tl.float32), acc.to(dt).to(tl.float32)).to(dt)
+            arg = arg_n
+            lf = hlogits.to(tl.float32)
+            lf = tl.where(noisy, lf / temp[:, None], lf)
+            x = tl.where(noisy, lf + -tl.log(arg), lf)
+            x = tl.where(vhmask[None, :], x, float("-inf"))
+            bv, bi = tl.max(
+                x, axis=1, return_indices=True, return_indices_tie_break_left=True
+            )
+            take = bv > best_val
+            best_val = tl.where(take, bv, best_val)
+            best_idx = tl.where(take, (voff + pid * VT + bi).to(tl.int64), best_idx)
+        else:
+            for t in range(pid, num_tiles, ctas):
+                v = t * VT + tl.arange(0, VT)
+                vmask = v < vocab
+                w = tl.load(
+                    w2_ptr + v[:, None].to(tl.int64) * RANK + k[None, :],
+                    mask=vmask[:, None],
+                    other=0.0,
+                    eviction_policy="evict_last",
+                )
+                acc = tl.dot(emb, tl.trans(w))
+                bmask = rmask[:, None] & vmask[None, :]
+                base = tl.load(
+                    base_ptr
+                    + rows64[:, None] * base_stride0
+                    + step * base_stride1
+                    + v[None, :],
+                    mask=bmask,
+                    other=0.0,
+                    eviction_policy="evict_first",
+                )
+                dt = base.dtype
+                logits = _add_rn(base.to(tl.float32), acc.to(dt).to(tl.float32)).to(dt)
+                tl.store(
+                    out_ptr
+                    + rows64[:, None] * out_stride0
+                    + step * out_stride1
+                    + v[None, :],
+                    logits,
+                    mask=bmask,
+                )
+                arg = tl.load(
+                    noise_ptr + (rows64[:, None] * K + step) * vocab + v[None, :],
+                    mask=bmask & noisy,
+                    other=1.0,
+                )
+                lf = logits.to(tl.float32)
+                lf = tl.where(noisy, lf / temp[:, None], lf)
+                x = tl.where(noisy, lf + -tl.log(arg), lf)
+                x = tl.where(vmask[None, :], x, float("-inf"))
+                bv, bi = tl.max(
+                    x, axis=1, return_indices=True, return_indices_tie_break_left=True
+                )
+                take = bv > best_val
+                best_val = tl.where(take, bv, best_val)
+                best_idx = tl.where(take, (voff + t * VT + bi).to(tl.int64), best_idx)
+        # The ordered word: -0 as +0 (equal keys), then the float order as unsigned.
+        bits = best_val.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+        bits = tl.where(bits == 0x80000000, 0, bits)
+        order = tl.where(bits >= 0x80000000, 0xFFFFFFFF - bits, bits + 0x80000000)
+        packed = (order << _TOKEN_BITS) | ((1 << _TOKEN_BITS) - 1 - best_idx)
+        slot = (par * K + step) * RMAX
+        for i in tl.static_range(RMAX):
+            if i < num_rows:
+                word = tl.max(tl.where(rows == i, packed, 0), axis=0)
+                # A strong store (the last program polls it), its old value unused.
+                tl.atomic_xchg(
+                    words_ptr + (slot + i) * ctas + pid,
+                    (tag << _TAG_SHIFT) | word,
+                    sem="relaxed",
+                    scope="gpu",
+                )
+        old = tl.atomic_add(count_ptr + step, 1, sem="relaxed", scope="gpu")
+        if old % ctas == ctas - 1:
+            # The last program of this rank: every word of the rank (tagged, so
+            # stores still on their way are waited for), their largest to every rank.
+            best = tl.zeros([RMAX], tl.int64)
+            for i in tl.static_range(RMAX):
+                if i < num_rows:
+                    ws = words_ptr + (slot + i) * ctas + g
+                    gm = g < ctas
+                    got = tl.load(ws, mask=gm, other=0, volatile=True)
+                    miss = tl.sum(tl.where(gm & ((got >> _TAG_SHIFT) != tag), 1, 0))
+                    while miss > 0:
+                        got = tl.load(ws, mask=gm, other=0, volatile=True)
+                        miss = tl.sum(tl.where(gm & ((got >> _TAG_SHIFT) != tag), 1, 0))
+                    # Read again: every word is final now, in every thread's copy.
+                    got = tl.load(ws, mask=gm, other=0, volatile=True)
+                    best = tl.where(r4 == i, tl.max(tl.where(gm, got, 0), axis=0), best)
+            addr = peers[None, :] + ((slot + r4[:, None]) * W + rank) * 8
+            data = best[:, None] + tl.zeros([RMAX, W_POW2], tl.int64)
+            _store_sys_b64(addr, data, slot_mask.to(tl.int32))
+        if HOIST:
+            nxt = step + 1
+            more = nxt < K
+            req_n = tl.load(
+                idx_map_ptr + rows64 * idx_stride + nxt, mask=rmask & more, other=-1
+            )
+            req_n = req_n.to(tl.int64)
+            temp_n = tl.load(temp_ptr + req_n, mask=req_n >= 0, other=0.0)
+            temp_n = temp_n.to(tl.float32)
+            base_n = tl.load(
+                base_ptr
+                + rows64[:, None] * base_stride0
+                + nxt * base_stride1
+                + vh[None, :],
+                mask=hmask & more,
+                other=0.0,
+                eviction_policy="evict_first",
+            )
+            arg_n = tl.load(
+                noise_ptr + (rows64[:, None] * K + nxt) * vocab + vh[None, :],
+                mask=hmask & more & (temp_n[:, None] != 0.0),
+                other=1.0,
+            )
+        xs = box_ptr + (slot + r4[:, None]) * W + j[None, :]
+        got = tl.load(xs, mask=slot_mask, other=0, volatile=True)
+        miss = tl.sum(tl.where(slot_mask & ((got >> _TAG_SHIFT) != tag), 1, 0))
+        while miss > 0:
+            got = tl.load(xs, mask=slot_mask, other=0, volatile=True)
+            miss = tl.sum(tl.where(slot_mask & ((got >> _TAG_SHIFT) != tag), 1, 0))
+        # Read again: every slot is final now, in every thread's copy of it.
+        got = tl.load(xs, mask=slot_mask, other=0, volatile=True)
+        top = tl.max(tl.where(slot_mask, got & ((1 << _TAG_SHIFT) - 1), -1), axis=1)
+        tok = (1 << _TOKEN_BITS) - 1 - (top & ((1 << _TOKEN_BITS) - 1))
+        if HOIST:
+            # The cache-bound logits, off the token's path (read after the grid).
+            tl.store(
+                out_ptr
+                + rows64[:, None] * out_stride0
+                + step * out_stride1
+                + vh[None, :],
+                hlogits,
+                mask=hmask,
+            )
+        tl.store(
+            tokens_ptr + r4 * tokens_stride + step,
+            tok,
+            mask=(r4 < num_rows) & (pid == 0),
+        )
+        prev = tl.sum(tl.where(rows[:, None] == r4[None, :], tok[None, :], 0), axis=1)
+    # The logits gather that follows (launched with PDL) may start: every program
+    # of this grid is resident, and it waits for this grid's end to read.
+    _launch_dependents()
+
+
+def _resident_ctas(kernel, device) -> int:
+    """CTAs of the compiled `kernel` the device holds at once (the occupancy API
+    times the SM count), 0 when unknown."""
+    import ctypes
+
+    try:
+        if getattr(kernel, "function", None) is None:
+            kernel._init_handles()
+        lib = ctypes.CDLL("libcuda.so.1")
+        blocks = ctypes.c_int(0)
+        rc = lib.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            ctypes.byref(blocks),
+            ctypes.c_void_p(int(kernel.function)),
+            ctypes.c_int(32 * int(kernel.metadata.num_warps)),
+            ctypes.c_size_t(int(kernel.metadata.shared)),
+        )
+        if rc != 0:
+            logger.warning("DSpark Markov one-launch steps: occupancy rc %d", rc)
+            return 0
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        return int(blocks.value) * int(sms)
+    except Exception as exc:  # no occupancy answer: the launches stay as they are
+        logger.warning("DSpark Markov one-launch steps: occupancy %s", exc)
+        return 0
+
+
+class ShardedMarkovSteps:
+    """`ShardedMarkov.run` with all draft steps in one cooperative launch
+    (`_markov_shard_steps_kernel`), then the same logits gather and cache scatter.
+    Built eagerly (collective) next to its ShardedMarkov; `ok` is the same on every
+    rank (MIN over the TP group), so every rank takes the same path for a step."""
+
+    def __init__(self, sharded, n_spec):
+        import os
+
+        from ..symm import peer_rendezvous
+
+        comm = sharded.comm
+        self.sharded, self.comm, self.k = sharded, comm, n_spec
+        self.tp, self.rank, self.device = comm.tp, comm.rank, sharded.device
+        self.vs, self.voff, self.vocab = sharded.vs, sharded.voff, sharded.vocab
+        self.vt = int(os.environ.get(STEPS_VT_ENV, "0") or 0) or VT
+        self.tiles = triton.cdiv(self.vs, self.vt)
+        self.ctas = 1
+        dev = self.device
+        self.noise = torch.zeros(
+            STEPS_RMAX * n_spec * self.vs, dtype=torch.float32, device=dev
+        )
+        self.words = torch.zeros(
+            2 * n_spec * STEPS_RMAX * self.tiles, dtype=torch.int64, device=dev
+        )
+        self.count = torch.zeros(n_spec, dtype=torch.int64, device=dev)
+        import torch.distributed._symmetric_memory as symm_mem
+
+        self.box = symm_mem.empty(
+            2 * n_spec * STEPS_RMAX * self.tp, dtype=torch.int64, device=dev
+        )
+        self.box.zero_()
+        handle = peer_rendezvous(self.box, comm.group)
+        self.peers = torch.tensor(
+            [int(p) for p in handle.buffer_ptrs], dtype=torch.int64, device=dev
+        )
+        self._handle = handle
+        self.kernel = None
+        self.meta = None
+        self.resident = 0
+        self.ok = False
+
+    @classmethod
+    def build(cls, sharded, spec, n_spec, w1, w2):
+        """The steps object (`ok` False when it cannot serve, the same on every
+        rank). Collective over the drafter TP group."""
+        import os
+
+        comm = sharded.comm
+        dev = sharded.device
+        steps = cls(sharded, n_spec)
+        flag, why = 1, ""
+        mode = os.environ.get(STEPS_MODE_ENV, "hoist").split(",")
+        warps = int(os.environ.get(STEPS_WARPS_ENV, "4") or 4)
+        try:
+            if spec.use_fp64_gumbel:
+                raise ValueError("FP64 Gumbel keys")
+            if w1.dtype != torch.bfloat16 or w2.dtype != torch.bfloat16:
+                raise ValueError("Markov weights not bf16")
+            # One tile per CTA (its markov_w2 tile kept across the steps) when the
+            # device holds that grid at once; "any" (tests) also tries fewer CTAs.
+            want = int(os.environ.get(STEPS_CTAS_ENV, "0") or 0) or steps.tiles
+            cands = sorted(
+                (
+                    c
+                    for c in range(1, min(want, steps.tiles) + 1)
+                    if steps.tiles % c == 0
+                ),
+                reverse=True,
+            )
+            if "any" not in mode:
+                cands = [c for c in cands if c == steps.tiles]
+            for ctas in cands:
+                steps.ctas = ctas  # compiled for this count (a specialized value)
+                meta = steps._meta_for(
+                    w1,
+                    ctas,
+                    ctas == steps.tiles,
+                    warps,
+                )
+                kernel = steps._compile(spec, w1, w2, meta)
+                resident = _resident_ctas(kernel, dev)
+                if resident >= ctas:
+                    steps.ctas, steps.meta = ctas, meta
+                    steps.kernel, steps.resident = kernel, resident
+                    break
+            if steps.meta is None:
+                steps.ctas = 1
+                raise ValueError(f"{steps.tiles} CTAs do not fit the device at once")
+        except Exception as exc:  # compile or occupancy failure: stay on the launches
+            flag, why = 0, f"{type(exc).__name__}: {exc}"
+        steps.why = why
+        # Every rank: the same flag and the same CTA count, else nobody uses it.
+        t = torch.tensor([flag, steps.ctas, -steps.ctas], dtype=torch.int64, device=dev)
+        torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MIN, group=comm.group
+        )
+        steps.ok = bool(t[0].item() == 1 and t[1].item() == -t[2].item())
+        torch.accelerator.synchronize(dev)
+        torch.distributed.barrier(group=comm.group)
+        if steps.ok:
+            k = steps.kernel
+            logger.info_once(
+                "DSpark Markov sampling: %d draft steps in one launch over %d ranks "
+                "(%d CTAs of %d warps, %d-entry tiles, %d resident, %d regs, "
+                "%d B shared)",
+                n_spec,
+                steps.tp,
+                steps.ctas,
+                steps.meta["num_warps"],
+                steps.vt,
+                steps.resident,
+                int(getattr(k, "n_regs", -1) or -1),
+                int(k.metadata.shared),
+            )
+        else:
+            logger.info_once(
+                "DSpark Markov one-launch steps off: %s", why or "another rank"
+            )
+        return steps
+
+    def serves(self, num_reqs, n_spec, local) -> bool:
+        return (
+            self.ok
+            and n_spec == self.k
+            and 1 <= num_reqs <= STEPS_RMAX
+            and num_reqs * n_spec <= NOISE_ROWS
+            and local.dtype == torch.bfloat16
+            and local.is_contiguous()
+            and local.shape[0] == num_reqs * n_spec
+        )
+
+    def _args(self, spec, num_reqs, base, out, w1, w2s, idx_map, sample_pos):
+        tokens = spec.draft_tokens
+        return (
+            spec.input_buffers.input_ids,
+            spec._anchor_idx,
+            w1,
+            w2s,
+            base,
+            base.stride(0),
+            base.stride(1),
+            out,
+            out.stride(0),
+            out.stride(1),
+            idx_map,
+            idx_map.stride(0),
+            sample_pos,
+            sample_pos.stride(0),
+            spec.temperature,
+            spec.seeds,
+            self.noise,
+            self.words,
+            self.count,
+            self.box,
+            self.peers,
+            tokens,
+            tokens.stride(0),
+            num_reqs,
+            self.vs,
+            self.voff,
+            self.tiles,
+            self.rank,
+            self.ctas,
+        )
+
+    def _meta_for(self, w1, ctas, hoist, warps):
+        return dict(
+            K=self.k,
+            W=self.tp,
+            W_POW2=triton.next_power_of_2(self.tp),
+            RANK=w1.shape[1],
+            VT=self.vt,
+            RB=RB,
+            RMAX=STEPS_RMAX,
+            SALT=_DRAFT_NOISE_SALT,
+            CTAS_POW2=triton.next_power_of_2(ctas),
+            RK_POW2=triton.next_power_of_2(STEPS_RMAX * self.k),
+            HOIST=bool(hoist),
+            num_warps=warps,
+            num_stages=1,
+            launch_cooperative_grid=True,
+        )
+
+    def _compile(self, spec, w1, w2, meta):
+        """Compile (no launch) the kernel for `meta`."""
+        n = self.k
+        local = torch.empty(n, self.vs, dtype=torch.bfloat16, device=self.device)
+        base = local.view(1, n, self.vs)
+        out = torch.empty_like(local).view(1, n, self.vs)
+        w2s = w2[self.voff : self.voff + self.vs]
+        idx_map = spec.sample_idx_mapping[:n].view(1, n)
+        sample_pos = spec.sample_pos[:n].view(1, n)
+        args = self._args(spec, 1, base, out, w1, w2s, idx_map, sample_pos)
+        return _markov_shard_steps_kernel.warmup(*args, grid=(self.ctas,), **meta)
+
+    def run(self, spec, num_reqs, local, w1, w2):
+        """`ShardedMarkov.run` (same tokens, same cache contents)."""
+        n_spec, vs = self.k, self.vs
+        base = local.view(num_reqs, n_spec, vs)
+        final = torch.empty_like(local)
+        out = final.view(num_reqs, n_spec, vs)
+        w2s = w2[self.voff : self.voff + vs]
+        idx_map = spec.sample_idx_mapping[: num_reqs * n_spec].view(num_reqs, n_spec)
+        sample_pos = spec.sample_pos[: num_reqs * n_spec].view(num_reqs, n_spec)
+        args = self._args(spec, num_reqs, base, out, w1, w2s, idx_map, sample_pos)
+        kernel = _markov_shard_steps_kernel[(self.ctas,)](*args, **self.meta)
+        if kernel is not self.kernel:
+            logger.warning_once(
+                "DSpark Markov one-launch steps: launched a kernel other than the "
+                "one checked at build (cooperative launch still checks residency)"
+            )
+        full = self.comm.gather_logits(final)
+        cache = spec.draft_logits.values
+        _markov_cache_scatter_kernel[
+            (num_reqs * n_spec, triton.cdiv(self.vocab, SCATTER_BLOCK))
+        ](
+            full,
+            full.stride(0),
+            cache,
+            cache.stride(0),
+            cache.stride(1),
+            spec.draft_logits.row_mapping,
+            idx_map,
+            idx_map.stride(0),
+            self.vocab,
+            K=n_spec,
+            BLOCK=SCATTER_BLOCK,
+            num_warps=4,
+        )
