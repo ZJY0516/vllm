@@ -78,6 +78,18 @@ from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
 
+# K31_DEFER_PROMPT_FREE_S > 0: keep the finished request's prompt objects alive for
+# that many seconds after the final output, so the O(prompt length) deallocation of
+# the token-id lists runs after the response stream has closed instead of between the
+# last token and the end of the stream. Bookkeeping only (no change to what is
+# computed or returned).
+_K31_DEFER_PROMPT_FREE_S = float(os.environ.get("K31_DEFER_PROMPT_FREE_S", "0") or 0)
+
+
+def _k31_defer_release(objs: tuple) -> None:
+    holder = [objs]
+    asyncio.get_running_loop().call_later(_K31_DEFER_PROMPT_FREE_S, holder.clear)
+
 
 class InputStreamError(Exception):
     """Wrapper for errors from the input stream generator.
@@ -812,6 +824,8 @@ class AsyncLLM(EngineClient):
                 # own request cleanup based on finished.
                 assert isinstance(out, RequestOutput)
                 finished = out.finished
+                if finished and _K31_DEFER_PROMPT_FREE_S > 0:
+                    _k31_defer_release((prompt, out.prompt_token_ids))
                 if out is not STREAM_FINISHED:
                     yield out
 
