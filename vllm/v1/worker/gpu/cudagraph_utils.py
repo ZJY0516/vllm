@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import itertools
+import os
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
@@ -64,6 +65,11 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner
 
 logger = init_logger(__name__)
+
+# K31_PFG=1 (opt-in): also capture prefill PIECEWISE (breakable) graphs wider than one
+# decode batch when RecoverSSM is on; KDA metadata routes such capture dummies to the
+# non-spec path. Off by default (stock guard unchanged).
+_K31_PFG = os.environ.get("K31_PFG") == "1"
 
 
 class AttentionState(NamedTuple):
@@ -361,6 +367,7 @@ class CudaGraphManager:
             if mixed_mode and (
                 not self.vllm_config.cache_config.use_kda_recoverssm
                 or num_tokens <= max_decode_tokens
+                or _K31_PFG
             ):
                 # for PIECEWISE graphs there is no limit on requests when replaying
                 # i.e. no request padding is needed, so we leave it as None.

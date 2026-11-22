@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
@@ -1194,19 +1195,30 @@ def dcp_a2a_v_up_proj_lse_reduce(
     )
 
 
+# K31_DCPWS=N > 0 (opt-in): cap the DCP workspace rows (direct A2A, query gather,
+# top-k merge rescue) at max(N, one decode batch) instead of letting them grow with
+# the largest CUDA-graph capture size. Steps on the DCP path with more rows than the
+# cap take the existing larger-batch fallbacks. Off by default.
+_K31_DCPWS = int(os.environ.get("K31_DCPWS", "0") or 0)
+
+
 def get_dcp_workspace_max_num_tokens(vllm_config: VllmConfig) -> int:
     scheduler_config = vllm_config.scheduler_config
     # num_speculative_tokens also counts a diffusion canvas.
     tokens_per_seq = max(
         1 + vllm_config.num_speculative_tokens, max_decode_query_len(vllm_config)
     )
-    return min(
+    decode_rows = scheduler_config.max_num_seqs * tokens_per_seq
+    rows = min(
         scheduler_config.max_num_batched_tokens,
         max(
-            scheduler_config.max_num_seqs * tokens_per_seq,
+            decode_rows,
             vllm_config.compilation_config.max_cudagraph_capture_size or 0,
         ),
     )
+    if _K31_DCPWS > 0:
+        rows = min(rows, max(_K31_DCPWS, decode_rows))
+    return rows
 
 
 def reserve_query_head_storage(
