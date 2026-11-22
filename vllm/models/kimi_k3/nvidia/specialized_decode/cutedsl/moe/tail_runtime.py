@@ -19,11 +19,15 @@ import torch
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8
 from cutlass.cute.runtime import make_fake_stream
 
+from vllm.logger import init_logger
+
 from ..common.host import fake, prepare_shared_carveout, stream, tensor_maps, to_cute
 from ..common.policy import STEP_CAP, W112, batch_table
 from ..common.twoshot import TwoShot
 from ..oproj.prepared import OprojMailbox
-from .tail import MoeTail, WaveMoeTail, WaveMoeTailExact
+from .tail import MoeTail, WaveMoeTail, WaveMoeTailExact, WaveMoeTailLate
+
+logger = init_logger(__name__)
 
 # MoE tail mailbox tokens (padded decode batches); small-batch front_poll G/W/S rows per
 # parity.
@@ -108,6 +112,20 @@ def pub8(tp, batch):
     """TP16 B<=8 batch on the published path (`PUB8`), run by WaveMoeTailExact."""
     table = batch_table(PUB8.get(tp, ""))
     return tp == 16 and batch <= 8 and bool(table.get(batch, 0))
+
+
+# K31_DR16=1: TP16 published 8-row tails (`PUB8`, one request at k = 7) run
+# WaveMoeTailLate: the up projection starts on x * gamma before the RMS exchange and
+# the owners scale the sums by the inverse RMS (not the same bits as
+# normalize-first). K31_DR16_MODE picks its variant ("p", "s", "m"). Default off.
+DR16 = {16: "8:1" if _on("K31_DR16") else ""}
+DR16_MODE = os.environ.get("K31_DR16_MODE", "s")
+
+
+def dr16(tp, batch):
+    """TP16 `pub8` batch whose WaveMoeTailExact runs late-scaled (`DR16`)."""
+    table = batch_table(DR16.get(tp, ""))
+    return pub8(tp, batch) and bool(table.get(batch, 0))
 
 
 def published(tp, batch):
@@ -224,6 +242,7 @@ def compile_tail(
     direct=False,
     vote=False,
     late=False,
+    late16=None,
 ):
     """front: rows complete at the PDL wait; front_poll: three 0xffff-armed G/W/S parity
     slots polled per row and re-armed after use; publish (`published`): WaveMoeTail
@@ -231,7 +250,7 @@ def compile_tail(
     twoshot: publish over the two-shot receive slots and gather. `gate` and
     `poll_ns`: MoeTail's barrier before the latent/RS poll and its poll sleep
     (`front_gate`, `front_poll_ns`; published: `published_poll_ns`). `direct`,
-    `vote`: WaveMoeTail's (`T8T`)."""
+    `vote`: WaveMoeTail's (`T8T`). `late16`: WaveMoeTailLate's variant (`DR16`)."""
     m8, twoshot = mode in ("publish", "twoshot"), mode == "twoshot"
     vec = lambda n, dtype=BFloat16, align=16: fake((n,), None, dtype, align)
     slots = 3 * POLL_CAP if mode == "front_poll" else batch
@@ -244,7 +263,9 @@ def compile_tail(
     scalars: tuple = (Int64(0), Int64(0), Int32(0), Int32(0), Int32(CAP), Float32(1e-6))
     scalars += (Int32(2), Int32(CAP))
     kernel: MoeTail
-    if m8 and pub8(tp, batch):
+    if m8 and pub8(tp, batch) and late16 is not None:
+        kernel = WaveMoeTailLate(batch, tp, early, poll_ns, late16)
+    elif m8 and pub8(tp, batch):
         kernel = wave = WaveMoeTailExact(batch, tp, early, poll_ns, PUB8_RS_WARP)
     elif m8 and (direct or vote or poll_ns is not None):
         kw = dict(direct=direct, poll_ns=poll_ns, vote=vote, late=late)
@@ -322,6 +343,12 @@ class MoeTailWeights:
             kw = dict(early=b in early, umma=on, gate=gate, poll_ns=sleep)
             if on and late(tp, b):
                 kw.update(late=True)
+            if mode == "publish" and dr16(tp, b):
+                kw.update(late16=DR16_MODE)
+                logger.info_once(
+                    "K31_DR16 MoE tail TP%d B%d: late-scaled up projection (mode %s)",
+                    tp, b, DR16_MODE,
+                )
             if mode != "front" and tp == 8:  # T8T: only TP8 published tails
                 direct8 = direct(tp, b, twoshot)
                 sleep8 = published_poll_ns(tp, b)
