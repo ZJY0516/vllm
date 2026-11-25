@@ -39,8 +39,6 @@ class GroupOffloadConfig(NamedTuple):
     kv_event_group_spec: OffloadingEventGroupSpec
     # None below means full attention
     sliding_window_size_in_chunks: int | None
-    # The group's block size before DCP scaling.
-    block_size: int
     manager_config: ManagerConfig
     # Partial-tail data for this group comes from the scheduler's CoW hand-off
     # rather than the request block table.
@@ -102,7 +100,6 @@ class SchedulerOffloadConfig(NamedTuple):
     supports_partial_tail: bool
     alignment_tokens: int | None = None
     retention_interval: int | None = None
-    dcp_world_size: int = 1
     sync_load_budget_bytes: int = 0
     # KV bytes per token on one worker, summed over the offloaded groups.
     kv_bytes_per_token: int = 0
@@ -174,7 +171,6 @@ class SchedulerOffloadConfig(NamedTuple):
                         // spec.tokens_per_hash
                     ),
                     sliding_window_size_in_chunks=group.sliding_window_size_in_chunks,
-                    block_size=kv_cache_group.block_size,
                     manager_config=kv_cache_group.manager_config,
                     kv_event_group_spec=get_offloading_event_group_spec(kv_cache_group),
                     requires_cow_source=is_mamba_prefix_caching_group(kv_cache_group),
@@ -232,7 +228,6 @@ class SchedulerOffloadConfig(NamedTuple):
             supports_partial_tail=supports_partial_tail,
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
-            dcp_world_size=dcp_world_size,
             # Per-step KV bytes (per worker) loaded within the step (0 disables).
             sync_load_budget_bytes=int(
                 spec.extra_config.get("sync_load_budget_bytes", 0)

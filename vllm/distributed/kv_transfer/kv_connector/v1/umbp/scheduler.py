@@ -230,7 +230,6 @@ class UMBPStoreConnectorScheduler:
         )
         self.kv_cache_config = kv_cache_config
         dcp_size = vllm_config.parallel_config.decode_context_parallel_size
-        self._dcp_size = dcp_size
         self._retention_interval = kv_cache_config.prefix_cache_retention_interval
         self.group_block_sizes = {
             group_id: resolve_dcp_kv_block_size(group, dcp_size)
@@ -1540,11 +1539,10 @@ class UMBPStoreConnectorScheduler:
             start_block=indices.start,
             end_block=indices.stop,
             alignment_tokens=self.block_size,
-            block_size=group.block_size,
+            block_size=self.group_block_sizes[group_id],
             manager_config=group.manager_config,
             retention_interval=self._retention_interval,
             reachable_boundaries=reachable_boundaries,
-            dcp_world_size=self._dcp_size,
         )
         if mask is not None and len(mask) != len(indices):
             raise RuntimeError(

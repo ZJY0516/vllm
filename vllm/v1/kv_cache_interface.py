@@ -798,7 +798,7 @@ class KVCacheGroup:
 
 class PrefixLookupGroup(NamedTuple):
     """KV cache groups looked up jointly for cache hits: they share a manager
-    policy, block size and DCP sharding."""
+    policy, logical block size, and DCP sharding."""
 
     manager_config: ManagerConfig
     block_size: int
@@ -811,15 +811,27 @@ class PrefixLookupGroup(NamedTuple):
 
 def prefix_lookup_groups(
     groups: Sequence[KVCacheGroup],
+    group_block_sizes: Sequence[int] | None = None,
 ) -> list[PrefixLookupGroup]:
-    """Partition the prefix-cacheable groups into joint cache-hit lookups."""
+    """Partition the prefix-cacheable groups into joint cache-hit lookups.
+
+    When `group_block_sizes` is provided (logical tokens per block, after any
+    DCP sharding), `PrefixLookupGroup.block_size` holds that logical size.
+    `dcp_sharded` stays in the grouping key so sharded target and replicated
+    draft groups with equal logical block sizes keep independent lookups.
+    """
+    if group_block_sizes is not None:
+        assert len(group_block_sizes) == len(groups)
     lookups: dict[tuple, PrefixLookupGroup] = {}
     for i, g in enumerate(groups):
         if not g.prefix_cacheable:
             continue
-        key = (g.manager_config, g.block_size, g.dcp_sharded)
+        block_size = (
+            group_block_sizes[i] if group_block_sizes is not None else g.block_size
+        )
+        key = (g.manager_config, block_size, g.dcp_sharded)
         lookup = lookups.setdefault(
-            key, PrefixLookupGroup(g.manager_config, g.block_size, [])
+            key, PrefixLookupGroup(g.manager_config, block_size, [])
         )
         lookup.group_ids.append(i)
     return list(lookups.values())
