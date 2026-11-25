@@ -30,6 +30,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     get_request_block_hasher,
     init_none_hash,
+    resolve_dcp_kv_block_size,
 )
 from vllm.v1.core.sched.output import KVConnectorBlockState, SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -622,7 +623,7 @@ def test_scheduler_accepts_dspark_with_multi_layer_full_attention(
         enable_caching=False,
         kv_cache_group_id=1,
         scheduler_block_size=16,
-        dcp_world_size=dcp_size,
+        block_size=resolve_dcp_kv_block_size(config.transfer_groups[1], dcp_size),
     )
     imported_tokens = manager.block_size
     target_tokens = 1 + vllm_config.num_speculative_tokens

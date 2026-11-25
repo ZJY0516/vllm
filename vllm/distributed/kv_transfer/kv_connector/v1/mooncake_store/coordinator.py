@@ -283,8 +283,6 @@ class MooncakeStoreCoordinator:
                 manager_config=_coverage_config(g.manager_config),
                 retention_interval=retention_interval,
                 reachable_boundaries=reachable_boundaries,
-                # Worker initialization has already resolved DCP in this block size.
-                dcp_world_size=1,
             )
             if mask is not None:
                 assert len(mask) == end_block - start_block

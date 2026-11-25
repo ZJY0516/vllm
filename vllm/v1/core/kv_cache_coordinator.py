@@ -10,6 +10,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
     partial_hash_hits_enabled,
+    resolve_dcp_kv_block_size,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -118,6 +119,12 @@ class KVCacheCoordinator(ABC):
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
 
+        if dcp_world_size > 1:
+            for g in kv_cache_config.kv_cache_groups:
+                assert g.manager_cls.supports_dcp_sharding or not g.dcp_sharded, (
+                    f"DCP sharding is not supported for {g.manager_cls.__name__}."
+                )
+
         self.single_type_managers = tuple(
             create_single_type_manager(
                 kv_cache_group,
@@ -126,7 +133,7 @@ class KVCacheCoordinator(ABC):
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
-                dcp_world_size=dcp_world_size,
+                block_size=resolve_dcp_kv_block_size(kv_cache_group, dcp_world_size),
                 pcp_world_size=pcp_world_size,
                 scheduler_block_size=self.scheduler_block_size,
                 needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,
@@ -526,9 +533,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             metrics_collector=metrics_collector,
             num_hash_lookahead_tokens=num_hash_lookahead_tokens,
         )
-        self.group_block_size = self.kv_cache_config.kv_cache_groups[0].block_size
         self.manager_config = self.kv_cache_config.kv_cache_groups[0].manager_config
-        self.dcp_world_size = self.single_type_managers[0].dcp_world_size
         self.pcp_world_size = pcp_world_size
         self.block_size = self.single_type_managers[0].block_size
         # For models using only Mamba, block_size is set to max_model_len when
@@ -551,10 +556,9 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             max_length=max_cache_hit_length,
             kv_cache_group_ids=[0],
             block_pool=self.block_pool,
-            block_size=self.group_block_size,
+            block_size=self.block_size,
             manager_config=self.manager_config,
             alignment_tokens=self.block_size,
-            dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
             num_request_tokens=num_request_tokens,
         )
@@ -600,7 +604,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # different KV cache groups have different block sizes, the actual block size
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
-        self.dcp_world_size = dcp_world_size
         # Only groups that participate in prefix caching must satisfy the
         # divisibility constraint; groups that opt out (e.g. circular buffers
         # such as the GLM-5.3-Flash indexer tail) are scratch and excluded.
@@ -618,22 +621,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             f"hash_block_size. block_sizes={cacheable_block_sizes}, "
             f"hash_block_size={hash_block_size}"
         )
-        for g in kv_cache_config.kv_cache_groups:
-            replicated = not g.dcp_sharded
-            if pcp_world_size > 1:
+        if pcp_world_size > 1:
+            for g in kv_cache_config.kv_cache_groups:
                 assert issubclass(g.manager_cls, FullAttentionManager) or (
-                    replicated
+                    not g.dcp_sharded
                     and all(
                         isinstance(spec, AttentionSpec)
                         for spec in g.kv_cache_specs.values()
                     )
                 ), "PCP only supports full attention and replicated draft groups."
-            if dcp_world_size > 1:
-                assert issubclass(g.manager_cls, FullAttentionManager) or replicated, (
-                    "DCP with hybrid KV cache layouts only supports "
-                    "full-attention, Mamba, and replicated draft groups, got: "
-                    f"{g.manager_cls.__name__}."
-                )
         # Fine-grained hash hits require compatible cache managers in every
         # group. TP needs hashing finer than the Mamba block;
         # DCP accepts equality because it scales the effective full-attention
@@ -670,7 +666,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # per-request scratch and never take part in hit lookup; their slot in
         # the per-group hit tuple stays empty.
         groups = self.kv_cache_config.kv_cache_groups
-        self.attention_groups = prefix_lookup_groups(groups)
+        self.attention_groups = prefix_lookup_groups(groups, self.group_block_sizes)
 
         assert self.attention_groups, (
             "HybridKVCacheCoordinator requires at least one cacheable group."
@@ -764,9 +760,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     block_size=block_size,
                     manager_config=manager_config,
                     alignment_tokens=self._cache_hit_alignment_tokens,
-                    dcp_world_size=self.single_type_managers[
-                        first_group_id
-                    ].dcp_world_size,
                     pcp_world_size=self.single_type_managers[
                         first_group_id
                     ].pcp_world_size,
@@ -836,7 +829,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 block_size=block_size,
                 manager_config=manager_config,
                 alignment_tokens=self._cache_hit_alignment_tokens,
-                dcp_world_size=manager.dcp_world_size,
                 pcp_world_size=manager.pcp_world_size,
                 num_request_tokens=num_request_tokens,
             )

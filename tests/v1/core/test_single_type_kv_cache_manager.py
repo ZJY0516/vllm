@@ -7,9 +7,11 @@ import pytest
 import torch
 
 from tests.v1.core.utils import new_kv_cache_group
+from vllm.config import ModelConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -28,7 +30,10 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    KVCacheConfig,
+    KVCacheGroup,
     MambaSpec,
+    ManagerConfig,
 )
 from vllm.v1.request import Request
 
@@ -1308,3 +1313,65 @@ def test_pop_blocks_for_free_trims_null_head():
     block_pool.free_blocks([null])
     assert null.ref_cnt == null_ref_cnt
     assert block_pool.get_num_free_blocks() == num_free_blocks
+
+
+def test_startup_and_runtime_admission_cap_agree_under_dcp():
+    """Startup `max_allocated_blocks_per_request` and runtime
+    `KVCacheCoordinator` construction must resolve the same DCP-logical
+    block size for `max_admission_blocks`."""
+
+    class _DCPShardedSlidingWindowManager(SlidingWindowManager):
+        supports_dcp_sharding = True
+
+    dcp_world_size = 4
+    physical_block_size = 16
+    logical_block_size = physical_block_size * dcp_world_size
+    max_in_flight_tokens = 128
+    max_model_len = 1024
+
+    layer = SlidingWindowManager.layer_config(
+        AttentionSpec(
+            block_size=physical_block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            dcp_sharded=True,
+        ),
+        sliding_window=128,
+    )
+    group = KVCacheGroup(
+        kv_cache_specs={"swa": layer.spec},
+        manager_config=ManagerConfig(
+            _DCPShardedSlidingWindowManager, layer.manager_config.params
+        ),
+        block_size=physical_block_size,
+        dcp_sharded=True,
+    )
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=max_model_len))
+    vllm_config.parallel_config.decode_context_parallel_size = dcp_world_size
+    vllm_config.scheduler_config.max_num_batched_tokens = max_in_flight_tokens
+    vllm_config.scheduler_config.async_scheduling = False
+
+    startup_blocks = group.max_allocated_blocks_per_request(vllm_config)
+    kv_cache_manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=32,
+            kv_cache_tensors=[],
+            kv_cache_groups=[group],
+        ),
+        max_model_len=max_model_len,
+        max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+        enable_caching=False,
+        hash_block_size=logical_block_size,
+        scheduler_block_size=logical_block_size,
+        dcp_world_size=dcp_world_size,
+    )
+    manager = kv_cache_manager.coordinator.single_type_managers[0]
+    assert manager.block_size == logical_block_size
+    assert startup_blocks == manager.max_admission_blocks_per_request
+    assert startup_blocks == SlidingWindowManager.max_admission_blocks(
+        layer.manager_config,
+        logical_block_size,
+        max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+        max_model_len=max_model_len,
+    )

@@ -1529,6 +1529,121 @@ def test_dcp_target_allocates_replicated_draft_independently(
     assert [len(group) for group in cached_blocks.blocks] == [1, 4]
 
 
+def test_kv_cache_manager_rejects_dcp_sharded_non_full_attention():
+    """Managers with supports_dcp_sharding=False fail fast when DCP shards them."""
+    sharded_swa = new_kv_cache_group(
+        ["swa"],
+        sliding_window_layer(
+            AttentionSpec(
+                block_size=16,
+                num_kv_heads=8,
+                head_size=64,
+                dtype=torch.bfloat16,
+                dcp_sharded=True,
+            ),
+            sliding_window=256,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[sharded_swa],
+    )
+    with pytest.raises(AssertionError, match="SlidingWindowManager"):
+        KVCacheManager(
+            kv_cache_config,
+            max_model_len=1024,
+            hash_block_size=64,
+            scheduler_block_size=64,
+            dcp_world_size=4,
+            enable_caching=True,
+        )
+
+
+def test_sharded_target_and_replicated_draft_keep_independent_lookup_groups():
+    """Sharded target and replicated draft with equal logical block sizes stay
+    in separate lookup groups so independent full/partial entries still hit."""
+    target_group = new_kv_cache_group(
+        ["target"],
+        full_layer(
+            AttentionSpec(
+                block_size=16,
+                num_kv_heads=8,
+                head_size=64,
+                dtype=torch.bfloat16,
+                dcp_sharded=True,
+            )
+        ),
+    )
+    draft_group = new_kv_cache_group(
+        ["draft"],
+        full_layer(
+            AttentionSpec(
+                block_size=64,
+                num_kv_heads=8,
+                head_size=64,
+                dtype=torch.bfloat16,
+                dcp_sharded=False,
+            )
+        ),
+    )
+    mamba_group = new_kv_cache_group(
+        ["mamba"], new_mamba_layer(enable_prefix_caching=True, block_size=16)
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[target_group, draft_group, mamba_group],
+    )
+    manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=1024,
+        hash_block_size=16,
+        scheduler_block_size=64,
+        dcp_world_size=4,
+        enable_caching=True,
+    )
+    assert manager.coordinator.group_block_sizes == (64, 64, 16)
+    assert manager.coordinator.enable_partial_hash_hits
+    assert [g.group_ids for g in manager.coordinator.attention_groups] == [
+        [0],
+        [1],
+        [2],
+    ]
+
+    init_none_hash(sha256)
+    # First chunk at 48 tokens caches Mamba's 48-token snapshot (block 2);
+    # extending to 64 promotes target & draft to 64-token full blocks.
+    req_full = make_request("full", list(range(65)), block_size=16, hash_fn=sha256)
+    assert manager.allocate_slots(req_full, 48) is not None
+    req_full.num_computed_tokens = 48
+    assert manager.allocate_slots(req_full, 16) is not None
+    manager.free(req_full)
+    # Evict draft's and Mamba's 64-token entries and leave a 48-token partial
+    # entry for draft while target retains its full 64-token block and Mamba
+    # retains its 48-token snapshot.
+    pool = manager.block_pool
+    full_hash = req_full.block_hashes[3]
+    for group_id in (1, 2):
+        cached = pool.get_cached_block(full_hash, [group_id])
+        assert cached is not None
+        pool._maybe_evict_cached_block(cached[0])
+    draft_partial = pool.get_new_blocks(1)[0]
+    pool.cache_partial_block(
+        request=req_full,
+        block=draft_partial,
+        num_tokens=48,
+        kv_cache_group_id=1,
+        block_size=64,
+    )
+    pool.free_blocks([draft_partial])
+
+    req_replay = make_request("replay", list(range(65)), block_size=16, hash_fn=sha256)
+    hit_blocks, num_cached, _ = manager.get_computed_blocks(req_replay)
+    assert num_cached == 48
+    assert [len(group) for group in hit_blocks.blocks] == [1, 1, 3]
+
+
 def test_dcp_hybrid_target_pads_replicated_draft_pages(monkeypatch):
     """A hybrid target keeps a layer-compact layout next to a replicated draft:
     the draft's pages are padded to the target's instead of packing blocks."""

@@ -6594,6 +6594,100 @@ class TestEagle:
         assert store_job.src_spec.group_sizes == [0, 1]
         assert store_job.src_spec.block_indices == [0, 123]
 
+    def test_dcp_replicated_swa_draft_retains_unscaled_window(self):
+        """A replicated SWA draft group under DCP must not be scaled by
+        `dcp_world_size` when pruning store candidates."""
+        vllm_config = _make_vllm_config(
+            extra_config={
+                "blocks_per_chunk": 1,
+                "offload_prompt_only": False,
+            },
+            tensor_parallel_size=4,
+            decode_context_parallel_size=4,
+        )
+        vllm_config.speculative_config = None
+        kv_cache_config = KVCacheConfig(
+            num_blocks=0,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                make_kv_cache_group(
+                    ["target"],
+                    AttentionSpec(
+                        block_size=32,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                        dcp_sharded=True,
+                    ),
+                ),
+                make_kv_cache_group(
+                    ["draft_swa"],
+                    sliding_window_layer(
+                        block_size=16,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                        sliding_window=32,
+                        dcp_sharded=False,
+                    ),
+                ),
+            ],
+        )
+        spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+        scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+        _as_mock(scheduler.manager.prepare_store).side_effect = (
+            lambda keys, req_context, trigger: generate_store_output(keys)
+        )
+
+        request = MagicMock()
+        request.request_id = "req"
+        request.kv_transfer_params = None
+        request.num_prompt_tokens = 256
+        request.num_tokens = 256
+        request.num_computed_tokens = 0
+        request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(16)]
+        request.all_token_ids = list(range(256))
+        request.lora_request = None
+        request.shared_prefix_boundary = 0
+        request.status = RequestStatus.RUNNING
+        request.is_finished.return_value = False
+        scheduler.on_new_request(request)
+
+        target_block_ids = [1]
+        draft_swa_block_ids = list(range(101, 109))
+        output = SchedulerOutput.make_empty()
+        output.scheduled_new_reqs = [
+            NewRequestData(
+                req_id="req",
+                prompt_token_ids=[],
+                mm_features=[],
+                sampling_params=None,
+                pooling_params=None,
+                block_ids=(target_block_ids, draft_swa_block_ids),
+                num_computed_tokens=0,
+                lora_request=None,
+                prefill_token_ids=[],
+            )
+        ]
+        output.num_scheduled_tokens = {"req": 128}
+        output.total_num_scheduled_tokens = 128
+        meta = scheduler.build_connector_meta(output)
+        assert isinstance(meta, OffloadingConnectorMetadata)
+        assert len(meta.store_jobs) == 1
+        [store_job] = meta.store_jobs.values()
+        assert isinstance(store_job.src_spec, GPULoadStoreSpec)
+        # Group 0 (sharded target): 128-token logical block -> index 0.
+        # Group 1 (replicated SWA draft, 16-token blocks, window=32): of the
+        # first 8 blocks in the 128-token segment, only indices 6 and 7 are
+        # reachable for replay.
+        assert store_job.src_spec.group_sizes == [1, 2]
+        assert store_job.src_spec.block_indices == [0, 6]
+        assert store_job.src_spec.block_ids.tolist() == [
+            target_block_ids[0],
+            draft_swa_block_ids[6],
+            draft_swa_block_ids[7],
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Tests for request_finished fence population with in-flight pending stores.

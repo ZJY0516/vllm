@@ -236,11 +236,10 @@ def _reachable_store_block_mask(
         start_block=start_chunk_idx * blocks_per_chunk,
         end_block=end_chunk_idx * blocks_per_chunk,
         alignment_tokens=config.alignment_tokens,
-        block_size=group_config.block_size,
+        block_size=group_config.tokens_per_block,
         manager_config=manager_config,
         retention_interval=config.retention_interval,
         reachable_boundaries=reachable_boundaries,
-        dcp_world_size=config.dcp_world_size,
         final_segment_end_block=(
             final_segment_end_chunk_idx * blocks_per_chunk
             if final_segment_end_chunk_idx is not None

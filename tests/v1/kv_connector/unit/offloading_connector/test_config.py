@@ -654,7 +654,7 @@ def test_dcp_scales_attention_but_not_mamba_group_blocks():
         start_block=0,
         end_block=4,
         alignment_tokens=scheduler_config.alignment_tokens,
-        block_size=mamba_group.block_size,
+        block_size=mamba_group.tokens_per_block,
         manager_config=mamba_group.manager_config,
     )
     assert block_mask is None or [i for i in range(4) if block_mask[i]] == [1, 3]

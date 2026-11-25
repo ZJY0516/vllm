@@ -123,7 +123,6 @@ def _group_config(
         tokens_per_chunk=tokens_per_chunk,
         hashes_per_chunk=tokens_per_chunk // tokens_per_hash,
         sliding_window_size_in_chunks=sliding_window_size_in_chunks,
-        block_size=block_size,
         manager_config=manager_config,
         kv_event_group_spec=event_spec,
         requires_cow_source=mamba,

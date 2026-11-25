@@ -2348,9 +2348,6 @@ def test_prefix_cache_hit_uses_per_group_dcp_geometry(draft_sharded):
         dcp_world_size=dcp,
     )
     target_mgr, draft_mgr, mamba_mgr = manager.coordinator.single_type_managers
-    assert target_mgr.dcp_world_size == dcp
-    assert draft_mgr.dcp_world_size == (dcp if draft_sharded else 1)
-    assert mamba_mgr.dcp_world_size == 1
     assert target_mgr.block_size == sharded_block
     assert draft_mgr.block_size == (sharded_block if draft_sharded else block_size)
     assert mamba_mgr.block_size == block_size
@@ -6714,18 +6711,15 @@ def test_swa_reachable_block_mask_pins_shared_prefix():
     assert retained(0, 0, block_size) == {14}
 
 
-def test_swa_reachable_block_mask_with_dcp_scaling():
-    """DCP shards each block's KV across ranks, scaling the effective block size.
-    Verify that dcp_world_size > 1 scales block size in reachability calculations,
-    producing different masks than dcp_world_size=1."""
+def test_swa_reachable_block_mask_changes_with_block_size():
+    """Verify that logical block size controls SWA reachability granularity."""
     from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 
-    block_size = 16
     sliding_window = 32  # need = cdiv(31, 16) = 2
 
-    def get_mask(dcp_world_size):
+    def get_mask(logical_block_size):
         spec = _swa_layer(
-            block_size=block_size,
+            block_size=logical_block_size,
             num_kv_heads=1,
             head_size=1,
             dtype=torch.float32,
@@ -6734,46 +6728,32 @@ def test_swa_reachable_block_mask_with_dcp_scaling():
         m = SlidingWindowManager.reachable_block_mask(
             start_block=0,
             end_block=16,
-            alignment_tokens=64,  # alignment constraint
-            block_size=spec.spec.block_size,
+            alignment_tokens=64,
+            block_size=logical_block_size,
             manager_config=spec.manager_config,
-            retention_interval=64,  # sparse: 1 state per 64-token segment
+            retention_interval=64,
             reachable_boundaries=(255,),
-            dcp_world_size=dcp_world_size,
         )
         return None if m is None else {i for i, v in enumerate(m) if v}
 
-    # With dcp_world_size=1: effective block_size = 16
-    # per_segment = 64 // 16 = 4 blocks per segment
-    # need = 2, so 2 < 4 -> sparse retention with coarser granularity
-    mask_no_dcp = get_mask(dcp_world_size=1)
-
-    # With dcp_world_size=2: effective block_size = 32
-    # per_segment = 64 // 32 = 2 blocks per segment
-    # need = 2, so 2 >= 2 -> different retention granularity
-    mask_with_dcp = get_mask(dcp_world_size=2)
-
-    # DCP scaling changes block_size, altering segment granularity
-    assert mask_no_dcp is not None
-    assert mask_with_dcp is not None
-    # Different DCP world sizes should produce different masks
-    assert mask_no_dcp != mask_with_dcp, (
-        "DCP scaling should change retention granularity"
-    )
+    # block_size=16 -> per_segment=4, need=2 -> keep last 2 of each 4-block segment.
+    assert get_mask(16) == {2, 3, 6, 7, 10, 11, 14, 15}
+    # block_size=32 -> per_segment=2, need=1 -> keep last 1 of each 2-block segment.
+    assert get_mask(32) == {1, 3, 5, 7, 9, 11, 13, 15}
 
 
 @pytest.mark.parametrize(
-    "block_size,dcp_world_size,alignment_tokens",
+    "block_size,alignment_tokens",
     [
-        (16, 1, 24),  # 24 % 16 != 0
-        (16, 3, 64),  # effective block_size 48; 64 % 48 != 0
+        (16, 24),  # 24 % 16 != 0
+        (48, 64),  # 64 % 48 != 0
     ],
 )
 def test_swa_reachable_block_mask_sub_block_alignment_is_dense(
-    block_size, dcp_world_size, alignment_tokens
+    block_size, alignment_tokens
 ):
     """The mask is block-granular, so a sub-block alignment_tokens (not a
-    multiple of the DCP-scaled block size) cannot be represented exactly. This
+    multiple of the logical block size) cannot be represented exactly. This
     happens for hybrid offloading (e.g. Gemma), where alignment_tokens is the
     full-attention chunk size and need not divide the SWA block size. The mask
     must fall back to dense (None) rather than raise."""
@@ -6791,82 +6771,105 @@ def test_swa_reachable_block_mask_sub_block_alignment_is_dense(
         start_block=0,
         end_block=16,
         alignment_tokens=alignment_tokens,
-        block_size=spec.spec.block_size,
+        block_size=block_size,
         manager_config=spec.manager_config,
         retention_interval=alignment_tokens,
         reachable_boundaries=(),
-        dcp_world_size=dcp_world_size,
     )
     assert mask is None
 
 
-def test_mamba_reachable_block_mask_ignores_dcp():
-    """Mamba uses TP, not DCP: each rank holds the full recurrent state, so a
-    state block spans the group block_size tokens regardless of DCP. The
-    mask must not scale by dcp_world_size, so retention granularity is
-    identical for any DCP world size."""
-    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+@pytest.mark.parametrize("dcp_world_size", [2, 16])
+def test_mamba_manager_keeps_unscaled_block_size_and_sparse_retention_under_dcp(
+    dcp_world_size: int,
+):
+    """Mamba state is replicated under DCP, so its manager keeps the raw
+    block size and sparse retention even when full attention scales by DCP."""
+    block_size = 8
+    mamba_group = new_kv_cache_group(
+        ["mamba"],
+        _mamba_layer(
+            block_size=block_size,
+            shapes=(1, 1),
+            dtypes=(torch.float32,),
+            enable_prefix_caching=True,
+        ),
+    )
+    full_group = new_kv_cache_group(
+        ["full"],
+        AttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+        ),
+    )
+    scheduler_block_size = block_size * dcp_world_size
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[full_group, mamba_group],
+        prefix_cache_retention_interval=scheduler_block_size,
+    )
+    manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        scheduler_block_size=scheduler_block_size,
+        dcp_world_size=dcp_world_size,
+    )
+    full_mgr, mamba_mgr = manager.coordinator.single_type_managers
+    assert full_mgr.block_size == scheduler_block_size
+    assert mamba_mgr.block_size == block_size
 
-    spec = _mamba_layer(
-        block_size=16,
-        shapes=(1, 1),
-        dtypes=(torch.float32,),
-        enable_prefix_caching=True,
+    prompt = list(range(2 * scheduler_block_size + 1))
+    req0 = make_request("0", prompt, block_size, sha256)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    # Step through each Mamba block boundary (align-mode Mamba commits at chunk
+    # ends) so every block is offered to retention masking.
+    chunk_ends = list(range(block_size, len(prompt), block_size)) + [len(prompt)]
+    for chunk_end in chunk_ends:
+        assert (
+            manager.allocate_slots(
+                req0,
+                chunk_end - req0.num_computed_tokens,
+                num_computed_tokens,
+                computed_blocks,
+            )
+            is not None
+        )
+        req0.num_computed_tokens = chunk_end
+        computed_blocks = None
+        num_computed_tokens = 0
+
+    cached_mamba_blocks = {
+        i
+        for i, block_hash in enumerate(req0.block_hashes)
+        if manager.block_pool.get_cached_block(block_hash, kv_cache_group_ids=[1])
+    }
+    assert cached_mamba_blocks == {dcp_world_size - 1, 2 * dcp_world_size - 1}, (
+        "Large DCP must not collapse Mamba retention to dense"
     )
 
-    def get_mask(dcp_world_size):
-        m = MambaManager.reachable_block_mask(
-            start_block=0,
-            end_block=16,
-            alignment_tokens=64,
-            block_size=spec.spec.block_size,
-            manager_config=spec.manager_config,
-            retention_interval=64,  # sparse: one state per 64-token segment
-            reachable_boundaries=(255,),
-            dcp_world_size=dcp_world_size,
-        )
-        return None if m is None else {i for i, v in enumerate(m) if v}
-
-    # block_size stays 16 regardless of DCP: per_segment = 64 // 16 = 4.
-    mask_no_dcp = get_mask(dcp_world_size=1)
-    mask_with_dcp = get_mask(dcp_world_size=2)
-
-    assert mask_no_dcp is not None
-    assert mask_with_dcp is not None
-    assert mask_no_dcp == mask_with_dcp, "DCP must not change Mamba retention"
-
-
-def test_mamba_reachable_block_mask_large_dcp_stays_sparse():
-    """A large DCP world size must not scale the Mamba block size, so it can
-    never collapse sparse retention into dense caching."""
-    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-
-    spec = _mamba_layer(
-        block_size=8,
-        shapes=(1, 1),
-        dtypes=(torch.float32,),
-        enable_prefix_caching=True,
+    req_intermediate = make_request(
+        "intermediate",
+        prompt[:block_size] + [888888] * (scheduler_block_size + 1),
+        block_size,
+        sha256,
     )
+    _, num_intermediate_hit, _ = manager.get_computed_blocks(req_intermediate)
+    assert num_intermediate_hit == 0
 
-    def get_mask(dcp_world_size):
-        return MambaManager.reachable_block_mask(
-            start_block=0,
-            end_block=16,
-            alignment_tokens=64,
-            block_size=spec.spec.block_size,
-            manager_config=spec.manager_config,
-            retention_interval=64,
-            reachable_boundaries=(255,),
-            dcp_world_size=dcp_world_size,
-        )
-
-    # block_size stays 8 regardless of DCP: per_segment = 64 // 8 = 8, sparse.
-    mask_no_dcp = get_mask(dcp_world_size=1)
-    mask_large_dcp = get_mask(dcp_world_size=16)
-
-    assert mask_no_dcp is not None, "Sparse retention expected"
-    assert mask_large_dcp is not None, "Large DCP must not force dense caching"
-    assert mask_no_dcp == mask_large_dcp, "DCP must not change Mamba retention"
+    req1 = make_request(
+        "1",
+        prompt[:scheduler_block_size] + [999999] * (scheduler_block_size + 1),
+        block_size,
+        sha256,
+    )
+    _, num_hit_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_hit_tokens == scheduler_block_size
 
 
 def test_swa_shared_prefix_reuse_under_zero_retention():
