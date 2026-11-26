@@ -11,7 +11,6 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import MambaSpec
 
 
 def align_mamba_prefill_checkpoints(
@@ -21,19 +20,19 @@ def align_mamba_prefill_checkpoints(
     """Align scheduler-supplied prefill checkpoints with batch row order."""
     if not checkpoints:
         return None
-    return {
-        group_id: (
-            [
-                group_ckpts[req_id][0] if req_id in group_ckpts else 0
-                for req_id in req_ids
-            ],
-            [
-                group_ckpts[req_id][1] if req_id in group_ckpts else NULL_BLOCK_ID
-                for req_id in req_ids
-            ],
-        )
-        for group_id, group_ckpts in checkpoints.items()
-    }
+    aligned: dict[int, tuple[list[int], list[int]]] = {}
+    for group_id, group_ckpts in checkpoints.items():
+        offsets: list[int] = []
+        block_ids: list[int] = []
+        for req_id in req_ids:
+            if (ckpt := group_ckpts.get(req_id)) is not None:
+                offsets.append(ckpt[0])
+                block_ids.append(ckpt[1])
+            else:
+                offsets.append(0)
+                block_ids.append(NULL_BLOCK_ID)
+        aligned[group_id] = (offsets, block_ids)
+    return aligned
 
 
 @dataclass
@@ -53,11 +52,9 @@ class MambaPrefillCheckpointBuilder:
     def __init__(
         self,
         vllm_config: VllmConfig,
-        kv_cache_spec: MambaSpec,
         checkpoint_alignment: int | None,
     ) -> None:
         self.vllm_config = vllm_config
-        self.kv_cache_spec = kv_cache_spec
         self.checkpoint_alignment = checkpoint_alignment
 
     def build(
@@ -78,9 +75,7 @@ class MambaPrefillCheckpointBuilder:
         if not any(checkpoint_offsets):
             return None
         state_indices = [
-            all_block_ids[row]
-            if row < len(all_block_ids) and offset > 0
-            else NULL_BLOCK_ID
+            all_block_ids[row] if offset > 0 else NULL_BLOCK_ID
             for row, offset in zip(request_rows, checkpoint_offsets)
         ]
         all_query_lens = m.query_start_loc_cpu.diff().tolist()

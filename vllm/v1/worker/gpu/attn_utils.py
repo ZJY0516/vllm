@@ -538,6 +538,11 @@ def build_attn_metadata(
                 num_logits_indices=fast_prefill.num_logits_indices,
                 max_logits_per_req=fast_prefill.max_logits_per_req,
             )
+        group_checkpoints = (
+            mamba_prefill_checkpoints.get(i)
+            if mamba_prefill_checkpoints is not None
+            else None
+        )
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
@@ -557,11 +562,7 @@ def build_attn_metadata(
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
             req_idx=req_idx,
-            mamba_prefill_checkpoints=(
-                mamba_prefill_checkpoints.get(i)
-                if mamba_prefill_checkpoints is not None
-                else None
-            ),
+            mamba_prefill_checkpoints=group_checkpoints,
             _token_to_req_indices_cache=token_to_req_indices,
             **common_attn_metadata_extra_kwargs,
         )
@@ -572,7 +573,7 @@ def build_attn_metadata(
             if (
                 attn_metadata_builder.supports_update_block_table
                 and isinstance(attn_group.kv_cache_spec, MambaSpec)
-                and mamba_prefill_checkpoints is None
+                and group_checkpoints is None
             ):
                 reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
             if reuse_key in cached_metadata:

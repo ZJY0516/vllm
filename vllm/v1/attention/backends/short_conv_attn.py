@@ -65,7 +65,7 @@ class ShortConvAttentionMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.checkpoint_builder = MambaPrefillCheckpointBuilder(
-            vllm_config, kv_cache_spec, self.checkpoint_alignment
+            vllm_config, self.checkpoint_alignment
         )
 
     def _checkpoint_rows(self, num_reqs: int, num_prefills: int) -> list[int]:

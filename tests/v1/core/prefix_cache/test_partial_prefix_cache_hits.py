@@ -3066,3 +3066,77 @@ def test_first_block_prompt_exports_detached_checkpoint():
     _, hit_tokens, _ = manager.get_computed_blocks(replay)
     assert hit_tokens == 48
     assert manager.reset_prefix_cache()
+
+
+def test_two_token_resumed_prefill_crossing_block_boundary_never_caches_skipped_block():
+    """A 2-token resumed prefill `[63, 65)` (`prompt=50, num_tokens=65,
+    block_size=64`) has `start + 1 == prefill_end` yet runs as prefill and
+    skips block 0's end state at 64. Freeing it must not cache block 0 as
+    state@64."""
+    hash_block_size = 16
+    mamba_block_size = 64
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        num_blocks=32,
+        num_prefill_checkpoint_blocks=1,
+    )
+    manager.coordinator.retention_interval = 0
+    mamba_manager = manager.coordinator.single_type_managers[1]
+    mamba_manager.keep_decode_resume_state = True
+
+    tokens = list(range(80))
+    request = make_request("resumed_2tok", tokens[:50], hash_block_size, sha256)
+    request.append_output_token_ids(tokens[50:65])
+
+    # Chunk 1 stops at 63 (mid-block), leaving state@63 in block 0.
+    assert manager.allocate_slots(request, 63) is not None
+    _, retained = manager.take_mamba_prefill_checkpoints()
+    manager.block_pool.free_blocks(retained)
+    request.num_computed_tokens = 63
+    manager.new_step_starts()
+
+    # Chunk 2 runs 2-token resumed prefill [63, 65), skipping state@64.
+    assert manager.allocate_slots(request, 2) is not None
+    request.num_computed_tokens = 65
+    manager.new_step_starts()
+
+    manager.free(request)
+    assert manager.block_pool.get_cached_block(request.block_hashes[3], [1]) is None
+
+
+def test_rollback_pending_mamba_prefill_checkpoint_restores_pool_and_state():
+    """Rolling back a same-step detached checkpoint (e.g. PRIORITY preemption)
+    evicts its hash, frees its block, and clears step-scoped tracking."""
+    hash_block_size = 16
+    mamba_block_size = 64
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        num_blocks=32,
+        num_prefill_checkpoint_blocks=1,
+    )
+    manager.coordinator.retention_interval = 0
+    mamba_manager = manager.coordinator.single_type_managers[1]
+
+    free_before = manager.block_pool.get_num_free_blocks()
+    request = make_request("victim", list(range(50)), hash_block_size, sha256)
+    assert manager.allocate_slots(request, 50) is not None
+    assert manager.estimate_cached_tokens(request) == 48
+    ckpt_hash = request.block_hashes[48 // hash_block_size - 1]
+    assert manager.block_pool.get_cached_block(ckpt_hash, [1]) is not None
+    assert mamba_manager.cached_blocks_this_step
+
+    manager.rollback_pending_mamba_prefill_checkpoints(request.request_id)
+    assert manager.block_pool.get_cached_block(ckpt_hash, [1]) is None
+    assert not mamba_manager.cached_blocks_this_step
+    assert manager.estimate_cached_tokens(request) == 0
+    assert manager.take_mamba_prefill_checkpoints() == ({}, [])
+    assert manager.take_boundary_state_offloads() == {}
+
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == free_before

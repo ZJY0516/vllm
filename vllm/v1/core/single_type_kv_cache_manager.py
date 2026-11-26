@@ -2202,6 +2202,36 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
 
+    @staticmethod
+    def _is_prefill_chunk(
+        query_start: int,
+        query_end: int,
+        prefill_end: int,
+        num_prompt_tokens: int | None,
+    ) -> bool:
+        """Whether `[query_start, query_end)` runs as a multi-token prefill
+        chunk (as opposed to decode, spec-decode verification, or a 1-token
+        prompt tail)."""
+        if query_end <= query_start + 1:
+            return False
+        if prefill_end > 0 and query_start >= prefill_end:
+            return False
+        # A 1-token prompt tail padded with placeholder drafts runs as
+        # spec-decode on the worker, not prefill.
+        return not (
+            num_prompt_tokens is not None
+            and query_start + 1 == num_prompt_tokens == prefill_end
+        )
+
+    def _record_prefill_end(self, request_id: str, end: int) -> None:
+        self._last_prefill_end[request_id] = max(
+            self._last_prefill_end.get(request_id, 0), end
+        )
+        if end % self.block_size == 0:
+            self._prefill_block_ends.setdefault(request_id, set()).add(
+                end // self.block_size - 1
+            )
+
     def _select_prefill_checkpoint(
         self,
         query_start: int,
@@ -2217,28 +2247,19 @@ class MambaManager(SingleTypeKVCacheManager):
         if (
             not self.has_prefill_checkpoint_blocks
             or self.prefill_checkpoint_alignment is None
-            or query_end <= query_start
-            or (prefill_end > 0 and query_start + 1 >= prefill_end)
+            or not self._is_prefill_chunk(
+                query_start, query_end, prefill_end, num_prompt_tokens
+            )
         ):
             return 0
         lookahead = self.block_pool.num_hash_lookahead_tokens
-        candidates: list[int] = []
-        if num_prompt_tokens is not None:
-            candidates.append(
-                get_reusable_prefix_length(
-                    num_prompt_tokens,
-                    num_hash_lookahead_tokens=lookahead,
-                    alignment_tokens=self.cache_hit_alignment_tokens,
-                )
+        candidates: list[int] = [
+            get_reusable_prefix_length(
+                num_prompt_tokens if num_prompt_tokens is not None else query_end,
+                num_hash_lookahead_tokens=lookahead,
+                alignment_tokens=self.cache_hit_alignment_tokens,
             )
-        else:
-            candidates.append(
-                get_reusable_prefix_length(
-                    query_end,
-                    num_hash_lookahead_tokens=lookahead,
-                    alignment_tokens=self.cache_hit_alignment_tokens,
-                )
-            )
+        ]
         if shared_prefix_boundary > 0:
             if self.shared_prefix_checkpoint and (
                 num_prompt_tokens is None or shared_prefix_boundary <= num_prompt_tokens
@@ -2290,14 +2311,9 @@ class MambaManager(SingleTypeKVCacheManager):
             num_tokens_main_model=num_tokens_main_model,
         )
         if self.prefix_caching and num_external_computed_tokens > 0:
-            end = num_local_computed_tokens + num_external_computed_tokens
-            self._last_prefill_end[request_id] = max(
-                self._last_prefill_end.get(request_id, 0), end
+            self._record_prefill_end(
+                request_id, num_local_computed_tokens + num_external_computed_tokens
             )
-            if end % self.block_size == 0:
-                self._prefill_block_ends.setdefault(request_id, set()).add(
-                    end // self.block_size - 1
-                )
 
     def get_num_blocks_to_allocate(
         self,
@@ -2385,10 +2401,9 @@ class MambaManager(SingleTypeKVCacheManager):
                     )
                 else:
                     self._planned_checkpoints.pop(request_id, None)
-                is_prefill_chunk = num_tokens > total_computed_tokens and (
-                    prefill_end == 0 or total_computed_tokens + 1 < prefill_end
-                )
-                if is_prefill_chunk:
+                if self._is_prefill_chunk(
+                    total_computed_tokens, num_tokens, prefill_end, num_prompt_tokens
+                ):
                     self._planned_prefill_ends[request_id] = num_tokens
                 else:
                     self._planned_prefill_ends.pop(request_id, None)
@@ -2430,13 +2445,7 @@ class MambaManager(SingleTypeKVCacheManager):
             planned_checkpoint = self._planned_checkpoints.pop(request_id, None)
             planned_prefill_end = self._planned_prefill_ends.pop(request_id, None)
             if planned_prefill_end is not None:
-                self._last_prefill_end[request_id] = max(
-                    self._last_prefill_end.get(request_id, 0), planned_prefill_end
-                )
-                if planned_prefill_end % self.block_size == 0:
-                    self._prefill_block_ends.setdefault(request_id, set()).add(
-                        planned_prefill_end // self.block_size - 1
-                    )
+                self._record_prefill_end(request_id, planned_prefill_end)
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
             has_checkpoint = planned_checkpoint is not None
@@ -2567,6 +2576,14 @@ class MambaManager(SingleTypeKVCacheManager):
         if pending is None:
             return
         _, _, block = pending
+        if block.block_hash is not None:
+            self.cached_blocks_this_step.discard(block.block_hash)
+        self._last_checkpoint_block.pop(request_id, None)
+        self._pending_boundary_state_offloads = [
+            entry
+            for entry in self._pending_boundary_state_offloads
+            if entry[2] is not block
+        ]
         self.block_pool._maybe_evict_cached_block(block)
         self.block_pool.free_blocks([block])
 
@@ -2642,6 +2659,37 @@ class MambaManager(SingleTypeKVCacheManager):
         """
         return num_computed_tokens - 1
 
+    def _cache_pending_checkpoint(self, request: Request) -> None:
+        pending_ckpt = self._pending_checkpoints.get(request.request_id)
+        if pending_ckpt is None:
+            return
+        checkpoint_position, _, checkpoint_block = pending_ckpt
+        if checkpoint_block.block_hash is not None:
+            return
+        ckpt_hash = self.block_pool.cache_partial_block(
+            request=request,
+            block=checkpoint_block,
+            num_tokens=checkpoint_position,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+        )
+        if ckpt_hash is None:
+            return
+        self.cached_blocks_this_step.add(ckpt_hash)
+        self._record_tip(request.request_id, checkpoint_block)
+        self._last_checkpoint_block[request.request_id] = (
+            checkpoint_block,
+            ckpt_hash,
+        )
+        self._pending_boundary_state_offloads.append(
+            (
+                request.request_id,
+                self.kv_cache_group_id,
+                checkpoint_block,
+                checkpoint_position,
+            )
+        )
+
     def cache_blocks(
         self,
         request: Request,
@@ -2659,32 +2707,7 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.prefix_caching:
-            pending_ckpt = self._pending_checkpoints.get(request.request_id)
-            if pending_ckpt is not None:
-                checkpoint_position, _, checkpoint_block = pending_ckpt
-                if checkpoint_block.block_hash_num_tokens != checkpoint_position:
-                    ckpt_hash = self.block_pool.cache_partial_block(
-                        request=request,
-                        block=checkpoint_block,
-                        num_tokens=checkpoint_position,
-                        kv_cache_group_id=self.kv_cache_group_id,
-                        block_size=self.block_size,
-                    )
-                    if ckpt_hash is not None:
-                        self.cached_blocks_this_step.add(ckpt_hash)
-                        self._record_tip(request.request_id, checkpoint_block)
-                        self._last_checkpoint_block[request.request_id] = (
-                            checkpoint_block,
-                            ckpt_hash,
-                        )
-                        self._pending_boundary_state_offloads.append(
-                            (
-                                request.request_id,
-                                self.kv_cache_group_id,
-                                checkpoint_block,
-                                checkpoint_position,
-                            )
-                        )
+            self._cache_pending_checkpoint(request)
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
             if partial_hash is not None:
                 self.cached_blocks_this_step.add(partial_hash)

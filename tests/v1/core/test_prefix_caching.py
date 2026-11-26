@@ -6765,9 +6765,10 @@ def test_mamba_sparse_retention_caches_decode_resume_state_on_free(lookahead):
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
 def test_mamba_decode_resume_skips_off_boundary_checkpoint_block(async_scheduling):
-    """A resumed prefill over [0, 95) runs in one pass and exports its checkpoint
-    at 80 into the Mamba block ending at 64. That block must not be cached on
-    free as the decode state at 64, also after later steps were scheduled."""
+    """A resumed prefill over [0, 95) runs in one pass with prompt=50. Under
+    retention_interval=0, neither the skipped block-0 end (64) nor the
+    transient resumed position (80) may be cached; only the reusable prompt
+    replay checkpoint (48) is exported into a detached block."""
     hash_block_size, mamba_block_size = 16, 64
     kv_cache_config = _make_hybrid_kv_cache_config(
         hash_block_size, 100, ["full", "mamba"]
