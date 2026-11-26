@@ -222,13 +222,16 @@ def test_mamba_checkpoint_admission_matches_allocation(
 
     admission_estimate = estimate(prompt_tokens, computed_tokens, True)
     allocation_estimate = estimate(prompt_tokens, computed_tokens, False)
-    assert request_id in manager._checkpoints
+    assert request_id in manager._planned_checkpoints
 
     free_before = pool.get_num_free_blocks()
     manager.allocate_new_blocks(request_id, prompt_tokens, prompt_tokens)
     allocated = free_before - pool.get_num_free_blocks()
 
     assert admission_estimate == allocation_estimate == allocated
+    checkpoints, retained = manager.take_pending_prefill_checkpoints()
+    assert request_id in checkpoints
+    pool.free_blocks(retained)
 
 
 @pytest.mark.parametrize("num_speculative_blocks", [1, 2, 3])
@@ -283,13 +286,16 @@ def test_mamba_checkpoint_hash_maps_only_to_checkpoint_block(
     manager.new_step_starts()
     step(first_chunk_blocks * block_size, prompt_tokens)
 
-    checkpoint_position, checkpoint_idx = manager._checkpoints["r"]
-    checkpoint_block = manager.req_to_blocks["r"][checkpoint_idx]
-    assert all(
-        b.block_hash is None or b is checkpoint_block for b in speculative_blocks
-    )
+    checkpoints, retained = manager.take_pending_prefill_checkpoints()
+    assert "r" in checkpoints
+    offset, ckpt_block_id = checkpoints["r"]
+    checkpoint_position = first_chunk_blocks * block_size + offset
+    checkpoint_block = pool.blocks[ckpt_block_id]
+    assert checkpoint_block not in manager.req_to_blocks["r"]
+    assert all(b.block_hash is None for b in speculative_blocks)
     block_hash = request.block_hashes[checkpoint_position // block_size - 1]
     assert pool.get_cached_block(block_hash, [0]) == [checkpoint_block]
+    pool.free_blocks(retained)
 
 
 def get_sliding_window_manager(

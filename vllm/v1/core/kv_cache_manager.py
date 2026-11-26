@@ -565,6 +565,7 @@ class KVCacheManager:
         # Matches the scheduler's own prefill boundary: `num_tokens - 1`
         # extends it to resumed requests replaying their output tokens.
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        num_hashed_tokens = len(request.block_hashes) * self.block_pool.hash_block_size
 
         full_sequence_shortfall = 0
         if full_sequence_must_fit:
@@ -581,6 +582,9 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
                 prefill_end=prefill_end,
+                num_prompt_tokens=request.num_prompt_tokens,
+                shared_prefix_boundary=request.shared_prefix_boundary,
+                num_hashed_tokens=num_hashed_tokens,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             full_sequence_shortfall = (
@@ -619,6 +623,9 @@ class KVCacheManager:
             num_local_computed_tokens=num_local_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
             prefill_end=prefill_end,
+            num_prompt_tokens=request.num_prompt_tokens,
+            shared_prefix_boundary=request.shared_prefix_boundary,
+            num_hashed_tokens=num_hashed_tokens,
         )
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an
@@ -809,9 +816,9 @@ class KVCacheManager:
     def estimate_cached_tokens(self, request: Request) -> int:
         """Estimate the number of tokens cached by the request."""
         cached_tokens: int | None = None
-        for group, blocks in zip(
+        for group, manager in zip(
             self.kv_cache_config.kv_cache_groups,
-            self.get_blocks(request.request_id).blocks,
+            self.coordinator.single_type_managers,
         ):
             if not group.prefix_cacheable:
                 continue
@@ -819,13 +826,7 @@ class KVCacheManager:
                 # Cross-attention groups are not prefix cached.
                 continue
 
-            # Coverage grows along the block table: the last hashed block has the most.
-            group_cached_tokens = 0
-            for block in reversed(blocks):
-                if block.block_hash_num_tokens:
-                    group_cached_tokens = block.block_hash_num_tokens
-                    break
-
+            group_cached_tokens = manager.estimate_cached_tokens(request.request_id)
             cached_tokens = (
                 group_cached_tokens
                 if cached_tokens is None
@@ -922,6 +923,24 @@ class KVCacheManager:
         ]
         retained_blocks = [block for pair in pending_copies for block in pair]
         return copies, retained_blocks
+
+    def take_mamba_prefill_checkpoints(
+        self,
+    ) -> tuple[dict[int, dict[str, tuple[int, int]]], list[KVCacheBlock]]:
+        """Drain explicit Mamba prefill checkpoints and their retained blocks."""
+        checkpoints: dict[int, dict[str, tuple[int, int]]] = {}
+        retained_blocks: list[KVCacheBlock] = []
+        for group_id, mgr in enumerate(self.coordinator.single_type_managers):
+            group_ckpts, group_retained = mgr.take_pending_prefill_checkpoints()
+            if group_ckpts:
+                checkpoints[group_id] = group_ckpts
+            retained_blocks.extend(group_retained)
+        return checkpoints, retained_blocks
+
+    def rollback_pending_mamba_prefill_checkpoints(self, request_id: str) -> None:
+        """Evict and free pending prefill checkpoints for a rolled-back req."""
+        for mgr in self.coordinator.single_type_managers:
+            mgr.rollback_pending_prefill_checkpoint(request_id)
 
     def take_boundary_state_offloads(
         self,

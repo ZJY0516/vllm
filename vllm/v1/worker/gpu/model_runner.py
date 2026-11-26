@@ -54,6 +54,9 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.mamba.checkpoint import (
+    align_mamba_prefill_checkpoints,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -1692,6 +1695,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 int(num_scheduled_tokens_upper_bound.max())
                 if adaptive_verification is not None
                 else None
+            ),
+            mamba_prefill_checkpoints=align_mamba_prefill_checkpoints(
+                scheduler_output.mamba_prefill_checkpoints, req_ids
             ),
         )
         if self.pcp_manager is not None:

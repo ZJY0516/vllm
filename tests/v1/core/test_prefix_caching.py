@@ -37,9 +37,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.layers.mamba.checkpoint import (
-    compute_mamba_prefill_checkpoints,
-)
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -4940,19 +4937,12 @@ def test_lookahead_checkpoint_has_available_hash(
     assert blocks is not None
     assert blocks[0].block_hash_num_tokens == expected_boundary
     if checkpoint_blocks:
-        offsets, cols = compute_mamba_prefill_checkpoints(
-            [prompt_len],
-            [prompt_len],
-            hash_block_size=64,
-            mamba_block_size=512,
-            checkpoint_alignment=64,
-            cache_hit_alignment_tokens=64,
-            num_hash_lookahead_tokens=lookahead,
-        )
-        assert offsets == [expected_boundary]
-        assert (
-            blocks[0].block_id == manager.get_block_ids(request.request_id)[1][cols[0]]
-        )
+        checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+        assert checkpoints == {
+            1: {request.request_id: (expected_boundary, blocks[0].block_id)}
+        }
+        assert blocks[0].block_id not in manager.get_block_ids(request.request_id)[1]
+        manager.block_pool.free_blocks(retained)
 
     request.num_computed_tokens = len(tokens)
     manager.free(request)
@@ -6826,10 +6816,13 @@ def test_mamba_decode_resume_skips_off_boundary_checkpoint_block(async_schedulin
     manager.free(req)
 
     # The state at 64 was never computed and the one at 80 is transient, so
-    # nothing here is reusable for the Mamba group.
+    # neither is cached; only the reusable prompt replay checkpoint at 48 is
+    # exported into a detached block.
+    assert manager.block_pool.get_cached_block(req.block_hashes[3], [1]) is None
+    assert manager.block_pool.get_cached_block(req.block_hashes[4], [1]) is None
     probe = make_request("probe", req.all_token_ids[:96], hash_block_size, sha256)
     _, num_hit_tokens, _ = manager.get_computed_blocks(probe)
-    assert num_hit_tokens == 0
+    assert num_hit_tokens == 48
 
 
 @pytest.mark.skip_global_cleanup

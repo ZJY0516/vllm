@@ -48,19 +48,20 @@ MAMBA_GROUP_ID = 1
         "query_end",
         "checkpoint_position",
         "hash_size",
-        "block_size",
         "alignment",
         "expected",
     ),
     [
-        (0, 100, 88, 8, 64, 16, False),
-        (0, 100, 96, 8, 64, 16, True),
-        (0, 100, 96, 8, 64, None, False),
-        (8, 100, 96, 8, 64, 16, False),
-        (15360, 16896, 16768, 128, 1536, 16, False),
-        (15360, 16960, 16896, 128, 1536, 16, True),
-        (15360, 16960, 16768, 128, 1536, 16, True),
-        (16064, 18433, 18432, 128, 1536, 16, False),
+        (0, 100, 88, 8, 16, False),
+        (0, 100, 96, 8, 16, True),
+        (0, 100, 96, 8, None, False),
+        (8, 100, 96, 8, 16, False),
+        # First-block and same-block checkpoints are valid with detached blocks.
+        (0, 50, 48, 16, 16, True),
+        (15360, 16896, 16768, 128, 16, True),
+        (15360, 16960, 16896, 128, 16, True),
+        (15360, 16960, 16768, 128, 16, True),
+        (16064, 18433, 18432, 128, 16, False),
     ],
 )
 def test_mamba_prefill_checkpoint_valid(
@@ -68,7 +69,6 @@ def test_mamba_prefill_checkpoint_valid(
     query_end: int,
     checkpoint_position: int,
     hash_size: int,
-    block_size: int,
     alignment: int | None,
     expected: bool,
 ) -> None:
@@ -78,7 +78,6 @@ def test_mamba_prefill_checkpoint_valid(
             query_end=query_end,
             checkpoint_position=checkpoint_position,
             hash_block_size=hash_size,
-            mamba_block_size=block_size,
             checkpoint_alignment=alignment,
         )
         is expected

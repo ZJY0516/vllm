@@ -131,6 +131,10 @@ class InputBatch:
     # adaptive verification with batch-sharded sampling, when the budget binds.
     num_admitted_draft_tokens: "AdmittedDraftCounts | None" = None
 
+    # Per-Mamba-group explicit prefill checkpoints aligned with batch rows:
+    # group_id -> (checkpoint_offsets, checkpoint_block_ids).
+    mamba_prefill_checkpoints: dict[int, tuple[list[int], list[int]]] | None = None
+
     @classmethod
     def make_dummy(
         cls,

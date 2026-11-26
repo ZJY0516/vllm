@@ -105,6 +105,10 @@ class InputBatch:
     # existing context and so compute exactly like decodes.
     prefill_runs_as_decode_np: np.ndarray | None = None
 
+    # Per-Mamba-group explicit prefill checkpoints aligned with batch rows:
+    # group_id -> (checkpoint_offsets, checkpoint_block_ids).
+    mamba_prefill_checkpoints: dict[int, tuple[list[int], list[int]]] | None = None
+
     @classmethod
     def make_dummy(
         cls,

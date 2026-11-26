@@ -233,12 +233,5 @@ class Mamba2AttentionMetadataBuilder(
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> Mamba2AttentionMetadata:
-        new_metadata = super().update_block_table(metadata, blk_table, slot_mapping)
-        if metadata.checkpoint_meta is None:
-            return new_metadata
-        # Checkpoint destinations are block-table entries, so each group
-        # re-gathers its own rather than writing into the source group's.
-        return replace(
-            new_metadata,
-            checkpoint_meta=metadata.checkpoint_meta.regather_state_indices(blk_table),
-        )
+        assert metadata.checkpoint_meta is None
+        return super().update_block_table(metadata, blk_table, slot_mapping)

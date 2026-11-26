@@ -105,7 +105,12 @@ def _create_mamba2_builder(
     return builder
 
 
-def _build(builder, seq_lens, query_lens):
+def _build(
+    builder,
+    seq_lens,
+    query_lens,
+    checkpoints: tuple[list[int], list[int]] | None = None,
+):
     common = create_common_attn_metadata(
         BatchSpec(seq_lens=seq_lens, query_lens=query_lens),
         MAMBA_BLOCK_SIZE,
@@ -114,16 +119,24 @@ def _build(builder, seq_lens, query_lens):
     )
     # create_common_attn_metadata leaves is_prefilling unset; the builder
     # asserts on it. Every row here is a full prefill.
-    common = common.replace(is_prefilling=torch.ones(len(seq_lens), dtype=torch.bool))
+    common = common.replace(
+        is_prefilling=torch.ones(len(seq_lens), dtype=torch.bool),
+        mamba_prefill_checkpoints=checkpoints,
+    )
     return builder.build(common_prefix_len=0, common_attn_metadata=common)
 
 
 def test_builder_emits_one_checkpoint_entry_per_prefill_row():
     """Declined rows stay in place, masked, and a chunk ends on the checkpoint."""
     builder = _create_mamba2_builder()
-    # Row 0 (seq_len 900) checkpoints at 768; row 1 (seq_len 100) is too short
-    # for a checkpoint at all.
-    meta = _build(builder, seq_lens=[900, 100], query_lens=[900, 100])
+    # Row 0 (seq_len 900) checkpoints at 768 into detached block 42; row 1
+    # has no checkpoint.
+    meta = _build(
+        builder,
+        seq_lens=[900, 100],
+        query_lens=[900, 100],
+        checkpoints=([768, 0], [42, NULL_BLOCK_ID]),
+    )
 
     assert meta.checkpoint_chunk_idx is not None
     assert meta.checkpoint_meta is not None
@@ -131,7 +144,7 @@ def test_builder_emits_one_checkpoint_entry_per_prefill_row():
     # The exporter masks row 1 off by its zero offset and null block, but
     # still loads its chunk index first, so the placeholder must be in range.
     assert meta.checkpoint_meta.checkpoint_offsets.tolist() == [768, 0]
-    assert meta.checkpoint_meta.state_indices[1].item() == NULL_BLOCK_ID
+    assert meta.checkpoint_meta.state_indices.tolist() == [42, NULL_BLOCK_ID]
     assert meta.checkpoint_chunk_idx[1].item() == 0
     # The checkpoint's token offset is the end of its chunk. Asserting it here
     # also proves the chunk split actually landed on the checkpoint.
@@ -139,33 +152,34 @@ def test_builder_emits_one_checkpoint_entry_per_prefill_row():
     assert meta.cu_chunk_seqlen_p[ckpt_chunk + 1].item() == 768
 
 
-def test_update_block_table_regathers_checkpoint_blocks():
-    """Groups sharing a spec reuse one group's metadata via update_block_table.
-
-    Checkpoint destinations are block-table entries, so each group needs its
-    own: layers of different groups share physical tensors, and reusing the
-    first group's indices writes every group's checkpoint into its blocks.
-    """
+def test_builder_uses_distinct_checkpoint_blocks_per_group():
+    """Each Mamba group consumes its own scheduler-assigned checkpoint block."""
     builder = _create_mamba2_builder()
-    meta = _build(builder, seq_lens=[900, 100], query_lens=[900, 100])
-    assert meta.checkpoint_meta is not None
-
-    # A second group's table: same shape as the first, disjoint block ids.
-    other_table = torch.arange(1000, 1016, dtype=torch.int32).reshape(2, 8)
-    updated = builder.update_block_table(
-        meta, other_table, torch.zeros(1000, dtype=torch.int64)
+    meta_group_1 = _build(
+        builder,
+        seq_lens=[900, 100],
+        query_lens=[900, 100],
+        checkpoints=([768, 0], [42, NULL_BLOCK_ID]),
     )
-
-    # Row 0 checkpoints in column cdiv(900, 256) - 2 == 2; row 1 declined.
-    assert updated.checkpoint_meta is not None
-    assert updated.checkpoint_meta.state_indices.tolist() == [
-        other_table[0, 2].item(),
-        NULL_BLOCK_ID,
-    ]
+    meta_group_2 = _build(
+        builder,
+        seq_lens=[900, 100],
+        query_lens=[900, 100],
+        checkpoints=([768, 0], [1042, NULL_BLOCK_ID]),
+    )
+    assert meta_group_1.checkpoint_meta is not None
+    assert meta_group_2.checkpoint_meta is not None
+    assert meta_group_1.checkpoint_meta.state_indices.tolist() == [42, NULL_BLOCK_ID]
+    assert meta_group_2.checkpoint_meta.state_indices.tolist() == [1042, NULL_BLOCK_ID]
 
 
 def test_builder_emits_nothing_without_prefix_caching():
     builder = _create_mamba2_builder(enable_prefix_caching=False)
-    meta = _build(builder, seq_lens=[900], query_lens=[900])
+    meta = _build(
+        builder,
+        seq_lens=[900],
+        query_lens=[900],
+        checkpoints=([768], [42]),
+    )
 
     assert meta.checkpoint_chunk_idx is None

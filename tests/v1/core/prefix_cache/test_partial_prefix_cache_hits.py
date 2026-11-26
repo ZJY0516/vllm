@@ -14,9 +14,6 @@ import torch
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
 from tests.v1.core.utils import new_kv_cache_group
 from vllm.distributed.kv_transfer.kv_connector.v1.base import SupportsHMA
-from vllm.model_executor.layers.mamba.checkpoint import (
-    compute_mamba_prefill_checkpoints,
-)
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import (
@@ -37,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
     get_reusable_prefix_length,
+    is_mamba_prefill_checkpoint_valid,
 )
 
 
@@ -106,8 +104,14 @@ def make_full_mamba_manager(
     num_blocks: int = 32,
     num_speculative_blocks: int = 0,
     num_prefill_checkpoint_blocks: int = 0,
+    prefill_checkpoint_alignment: int | None = None,
     num_hash_lookahead_tokens: int = 0,
 ):
+    alignment = (
+        (16 if prefill_checkpoint_alignment is None else prefill_checkpoint_alignment)
+        if num_prefill_checkpoint_blocks > 0
+        else None
+    )
     mamba_group = new_kv_cache_group(
         ["mamba"],
         MambaSpec(
@@ -119,9 +123,7 @@ def make_full_mamba_manager(
             enable_prefix_caching=True,
             num_speculative_blocks=num_speculative_blocks,
             num_prefill_checkpoint_blocks=num_prefill_checkpoint_blocks,
-            prefill_checkpoint_alignment=(
-                16 if num_prefill_checkpoint_blocks > 0 else None
-            ),
+            prefill_checkpoint_alignment=alignment,
         ),
     )
     kv_cache_config = KVCacheConfig(
@@ -530,6 +532,7 @@ def test_partial_hit_then_internal_checkpoint_uses_distinct_mamba_blocks():
         full_block_size=hash_block_size,
         mamba_block_size=mamba_block_size,
         num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=hash_block_size,
     )
 
     owner = make_request("owner", [0, 0, 1, 1, 2, 2, 3], hash_block_size, sha256)
@@ -564,11 +567,17 @@ def test_partial_hit_then_internal_checkpoint_uses_distinct_mamba_blocks():
     final_blocks = manager.allocate_slots(replay, 6)
     assert final_blocks is not None
 
-    checkpoint_block_id, running_block_id = final_blocks.get_block_ids()[1]
+    checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+    assert checkpoints == {
+        1: {replay.request_id: (4, checkpoints[1][replay.request_id][1])}
+    }
+    checkpoint_block_id = checkpoints[1][replay.request_id][1]
+    (running_block_id,) = [b for b in final_blocks.get_block_ids()[1] if b != 0]
     assert len({mamba_cow_block_id, checkpoint_block_id, running_block_id}) == 3
     mamba_blocks = manager.get_blocks(replay.request_id).blocks[1]
-    assert mamba_blocks[2].block_id == checkpoint_block_id
+    assert mamba_blocks[2].is_null
     assert mamba_blocks[3].block_id == running_block_id
+    manager.block_pool.free_blocks(retained)
 
 
 def test_internal_checkpoint_uses_partial_hash_lifecycle():
@@ -586,16 +595,18 @@ def test_internal_checkpoint_uses_partial_hash_lifecycle():
     new_blocks = manager.allocate_slots(request, request.num_tokens)
 
     assert new_blocks is not None
+    checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+    assert checkpoints[1][request.request_id][0] == 112
+    checkpoint_block_id = checkpoints[1][request.request_id][1]
+    checkpoint_block = manager.block_pool.blocks[checkpoint_block_id]
     mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
-    checkpoint_idx = 2
-    checkpoint_block = mamba_blocks[checkpoint_idx]
-    running_block = mamba_blocks[checkpoint_idx + 1]
-    assert not checkpoint_block.is_null
+    assert mamba_blocks[2].is_null
+    running_block = mamba_blocks[3]
     assert not running_block.is_null
     assert checkpoint_block is not running_block
+    assert checkpoint_block not in mamba_blocks
 
-    # The internal block is exported at state@112, replacing its temporary
-    # full-block state@96 key while retaining #52789's req_to_blocks ownership.
+    # The detached checkpoint block is cached directly at state@112.
     partial_hash = request.block_hashes[112 // hash_block_size - 1]
     partial_hit = manager.block_pool.get_cached_block(partial_hash, [1])
     assert partial_hit is not None
@@ -607,7 +618,9 @@ def test_internal_checkpoint_uses_partial_hash_lifecycle():
         request.request_id: [(1, checkpoint_block.block_id, 112)]
     }
 
+    manager.block_pool.free_blocks(retained)
     manager.free(request)
+    manager.new_step_starts()
     replay = make_request("replay", list(range(120)), hash_block_size, sha256)
     _, num_computed, _ = manager.get_computed_blocks(replay)
     assert num_computed == 112
@@ -654,20 +667,24 @@ def _mamba_split(request, num_new_tokens, num_local_computed_tokens):
 
 
 @pytest.mark.parametrize("retention_interval", [None, 0])
-def test_mid_block_resume_exports_checkpoint_into_resumed_block(retention_interval):
+def test_mid_block_resume_exports_checkpoint_into_detached_block(retention_interval):
     """Resuming at 96 and ending in the next block (150) runs in one step: the
-    checkpoint (144) goes into the resumed block, which the worker reads into
-    the running block before the forward, and is keyed at 144, never as the
-    block's end state (128)."""
+    checkpoint (144) goes into a detached checkpoint block, leaving the resumed
+    block unkeyed (never hashed as block-end state 128)."""
     manager, request, computed_blocks = _resume_mid_block(retention_interval, 150)
     assert _mamba_split(request, 54, 96) == 54
     assert manager.allocate_slots(request, 54, 96, computed_blocks) is not None
 
+    checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+    assert checkpoints[1][request.request_id][0] == 48
+    checkpoint_block_id = checkpoints[1][request.request_id][1]
     mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
-    assert mamba_blocks[1].block_hash_num_tokens == 144
+    assert mamba_blocks[1].block_hash is None
+    assert checkpoint_block_id not in [b.block_id for b in mamba_blocks]
     hit = manager.block_pool.get_cached_block(request.block_hashes[144 // 16 - 1], [1])
-    assert hit is not None and hit[0] is mamba_blocks[1]
+    assert hit is not None and hit[0].block_id == checkpoint_block_id
     assert manager.block_pool.get_cached_block(request.block_hashes[7], [1]) is None
+    manager.block_pool.free_blocks(retained)
 
 
 @pytest.mark.parametrize("retention_interval", [None, 0])
@@ -678,18 +695,24 @@ def test_mid_block_resume_run_past_keeps_resumed_block_unkeyed(retention_interva
     assert _mamba_split(request, 134, 96) == 134
     assert manager.allocate_slots(request, 134, 96, computed_blocks) is not None
 
+    checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+    assert checkpoints[1][request.request_id][0] == 128
+    checkpoint_block_id = checkpoints[1][request.request_id][1]
     mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
     assert mamba_blocks[1].block_hash is None
+    assert mamba_blocks[2].is_null
     assert manager.block_pool.get_cached_block(request.block_hashes[7], [1]) is None
-    assert mamba_blocks[2].block_hash_num_tokens == 224
+    hit = manager.block_pool.get_cached_block(request.block_hashes[224 // 16 - 1], [1])
+    assert hit is not None and hit[0].block_id == checkpoint_block_id
     # The stale resumed block must not reach a connector either.
     offloads = drain_boundary_state_offloads(manager).get(request.request_id, [])
-    assert offloads == [(1, mamba_blocks[2].block_id, 224)]
+    assert offloads == [(1, checkpoint_block_id, 224)]
+    manager.block_pool.free_blocks(retained)
 
 
-def test_running_request_resuming_mid_block_exports_into_resumed_block():
+def test_running_request_resuming_mid_block_exports_detached_checkpoint():
     """A running request whose chunk stopped mid-block (96) exports its next
-    chunk's checkpoint into that block, its own previous running block."""
+    chunk's checkpoint into a detached block without re-keying block 1."""
     manager = make_full_mamba_manager(
         dcp_world_size=1,
         hash_block_size=16,
@@ -704,9 +727,15 @@ def test_running_request_resuming_mid_block_exports_into_resumed_block():
     manager.new_step_starts()
     assert manager.allocate_slots(request, 54) is not None
 
+    checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+    assert checkpoints[1][request.request_id][0] == 48
+    checkpoint_block_id = checkpoints[1][request.request_id][1]
     mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
-    assert mamba_blocks[1].block_hash_num_tokens == 144
+    assert mamba_blocks[1].block_hash is None
+    hit = manager.block_pool.get_cached_block(request.block_hashes[144 // 16 - 1], [1])
+    assert hit is not None and hit[0].block_id == checkpoint_block_id
     assert manager.block_pool.get_cached_block(request.block_hashes[7], [1]) is None
+    manager.block_pool.free_blocks(retained)
 
 
 @pytest.mark.parametrize(("num_new", "num_accepted"), [(17, 15), (40, 40)])
@@ -796,11 +825,10 @@ def test_internal_checkpoint_publication_respects_retention(
     )
 
 
-def test_transient_checkpoint_evicts_retained_boundary_hash():
-    """With retention_interval=0, the checkpoint slot can coincide with a
-    reachable boundary block that this step's full-block pass just hashed.
-    The checkpoint state overwrites the slot, so the stale boundary hash
-    must be evicted rather than left pointing at the wrong state.
+def test_shared_prefix_boundary_exported_without_transient_overwrite():
+    """With retention_interval=0, a shared-prefix junction inside an
+    intermediate chunk is exported directly into a detached checkpoint block,
+    and no transient off-boundary checkpoint (112) is ever emitted.
     """
     hash_block_size = 16
     manager = make_full_mamba_manager(
@@ -813,18 +841,18 @@ def test_transient_checkpoint_evicts_retained_boundary_hash():
     manager.coordinator.retention_interval = 0
 
     request = make_request("producer", list(range(240)), hash_block_size, sha256)
-    # Block 2 ends at the shared-prefix junction 96, so the full-block pass
-    # hashes it as a retained boundary.
     request.shared_prefix_boundary = 96
     computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
     assert manager.allocate_slots(request, 128, num_computed, computed_blocks)
 
-    # The same slot is the transient checkpoint block (state@112): both the
-    # boundary hash and the checkpoint itself must stay unpublished.
+    checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+    assert checkpoints[1][request.request_id][0] == 96
     boundary_hash = request.block_hashes[96 // hash_block_size - 1]
-    assert manager.block_pool.get_cached_block(boundary_hash, [1]) is None
-    checkpoint_hash = request.block_hashes[112 // hash_block_size - 1]
-    assert manager.block_pool.get_cached_block(checkpoint_hash, [1]) is None
+    hit = manager.block_pool.get_cached_block(boundary_hash, [1])
+    assert hit is not None and hit[0].block_id == checkpoints[1][request.request_id][1]
+    transient_hash = request.block_hashes[112 // hash_block_size - 1]
+    assert manager.block_pool.get_cached_block(transient_hash, [1]) is None
+    manager.block_pool.free_blocks(retained)
 
 
 @pytest.mark.parametrize("prompt_len", [120, 104, 96])
@@ -882,26 +910,29 @@ def test_intermediate_chunk_checkpoint_reserved_only_under_dense_retention(
         num_prefill_checkpoint_blocks=1,
     )
     manager.coordinator.retention_interval = retention_interval
-    mamba_manager = manager.coordinator.single_type_managers[1]
 
     request = make_request("producer", list(range(240)), hash_block_size, sha256)
     computed_blocks, num_computed, _ = manager.get_computed_blocks(request)
     free_before = manager.block_pool.get_num_free_blocks()
 
-    # Mid-prompt chunk: the chunk-keyed position (112) is inside it. Blocks:
-    # the attention blocks, the running mamba block, plus the checkpoint.
+    # Mid-prompt chunk: under dense retention the full block boundary (96) is
+    # exported; under retention_interval=0 no checkpoint block is allocated.
     assert manager.allocate_slots(request, 128, num_computed, computed_blocks)
-    assert (request.request_id in mamba_manager._checkpoints) == reserved
+    checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+    assert (request.request_id in checkpoints.get(1, {})) == reserved
     allocated = free_before - manager.block_pool.get_num_free_blocks()
     assert allocated == 128 // hash_block_size + 1 + int(reserved)
+    manager.block_pool.free_blocks(retained)
 
     request.num_computed_tokens = 128
     manager.new_step_starts()
     # Final chunk: the prefill-end checkpoint at 224 is reserved either way.
     assert manager.allocate_slots(request, 112) is not None
-    assert mamba_manager._checkpoints[request.request_id][0] == 224
+    checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+    assert checkpoints[1][request.request_id][0] == 224 - 128
     end_hash = request.block_hashes[224 // hash_block_size - 1]
     assert manager.block_pool.get_cached_block(end_hash, [1]) is not None
+    manager.block_pool.free_blocks(retained)
 
 
 def test_hash_aligned_query_end_uses_regular_partial_tail():
@@ -919,8 +950,8 @@ def test_hash_aligned_query_end_uses_regular_partial_tail():
     new_blocks = manager.allocate_slots(request, 14)
 
     assert new_blocks is not None
-    mamba_manager = manager.coordinator.single_type_managers[1]
-    assert request.request_id not in mamba_manager._checkpoints
+    checkpoints, _ = manager.take_mamba_prefill_checkpoints()
+    assert not checkpoints
     mamba_blocks = manager.get_blocks(request.request_id).blocks[1]
     assert sum(not block.is_null for block in mamba_blocks) == 1
 
@@ -2819,7 +2850,7 @@ def test_prompt_end_checkpoint_survives_sparse_retention_with_coarse_hash():
     [(104, 0), (200, 0), (40, 24), (40, 25), (150, 43)],
 )
 @pytest.mark.parametrize("chunk_blocks", [2, 100])
-def test_checkpoint_reservation_matches_worker(
+def test_scheduler_checkpoint_plan_is_detached_and_valid(
     hash_block_size,
     mamba_block_size,
     lookahead,
@@ -2828,11 +2859,9 @@ def test_checkpoint_reservation_matches_worker(
     num_output_tokens,
     chunk_blocks,
 ):
-    """The worker exports a checkpoint wherever `compute_mamba_prefill_checkpoints`
-    says, into whatever block sits at its column. Each chunk, the manager must
-    either reserve exactly that position and column, or leave the column null so
-    the export is masked; anything else publishes a hash over the wrong state.
-    Under sparse retention, only the prefill-end chunk may reserve one.
+    """Every explicit checkpoint dispatched by `MambaManager` must be detached
+    from `req_to_blocks`, satisfy `is_mamba_prefill_checkpoint_valid`, and
+    point at a pool block keyed at the exact exported token position.
     """
     manager = make_full_mamba_manager(
         dcp_world_size=1,
@@ -2856,27 +2885,184 @@ def test_checkpoint_reservation_matches_worker(
     )
     request.append_output_token_ids(list(range(1000, 1000 + num_output_tokens)))
     num_tokens = request.num_tokens
-    prefill_end = max(num_prompt_tokens, num_tokens - 1)
+    prompt_checkpoint = get_reusable_prefix_length(
+        num_prompt_tokens,
+        num_hash_lookahead_tokens=lookahead,
+        alignment_tokens=mamba_manager.cache_hit_alignment_tokens,
+    )
 
     start = 0
     while start < num_tokens:
         end = min(start + chunk_blocks * mamba_block_size, num_tokens)
         assert manager.allocate_slots(request, end - start) is not None
-        offsets, cols = compute_mamba_prefill_checkpoints(
-            [end],
-            [end - start],
-            hash_block_size=hash_block_size,
-            mamba_block_size=mamba_block_size,
-            checkpoint_alignment=16,
-            cache_hit_alignment_tokens=mamba_manager.cache_hit_alignment_tokens,
-            num_hash_lookahead_tokens=lookahead,
-        )
-        reserved = mamba_manager._checkpoints.get(request.request_id)
-        if reserved is not None:
-            assert reserved == (start + offsets[0], cols[0])
-            assert retention_interval is None or end >= prefill_end
-        elif offsets[0]:
-            assert mamba_manager.req_to_blocks[request.request_id][cols[0]].is_null
+        checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+        group_ckpt = checkpoints.get(1, {}).get(request.request_id)
+        if group_ckpt is not None:
+            offset, block_id = group_ckpt
+            position = start + offset
+            assert is_mamba_prefill_checkpoint_valid(
+                query_start=start,
+                query_end=end,
+                checkpoint_position=position,
+                hash_block_size=hash_block_size,
+                checkpoint_alignment=16,
+            )
+            assert block_id not in [
+                b.block_id for b in mamba_manager.req_to_blocks[request.request_id]
+            ]
+            ckpt_hash = request.block_hashes[position // hash_block_size - 1]
+            cached = manager.block_pool.get_cached_block(ckpt_hash, [1])
+            assert cached is not None and cached[0].block_id == block_id
+            assert cached[0].block_hash_num_tokens == position
+            if retention_interval == 0:
+                assert position == prompt_checkpoint
+        manager.block_pool.free_blocks(retained)
         request.num_computed_tokens = end
         manager.new_step_starts()
         start = end
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("resume_from_hit", [False, True])
+def test_resumed_prefill_never_caches_skipped_block_as_decode_boundary(
+    async_scheduling: bool, resume_from_hit: bool
+):
+    """Regression test for #70066: a preempted request resuming past its
+    original prompt length (prompt=50, resumed to 95, block_size=64,
+    retention_interval=0) must never export a transient checkpoint at 80 or
+    cache block 0 as state@64 when freed (even under async scheduling or
+    when resuming from a partial hit at 48). Crossing block 1 (128) during
+    subsequent decode must still cache state@128 on free.
+    """
+    hash_block_size = 16
+    mamba_block_size = 64
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        num_blocks=64,
+        num_prefill_checkpoint_blocks=1,
+    )
+    manager.coordinator.retention_interval = 0
+    mamba_manager = manager.coordinator.single_type_managers[1]
+    mamba_manager.keep_decode_resume_state = True
+
+    tokens = list(range(200))
+    if resume_from_hit:
+        # Populate prefix cache with state@48 via a prior prompt of length 50.
+        seed = make_request("seed", tokens[:50], hash_block_size, sha256)
+        assert manager.allocate_slots(seed, 50) is not None
+        ckpts, retained = manager.take_mamba_prefill_checkpoints()
+        assert ckpts[1][seed.request_id][0] == 48
+        manager.block_pool.free_blocks(retained)
+        manager.free(seed)
+        manager.new_step_starts()
+
+    # Preempted request: 50 prompt tokens + 45 output tokens = 95 tokens total.
+    request = make_request("resumed", tokens[:50], hash_block_size, sha256)
+    request.append_output_token_ids(tokens[50:95])
+    computed_blocks, num_hit, _ = manager.get_computed_blocks(request)
+    assert num_hit == (48 if resume_from_hit else 0)
+
+    # Step 1: resumed prefill [num_hit, 95) in one pass.
+    assert (
+        manager.allocate_slots(request, 95 - num_hit, num_hit, computed_blocks)
+        is not None
+    )
+    ckpts, ckpt_retained = manager.take_mamba_prefill_checkpoints()
+    _, cow_retained = manager.take_kv_cache_block_copies()
+    if resume_from_hit:
+        # 48 was already hit, 80 is transient -> no checkpoint exported.
+        assert not ckpts
+    else:
+        # Reusable prompt checkpoint at 48 is exported into a detached block;
+        # transient position 80 is never exported.
+        assert ckpts[1][request.request_id][0] == 48
+        assert (
+            ckpts[1][request.request_id][1]
+            not in manager.get_block_ids(request.request_id)[1]
+        )
+    assert manager.block_pool.get_cached_block(request.block_hashes[4], [1]) is None
+    assert manager.block_pool.get_cached_block(request.block_hashes[3], [1]) is None
+
+    if async_scheduling:
+        # Step 2 (decode [95, 96)) scheduled before Step 1 completes on GPU.
+        request.num_computed_tokens = 95
+        request.num_in_flight_tokens = 95
+        manager.new_step_starts()
+        assert manager.allocate_slots(request, 1) is not None
+        assert not manager.take_mamba_prefill_checkpoints()[0]
+        # Step 1 now completes: processed_computed_tokens becomes 95.
+        request.num_computed_tokens = 96
+        request.num_in_flight_tokens = 1
+        manager.block_pool.free_blocks(ckpt_retained + cow_retained)
+    else:
+        request.num_computed_tokens = 95
+        manager.block_pool.free_blocks(ckpt_retained + cow_retained)
+        manager.new_step_starts()
+
+    # Freeing before crossing 128 must NEVER cache block 0 under the 64-token hash.
+    manager.free(request)
+    assert manager.block_pool.get_cached_block(request.block_hashes[3], [1]) is None
+    manager.new_step_starts()
+
+    # Now verify that decoding past 128 AFTER resumed prefill DOES cache state@128.
+    request2 = make_request("resumed_then_decode", tokens[:50], hash_block_size, sha256)
+    request2.append_output_token_ids(tokens[50:95])
+    computed_blocks, num_hit, _ = manager.get_computed_blocks(request2)
+    assert (
+        manager.allocate_slots(request2, 95 - num_hit, num_hit, computed_blocks)
+        is not None
+    )
+    _, ckpt_retained = manager.take_mamba_prefill_checkpoints()
+    _, cow_retained = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(ckpt_retained + cow_retained)
+    request2.num_computed_tokens = 95
+    manager.new_step_starts()
+
+    for pos in range(95, 130):
+        request2.append_output_token_ids([tokens[pos]])
+        assert manager.allocate_slots(request2, 1) is not None
+        request2.num_computed_tokens = pos + 1
+        manager.new_step_starts()
+
+    manager.free(request2)
+    # Block 0 (64) was crossed during prefill -> still NOT cached.
+    assert manager.block_pool.get_cached_block(request2.block_hashes[3], [1]) is None
+    # Block 1 (128) was crossed during decode -> cached on free!
+    hit_128 = manager.block_pool.get_cached_block(request2.block_hashes[7], [1])
+    assert hit_128 is not None and hit_128[0].block_hash_num_tokens == 128
+
+
+def test_first_block_prompt_exports_detached_checkpoint():
+    """Prompts shorter than one Mamba block can export their checkpoint into a
+    detached block in a single prefill step (no chunk split needed)."""
+    hash_block_size = 16
+    mamba_block_size = 64
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        num_blocks=32,
+        num_prefill_checkpoint_blocks=1,
+    )
+    manager.coordinator.retention_interval = 0
+
+    request = make_request("short", list(range(50)), hash_block_size, sha256)
+    assert manager.allocate_slots(request, 50) is not None
+    checkpoints, retained = manager.take_mamba_prefill_checkpoints()
+    assert checkpoints[1][request.request_id][0] == 48
+    ckpt_block_id = checkpoints[1][request.request_id][1]
+    assert ckpt_block_id not in manager.get_block_ids(request.request_id)[1]
+    assert manager.estimate_cached_tokens(request) == 48
+
+    manager.block_pool.free_blocks(retained)
+    manager.free(request)
+    manager.new_step_starts()
+
+    replay = make_request("replay", list(range(50)), hash_block_size, sha256)
+    _, hit_tokens, _ = manager.get_computed_blocks(replay)
+    assert hit_tokens == 48
+    assert manager.reset_prefix_cache()

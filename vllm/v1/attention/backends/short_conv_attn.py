@@ -95,14 +95,8 @@ class ShortConvAttentionMetadataBuilder(
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> ShortConvAttentionMetadata:
-        new_metadata = super().update_block_table(metadata, blk_table, slot_mapping)
-        if metadata.checkpoint is None:
-            return new_metadata
-        # Checkpoint destinations are block-table entries of this group.
-        return replace(
-            new_metadata,
-            checkpoint=metadata.checkpoint.regather_state_indices(blk_table),
-        )
+        assert metadata.checkpoint is None
+        return super().update_block_table(metadata, blk_table, slot_mapping)
 
 
 @dataclass

@@ -488,6 +488,11 @@ class CommonAttentionMetadata:
     fixed sliding window. None disables R-SWA. The attention backend copies this
     into its own persistent buffer and reads `rswa_window` from model config."""
 
+    mamba_prefill_checkpoints: tuple[list[int], list[int]] | None = None
+    """Per-row `(checkpoint_offsets, checkpoint_block_ids)` for this KV cache
+    group, planned by the scheduler. `0` / `NULL_BLOCK_ID` indicates no
+    checkpoint for that row; `None` when no row exports a checkpoint."""
+
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
 
@@ -558,6 +563,14 @@ class CommonAttentionMetadata:
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
             req_idx=maybe_slice_reqs(self.req_idx),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
+            mamba_prefill_checkpoints=(
+                (
+                    self.mamba_prefill_checkpoints[0][:num_actual_reqs],
+                    self.mamba_prefill_checkpoints[1][:num_actual_reqs],
+                )
+                if self.mamba_prefill_checkpoints is not None
+                else None
+            ),
         )
 
 

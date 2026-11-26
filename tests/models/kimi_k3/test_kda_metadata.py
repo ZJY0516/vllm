@@ -308,43 +308,46 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
 
 @requires_gpu
 @pytest.mark.parametrize(
-    "batch,prefix_match_unit,hit_alignment,expected_offsets,expected_states",
+    "batch,checkpoints,expected_offsets,expected_states",
     [
         (
             BatchSpec(seq_lens=[50, 32], query_lens=[50, 16]),
-            None,
-            16,
+            ([48, 0], [102, NULL_BLOCK_ID]),
             [48, 0],
-            [2, NULL_BLOCK_ID],
+            [102, NULL_BLOCK_ID],
         ),
         (
-            BatchSpec(seq_lens=[50, 32], query_lens=[50, 16]),
-            16,
-            16,
-            [48, 0],
-            [2, NULL_BLOCK_ID],
+            BatchSpec(seq_lens=[530], query_lens=[530]),
+            ([512], [132]),
+            [512],
+            [132],
         ),
-        (BatchSpec(seq_lens=[530], query_lens=[530]), None, 128, [512], [32]),
-        (BatchSpec(seq_lens=[530], query_lens=[50]), None, 128, [32], [32]),
-        (BatchSpec(seq_lens=[530], query_lens=[530]), 16, 16, [528], [32]),
-        (BatchSpec(seq_lens=[530], query_lens=[50]), 16, 16, [48], [32]),
+        (
+            BatchSpec(seq_lens=[530], query_lens=[50]),
+            ([48], [133]),
+            [48],
+            [133],
+        ),
     ],
 )
-def test_internal_checkpoint_metadata_targets_last_aligned_boundary(
-    batch, prefix_match_unit, hit_alignment, expected_offsets, expected_states
+def test_internal_checkpoint_metadata_uses_scheduler_plan(
+    batch, checkpoints, expected_offsets, expected_states
 ):
     device = GPU_DEVICE
     common_attn_metadata = create_common_attn_metadata(
         batch, BLOCK_SIZE, device, arange_block_indices=True
-    ).replace(is_prefilling=torch.tensor([True] * len(batch.seq_lens)))
+    ).replace(
+        is_prefilling=torch.tensor([True] * len(batch.seq_lens)),
+        mamba_prefill_checkpoints=checkpoints,
+    )
     builder = _make_builder(
         KimiK3KDAMetadataBuilder,
         num_speculative_tokens=0,
         full_cuda_graph=False,
         enable_prefix_caching=True,
         num_prefill_checkpoint_blocks=1,
-        prefix_match_unit=prefix_match_unit,
-        cache_hit_alignment_tokens=hit_alignment,
+        prefix_match_unit=16,
+        cache_hit_alignment_tokens=16,
         hash_block_size=16,
         device=device,
     )
@@ -369,78 +372,9 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary(
     )
 
 
-@pytest.mark.parametrize(
-    (
-        "seq_len",
-        "num_hash_lookahead_tokens",
-        "prefix_match_unit",
-        "expected_offset",
-    ),
-    [
-        (100, 4, 16, 96),
-        (100, 5, 16, 80),
-        (92, 1, 8, None),
-        (96, 1, 16, 80),
-    ],
-)
 @requires_gpu
-def test_spec_internal_checkpoint_metadata_targets_replay_boundary(
-    seq_len: int,
-    num_hash_lookahead_tokens: int,
-    prefix_match_unit: int,
-    expected_offset: int | None,
-) -> None:
-    """Lookahead hashes need no back-off from the replay boundary."""
+def test_internal_checkpoint_metadata_absent_without_scheduler_plan():
     device = GPU_DEVICE
-    batch = BatchSpec(seq_lens=[seq_len], query_lens=[seq_len])
-    common_attn_metadata = create_common_attn_metadata(
-        batch, BLOCK_SIZE, device, arange_block_indices=True
-    )
-    common_attn_metadata = common_attn_metadata.replace(
-        is_prefilling=torch.tensor([True]),
-        block_table_tensor=common_attn_metadata.block_table_tensor + 1,
-    )
-    builder = _make_builder(
-        KimiK3KDAMetadataBuilder,
-        num_speculative_tokens=3,
-        full_cuda_graph=False,
-        enable_prefix_caching=True,
-        num_prefill_checkpoint_blocks=1,
-        mamba_block_size=64,
-        prefix_match_unit=prefix_match_unit,
-        use_eagle=True,
-        num_hash_lookahead_tokens=num_hash_lookahead_tokens,
-        device=device,
-    )
-    assert isinstance(builder, KimiK3KDAMetadataBuilder)
-    builder.mamba_aligned_state_indices = mamba_get_block_table_tensor(
-        common_attn_metadata.block_table_tensor,
-        common_attn_metadata.seq_lens,
-        builder.kv_cache_spec,
-        True,
-        builder.num_speculative_blocks,
-    )
-    actual = builder.build(0, common_attn_metadata)
-
-    if expected_offset is None:
-        assert actual.checkpoint is None
-        return
-    assert actual.checkpoint is not None
-    torch.testing.assert_close(
-        actual.checkpoint.state_indices,
-        torch.tensor([1], dtype=torch.int32, device=device),
-    )
-    torch.testing.assert_close(
-        actual.checkpoint.checkpoint_offsets,
-        torch.tensor([expected_offset], dtype=torch.int32, device=device),
-    )
-
-
-@requires_gpu
-def test_internal_checkpoint_metadata_skips_unaligned_offset():
-    device = GPU_DEVICE
-    # The checkpoint block boundary is 48, but this query starts at token 1,
-    # making the real checkpoint offset 47, which is not FlashKDA-aligned.
     batch = BatchSpec(seq_lens=[50], query_lens=[49])
     common_attn_metadata = create_common_attn_metadata(
         batch, BLOCK_SIZE, device, arange_block_indices=True
