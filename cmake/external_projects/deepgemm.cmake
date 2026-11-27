@@ -8,6 +8,16 @@ if (DEFINED ENV{DEEPGEMM_SRC_DIR})
   set(DEEPGEMM_SRC_DIR $ENV{DEEPGEMM_SRC_DIR})
 endif()
 
+# Opt-in build option for Kimi K3 images only: also apply
+# deepgemm_nvfp4_mega_moe_situ_k31.patch (SiTU in place of SwiGLU in the NVFP4
+# Mega MoE epilogue, so other NVFP4 Mega MoE models must not use the build).
+# It can be set as an environment variable or passed as a cmake argument.
+if (DEFINED ENV{VLLM_K31_NVFP4_SITU_PATCH})
+  set(VLLM_K31_NVFP4_SITU_PATCH $ENV{VLLM_K31_NVFP4_SITU_PATCH})
+endif()
+option(VLLM_K31_NVFP4_SITU_PATCH
+  "Apply the Kimi K3 SiTU patch to DeepGEMM's NVFP4 Mega MoE kernel" OFF)
+
 # Local tree: set deepgemm_SOURCE_DIR directly (no FetchContent download).
 # Upstream git: use FetchContent_Populate with explicit options (CMP0169 NEW
 # disallows one-argument Populate(dep) after Declare; MakeAvailable would run
@@ -76,10 +86,18 @@ else()
   #   deepgemm_mqa_logits_tmem_prefetch.patch: in the SM100 MQA logits kernel
   #   (contiguous KV, 32 heads), load the next Q token's TMEM accumulators
   #   before the current token's head reduction; logits are bitwise identical.
-  find_package(Git REQUIRED)
-  foreach(_dg_patch
+  #   deepgemm_nvfp4_mega_moe_situ_k31.patch (only with VLLM_K31_NVFP4_SITU_PATCH):
+  #   Kimi K3 SiTU in the NVFP4 Mega MoE epilogue in place of SwiGLU, static
+  #   checkpoint input scales and an optional pre-dispatched launch.
+  set(_dg_patches
       "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm_mega_moe_situ_fixed_cost.patch"
       "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm_mqa_logits_tmem_prefetch.patch")
+  if(VLLM_K31_NVFP4_SITU_PATCH)
+    list(APPEND _dg_patches
+      "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm_nvfp4_mega_moe_situ_k31.patch")
+  endif()
+  find_package(Git REQUIRED)
+  foreach(_dg_patch ${_dg_patches})
     execute_process(
       COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_dg_patch}"
       WORKING_DIRECTORY "${deepgemm_SOURCE_DIR}"

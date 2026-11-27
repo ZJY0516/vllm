@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
     MEGA_MOE_MXFP4,
+    MEGA_MOE_NVFP4,
     DeepGemmMegaMoEExperts,
     MegaMoEActivation,
 )
@@ -368,6 +369,36 @@ def make_kimi_k3_mega_moe_expert_params_mapping(
                         shard_id,
                     )
                 )
+    if os.environ.get("K31_NVFP4_MEGAMOE") == "1":
+        # NVFP4 MegaMoE (K31_NVFP4_MEGAMOE=1): ModelOpt NVFP4 names. `.weight` also prefixes `.weight_scale_2`
+        # (substring replacement keeps the suffix); w2 `input_scale` is the static L2
+        # activation scale; w1/w3 `input_scale` are skipped in load_weights (the
+        # NVFP4 MegaMoE dispatch uses per-token scales).
+        for expert_id in range(num_experts):
+            for shard_id in ("w1", "w2", "w3"):
+                param_prefix = "w13" if shard_id in ("w1", "w3") else "w2"
+                mapping.append(
+                    (
+                        f"experts.{param_prefix}_weight",
+                        f"experts.{expert_id}.{shard_id}.weight",
+                        expert_id,
+                        shard_id,
+                    )
+                )
+            mapping.append(
+                ("experts.w2_input_scale", f"experts.{expert_id}.w2.input_scale", expert_id, "w2")
+            )
+            if os.environ.get("K31_NVFP4_CKPT_SCALES") == "1":
+                # K31_NVFP4_CKPT_SCALES=1: the static dispatch scale comes from w1/w3 `input_scale`.
+                for shard_id in ("w1", "w3"):
+                    mapping.append(
+                        (
+                            "experts.w13_input_scale",
+                            f"experts.{expert_id}.{shard_id}.input_scale",
+                            expert_id,
+                            shard_id,
+                        )
+                    )
     return mapping
 
 
@@ -569,7 +600,12 @@ class KimiMoE(nn.Module):
                     alpha=activation_situ_beta or 1.0,
                     beta=activation_situ_linear_beta or 0.0,
                 ),
-                weight_format=MEGA_MOE_MXFP4,
+                # Opt-in: K31_NVFP4_MEGAMOE=1 runs the NVFP4 checkpoint's routed experts on NVFP4 MegaMoE
+                weight_format=(
+                    MEGA_MOE_NVFP4
+                    if os.environ.get("K31_NVFP4_MEGAMOE") == "1"
+                    else MEGA_MOE_MXFP4
+                ),
                 prefix=f"{prefix}.experts",
             )
         else:
@@ -1566,6 +1602,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             kwargs: dict[str, Any] = args[2] if len(args) > 2 else {}
             if "rotary_emb.inv_freq" in name:
                 continue
+            if (
+                use_mega_moe
+                and os.environ.get("K31_NVFP4_MEGAMOE") == "1"
+                and os.environ.get("K31_NVFP4_CKPT_SCALES") != "1"
+                and ".experts." in name
+                and (name.endswith(".w1.input_scale") or name.endswith(".w3.input_scale"))
+            ):
+                continue  # not used by the NVFP4 MegaMoE (per-token dispatch scales)
             if experts_unpacked and name.endswith(".weight_packed"):
                 name = name.replace(".weight_packed", ".weight")
 

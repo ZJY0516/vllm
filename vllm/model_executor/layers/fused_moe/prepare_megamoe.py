@@ -312,7 +312,7 @@ def _prepare_megamoe_inputs_kernel(
         )
 
 
-@triton.jit(do_not_specialize=["num_tokens", "l2_activation_scale"])
+@triton.jit(do_not_specialize=["num_tokens", "l2_activation_scale", "static_x_scale"])
 def _prepare_megamoe_nvfp4_inputs_kernel(
     hidden_states,
     x_out,
@@ -335,6 +335,9 @@ def _prepare_megamoe_nvfp4_inputs_kernel(
     num_physical,
     w2_global_scale,
     l2_alpha,
+    a2_scales,
+    l1_global_scale,
+    l1_alpha_out,
     hidden_stride_m: tl.constexpr,
     hidden_stride_k: tl.constexpr,
     x_stride_m: tl.constexpr,
@@ -353,6 +356,7 @@ def _prepare_megamoe_nvfp4_inputs_kernel(
     topk_weights_out_stride_k: tl.constexpr,
     num_tokens,
     l2_activation_scale,
+    static_x_scale,
     hidden_size: tl.constexpr,
     top_k: tl.constexpr,
     num_local_experts: tl.constexpr,
@@ -363,127 +367,157 @@ def _prepare_megamoe_nvfp4_inputs_kernel(
     BLOCK_E: tl.constexpr,
     SHARED_BLOCK_M: tl.constexpr,
     SHARED_MXFP8: tl.constexpr,
+    STATIC_X: tl.constexpr,
+    ROUTE: tl.constexpr = True,
+    XQ: tl.constexpr = True,
 ) -> None:
+    # Pre-dispatch (M1): ROUTE stages the top-k ids and weights (EPLB mapping and load record included), XQ the
+    # L1/L2 alphas and the quantized activations; a pre-dispatched launch runs ROUTE right after the router top-k
+    # and XQ after the latent down projection. Both together are the stock staging.
     # Grid (token, split): each program quantizes the BLOCK_K chunks split,
     # split + NUM_SPLITS, ... of one token's row.
     token = tl.program_id(0)
     split = tl.program_id(1)
-    if l2_alpha is not None:
-        experts = tl.arange(0, BLOCK_E)
-        expert_mask = (experts < num_local_experts) & (token == 0) & (split == 0)
-        alpha = tl.load(w2_global_scale + experts, mask=expert_mask)
-        tl.store(l2_alpha + experts, alpha * l2_activation_scale, mask=expert_mask)
+    if XQ:
+        if l2_alpha is not None:
+            experts = tl.arange(0, BLOCK_E)
+            expert_mask = (experts < num_local_experts) & (token == 0) & (split == 0)
+            alpha = tl.load(w2_global_scale + experts, mask=expert_mask)
+            if a2_scales is not None:
+                # Per-expert L2 input scales (checkpoint `w2.input_scale`)
+                a2 = tl.load(a2_scales + experts, mask=expert_mask, other=1.0)
+                tl.store(l2_alpha + experts, alpha * a2, mask=expert_mask)
+            else:
+                tl.store(l2_alpha + experts, alpha * l2_activation_scale, mask=expert_mask)
+            if l1_alpha_out is not None:
+                # L1 alphas with the static input scale folded in
+                g1 = tl.load(l1_global_scale + experts, mask=expert_mask)
+                if STATIC_X:
+                    g1 = g1 * static_x_scale
+                tl.store(l1_alpha_out + experts, g1, mask=expert_mask)
+            if STATIC_X:
+                if a2_scales is not None:
+                    # Per-expert L2 input scales into the x-scales region the
+                    # patched kernel reads them from (unused without per-token scales)
+                    a2_out = tl.load(a2_scales + experts, mask=expert_mask, other=1.0)
+                    tl.store(x_scales + experts, a2_out, mask=expert_mask)
     if token >= num_tokens:
         return
 
-    if split == 0:
-        token_ids = token + tl.zeros([1], dtype=tl.int32)
-        _store_topk(
-            token_ids,
-            token_ids < num_tokens,
-            topk_ids,
-            topk_weights,
-            is_padding,
-            topk_idx_out,
-            topk_weights_out,
-            logical_to_physical,
-            replica_count,
-            expert_load,
-            record_enabled,
-            num_unpadded_tokens,
-            num_logical,
-            map_stride,
-            num_physical,
-            topk_ids_stride_m,
-            topk_ids_stride_k,
-            topk_weights_stride_m,
-            topk_weights_stride_k,
-            is_padding_stride_m,
-            topk_idx_stride_m,
-            topk_idx_stride_k,
-            topk_weights_out_stride_m,
-            topk_weights_out_stride_k,
-            top_k,
-            1,
-            BLOCK_TOPK,
-        )
+    if ROUTE:
+        if split == 0:
+            token_ids = token + tl.zeros([1], dtype=tl.int32)
+            _store_topk(
+                token_ids,
+                token_ids < num_tokens,
+                topk_ids,
+                topk_weights,
+                is_padding,
+                topk_idx_out,
+                topk_weights_out,
+                logical_to_physical,
+                replica_count,
+                expert_load,
+                record_enabled,
+                num_unpadded_tokens,
+                num_logical,
+                map_stride,
+                num_physical,
+                topk_ids_stride_m,
+                topk_ids_stride_k,
+                topk_weights_stride_m,
+                topk_weights_stride_k,
+                is_padding_stride_m,
+                topk_idx_stride_m,
+                topk_idx_stride_k,
+                topk_weights_out_stride_m,
+                topk_weights_out_stride_k,
+                top_k,
+                1,
+                BLOCK_TOPK,
+            )
 
-    # Every program reads the whole row for the token scale.
-    row = hidden_states + token.to(tl.int64) * hidden_stride_m
-    cols = tl.arange(0, BLOCK_H)
-    hidden_row = tl.load(
-        row + cols * hidden_stride_k, mask=cols < hidden_size, other=0.0
-    )
-    amax = tl.max(tl.abs(hidden_row.to(tl.float32)), axis=0)
-    x_scale = tl.maximum(amax, 1.0e-12) * _INV_NVFP4_MAX
-    if split == 0:
-        tl.store(x_scales + token, x_scale)
+    if XQ:
+        row = hidden_states + token.to(tl.int64) * hidden_stride_m
+        if STATIC_X:
+            # The checkpoint's static input scale, no per-token scale
+            x_scale = static_x_scale
+        else:
+            # Every program reads the whole row for the token scale.
+            cols = tl.arange(0, BLOCK_H)
+            hidden_row = tl.load(
+                row + cols * hidden_stride_k, mask=cols < hidden_size, other=0.0
+            )
+            amax = tl.max(tl.abs(hidden_row.to(tl.float32)), axis=0)
+            x_scale = tl.maximum(amax, 1.0e-12) * _INV_NVFP4_MAX
+            if split == 0:
+                tl.store(x_scales + token, x_scale)
 
-    shared_sf_row = _shared_sf_row(token, SHARED_BLOCK_M)
-    for k0 in tl.range(split * BLOCK_K, hidden_size, NUM_SPLITS * BLOCK_K):
-        k_ids = k0 + tl.arange(0, BLOCK_K)
-        k_mask = k_ids < hidden_size
-        hidden = tl.load(row + k_ids * hidden_stride_k, mask=k_mask, other=0.0)
+        shared_sf_row = _shared_sf_row(token, SHARED_BLOCK_M)
+        for k0 in tl.range(split * BLOCK_K, hidden_size, NUM_SPLITS * BLOCK_K):
+            k_ids = k0 + tl.arange(0, BLOCK_K)
+            k_mask = k_ids < hidden_size
+            hidden = tl.load(row + k_ids * hidden_stride_k, mask=k_mask, other=0.0)
 
-        # E2M1 values with one E4M3 scale per 16, relative to the token scale.
-        values = tl.reshape(
-            tl.div_rn(hidden.to(tl.float32), x_scale), [BLOCK_K // 16, 16]
-        )
-        block_scale = tl.max(tl.abs(values), axis=1) * (1.0 / 6.0)
-        block_scale = tl.minimum(tl.maximum(block_scale, 2.0**-9), 448.0)
-        block_scale = block_scale.to(tl.float8e4nv)
-        values = tl.div_rn(values, block_scale.to(tl.float32)[:, None])
-        magnitude = tl.abs(values)
-        # Round to nearest even on the grid {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
-        code = (
-            (magnitude > 0.25).to(tl.int32)
-            + (magnitude >= 0.75).to(tl.int32)
-            + (magnitude > 1.25).to(tl.int32)
-            + (magnitude >= 1.75).to(tl.int32)
-            + (magnitude > 2.5).to(tl.int32)
-            + (magnitude >= 3.5).to(tl.int32)
-            + (magnitude > 5.0).to(tl.int32)
-        )
-        code = tl.where((values < 0) & (code != 0), code | 8, code)
-        low, high = tl.split(tl.reshape(code, [BLOCK_K // 2, 2]))
-        packed_ids = k0 // 2 + tl.arange(0, BLOCK_K // 2)
-        tl.store(
-            x_out + token * x_stride_m + packed_ids,
-            (low | (high << 4)).to(tl.uint8),
-            mask=packed_ids < hidden_size // 2,
-        )
-        # Four E4M3 scales per little-endian int32 word, one word per 64 values.
-        sf_ids = k0 // 64 + tl.arange(0, BLOCK_K // 64)
-        sf_bytes = tl.reshape(
-            block_scale.to(tl.uint8, bitcast=True), [BLOCK_K // 64, 4]
-        )
-        tl.store(
-            x_sf + token * x_sf_stride_m + sf_ids,
-            _pack_bytes(sf_bytes, 4),
-            mask=sf_ids < hidden_size // 64,
-        )
+            # E2M1 values with one E4M3 scale per 16, relative to the token scale.
+            values = tl.reshape(
+                tl.div_rn(hidden.to(tl.float32), x_scale), [BLOCK_K // 16, 16]
+            )
+            block_scale = tl.max(tl.abs(values), axis=1) * (1.0 / 6.0)
+            block_scale = tl.minimum(tl.maximum(block_scale, 2.0**-9), 448.0)
+            block_scale = block_scale.to(tl.float8e4nv)
+            values = tl.div_rn(values, block_scale.to(tl.float32)[:, None])
+            magnitude = tl.abs(values)
+            # Round to nearest even on the grid {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+            code = (
+                (magnitude > 0.25).to(tl.int32)
+                + (magnitude >= 0.75).to(tl.int32)
+                + (magnitude > 1.25).to(tl.int32)
+                + (magnitude >= 1.75).to(tl.int32)
+                + (magnitude > 2.5).to(tl.int32)
+                + (magnitude >= 3.5).to(tl.int32)
+                + (magnitude > 5.0).to(tl.int32)
+            )
+            code = tl.where((values < 0) & (code != 0), code | 8, code)
+            low, high = tl.split(tl.reshape(code, [BLOCK_K // 2, 2]))
+            packed_ids = k0 // 2 + tl.arange(0, BLOCK_K // 2)
+            tl.store(
+                x_out + token * x_stride_m + packed_ids,
+                (low | (high << 4)).to(tl.uint8),
+                mask=packed_ids < hidden_size // 2,
+            )
+            # Four E4M3 scales per little-endian int32 word, one word per 64 values.
+            sf_ids = k0 // 64 + tl.arange(0, BLOCK_K // 64)
+            sf_bytes = tl.reshape(
+                block_scale.to(tl.uint8, bitcast=True), [BLOCK_K // 64, 4]
+            )
+            tl.store(
+                x_sf + token * x_sf_stride_m + sf_ids,
+                _pack_bytes(sf_bytes, 4),
+                mask=sf_ids < hidden_size // 64,
+            )
 
-        if shared_x is not None:
-            shared_ptrs = shared_x + token * shared_x_stride_m + k_ids
-            if SHARED_MXFP8:
-                fp8, _, scale_exp = _quantize_fp8_groups(
-                    tl.reshape(hidden.to(tl.float32), (1, BLOCK_K)),
-                    1,
-                    BLOCK_K,
-                    32,
-                    True,
-                )
-                tl.store(shared_ptrs, tl.reshape(fp8, [BLOCK_K]), mask=k_mask)
-                word_ids = k0 // 128 + tl.arange(0, BLOCK_K // 128)
-                tl.store(
-                    shared_x_sf
-                    + shared_sf_row * shared_x_sf_stride_m
-                    + word_ids * shared_x_sf_stride_k,
-                    _pack_bytes(tl.reshape(scale_exp, [BLOCK_K // 128, 4]), 4),
-                    mask=word_ids < hidden_size // 128,
-                )
-            else:
-                tl.store(shared_ptrs, hidden, mask=k_mask)
+            if shared_x is not None:
+                shared_ptrs = shared_x + token * shared_x_stride_m + k_ids
+                if SHARED_MXFP8:
+                    fp8, _, scale_exp = _quantize_fp8_groups(
+                        tl.reshape(hidden.to(tl.float32), (1, BLOCK_K)),
+                        1,
+                        BLOCK_K,
+                        32,
+                        True,
+                    )
+                    tl.store(shared_ptrs, tl.reshape(fp8, [BLOCK_K]), mask=k_mask)
+                    word_ids = k0 // 128 + tl.arange(0, BLOCK_K // 128)
+                    tl.store(
+                        shared_x_sf
+                        + shared_sf_row * shared_x_sf_stride_m
+                        + word_ids * shared_x_sf_stride_k,
+                        _pack_bytes(tl.reshape(scale_exp, [BLOCK_K // 128, 4]), 4),
+                        mask=word_ids < hidden_size // 128,
+                    )
+                else:
+                    tl.store(shared_ptrs, hidden, mask=k_mask)
 
 
 def _resolve_hidden_quant(hidden_quant: QuantKey, block_k: int) -> tuple[int, bool]:
@@ -679,8 +713,24 @@ def prepare_megamoe_nvfp4_inputs(
     l2_alpha: torch.Tensor | None = None,
     l2_activation_scale: float = 1.0,
     eplb_state: EplbLayerState | None = None,
+    a2_scales: torch.Tensor | None = None,
+    l1_global_scale: torch.Tensor | None = None,
+    l1_alpha_out: torch.Tensor | None = None,
+    static_x_scale: float | None = None,
+    stage: str = "all",
 ) -> None:
     """Stage DeepGEMM NVFP4 MegaMoE inputs (`kNvfp4DynamicToken`).
+
+    Pre-dispatch (M1): `stage` "route" stages only the top-k ids/weights (`hidden_states` may be None),
+    "x" only the alphas and activations, "all" both (stock).
+
+    Checkpoint scales: with `static_x_scale` every token is
+    quantized with that fixed input scale (no per-token scales), and
+    `l1_alpha_out` receives `l1_global_scale * static_x_scale` per local expert;
+    with `a2_scales` (per-local-expert L2 input scales) `l2_alpha` becomes
+    `w2_global_scale * a2_scales` and `x_scales[:num_local_experts]` (pass the
+    whole x-scales buffer) the `a2_scales` the patched kernel quantizes each
+    expert's intermediate with.
 
     Each token is scaled by its own fp32 `x_scales` (row amax / 2688) and
     quantized to E2M1 with one E4M3 scale per 16 values.
@@ -708,7 +758,15 @@ def prepare_megamoe_nvfp4_inputs(
         eplb_state: Optional EPLB layer state; maps ids to replicas and records load.
 
     """
-    num_tokens, hidden_size = hidden_states.shape
+    if stage not in ("all", "route", "x"):
+        raise ValueError(f"unknown staging stage {stage}")
+    if hidden_states is None:
+        if stage != "route":
+            raise ValueError("hidden_states is needed to stage activations")
+        num_tokens, hidden_size = topk_ids.shape[0], x.shape[1] * 2
+        hidden_states = topk_weights  # placeholder pointer, unused by the route stage
+    else:
+        num_tokens, hidden_size = hidden_states.shape
     if hidden_size % 128 != 0:
         raise ValueError(
             "MegaMoE input staging requires hidden_size to be a multiple of 128."
@@ -734,6 +792,24 @@ def prepare_megamoe_nvfp4_inputs(
 
     top_k = topk_ids.shape[1]
     num_local_experts = 0 if l2_alpha is None else l2_alpha.numel()
+    if (l1_global_scale is None) != (l1_alpha_out is None) or (
+        l1_alpha_out is not None and l2_alpha is None
+    ):
+        raise ValueError("l1_alpha_out needs l1_global_scale and l2_alpha.")
+    if a2_scales is not None and (
+        l2_alpha is None or a2_scales.numel() != num_local_experts
+    ):
+        raise ValueError("a2_scales needs l2_alpha, one scale per local expert.")
+    if l1_alpha_out is not None and l1_alpha_out.numel() != num_local_experts:
+        raise ValueError("l1_alpha_out has the wrong size.")
+    static_x = static_x_scale is not None
+    if static_x and not (static_x_scale > 0 and static_x_scale < float("inf")):
+        raise ValueError(f"static_x_scale must be finite and positive: {static_x_scale}")
+    if a2_scales is not None and (not static_x or x_scales.numel() < num_local_experts):
+        raise ValueError(
+            "a2_scales needs static_x_scale and the whole x-scales buffer "
+            "(at least one entry per local expert)."
+        )
     # Up to 512 tokens each row is split over programs; larger batches fill the
     # GPU with one program per row looping over wider chunks.
     block_h = triton.next_power_of_2(hidden_size)
@@ -742,6 +818,8 @@ def prepare_megamoe_nvfp4_inputs(
         num_splits = triton.cdiv(hidden_size, block_k)
     else:
         block_k = min(2048, block_h)
+        num_splits = 1
+    if stage == "route":
         num_splits = 1
     # One program even without tokens, to write l2_alpha.
     grid = (max(num_tokens, 1), num_splits)
@@ -760,6 +838,9 @@ def prepare_megamoe_nvfp4_inputs(
         *_eplb_kernel_args(eplb_state),
         w2_global_scale,
         l2_alpha,
+        a2_scales,
+        l1_global_scale,
+        l1_alpha_out,
         hidden_states.stride(0),
         hidden_states.stride(1),
         x.stride(0),
@@ -778,6 +859,7 @@ def prepare_megamoe_nvfp4_inputs(
         topk_weights_out.stride(1),
         num_tokens,
         l2_activation_scale,
+        float(static_x_scale) if static_x else 1.0,
         hidden_size,
         top_k,
         num_local_experts,
@@ -788,5 +870,8 @@ def prepare_megamoe_nvfp4_inputs(
         BLOCK_E=triton.next_power_of_2(max(num_local_experts, 1)),
         SHARED_BLOCK_M=shared_block_m or 1,
         SHARED_MXFP8=shared_mxfp8,
+        STATIC_X=static_x,
+        ROUTE=stage != "x",
+        XQ=stage != "route",
         num_warps=4,
     )

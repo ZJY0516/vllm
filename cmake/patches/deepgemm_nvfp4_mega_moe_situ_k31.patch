@@ -1,0 +1,246 @@
+Kimi K3 SiTU, static checkpoint input scales and an optional pre-dispatched
+launch for DeepGEMM's SM100 NVFP4 Mega MoE kernel (sm100_nvfp4_mega_moe.cuh).
+Applied by cmake/external_projects/deepgemm.cmake to the pinned DeepGEMM
+checkout only when VLLM_K31_NVFP4_SITU_PATCH is ON (default OFF).
+
+Build it only for Kimi K3 images: the patched header computes SiTU in place
+of the SwiGLU epilogue, so every 'swiglu' launch of this kernel becomes SiTU
+(alpha * tanh(gate / alpha) * sigmoid(gate) * beta * tanh(up / beta), with
+activation_alpha / activation_beta as the SiTU scales). Other NVFP4 Mega MoE
+models must use a build without it.
+
+- SiTU: the expression and helpers of sm100_fp8_fp4_mega_moe_situ.cuh (the
+  stock FP8 x FP4 SiTU kernel); kFastMath (stock default true) selects __expf
+  and fast_rcp as there, and tanh is 2 * sigmoid(2x) - 1.
+- Static input scales: with use_x_scales=false each local expert's L2 input
+  scale is read from the otherwise unused local x-scales region; launches
+  with use_x_scales=true are unchanged.
+- Pre-dispatch (M1): a launch whose dispatch head already ran (signalled in a
+  spare word of the expert send counts) skips the token counting and waits
+  for each source rank's input-ready epoch before pulling from it. Static
+  asserts: kNumExperts <= kNumMaxExperts - 128 and kNumRanks <= 32.
+
+vLLM selects these paths with K31_NVFP4_SITU_HEADER=1 (and K31_NVFP4_CKPT_SCALES,
+K31_M1); without the flag the Python side refuses SiTU on this kernel.
+
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_nvfp4_mega_moe.cuh b/deep_gemm/include/deep_gemm/impls/sm100_nvfp4_mega_moe.cuh
+index 691c57b..31911f0 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_nvfp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_nvfp4_mega_moe.cuh
+@@ -1,3 +1,5 @@
++// Modified by NVIDIA: Kimi K3 SiTU (alpha * tanh(gate / alpha) * sigmoid(gate) * beta * tanh(up / beta)) in place of the
++// SwiGLU epilogue, static per-expert L2 input scales, and an optional pre-dispatched launch (M1).
+ #pragma once
+ 
+ #include <cstdint>
+@@ -19,6 +21,35 @@
+ 
+ namespace deep_gemm {
+ 
++// Kimi K3 SiTU helpers, as in sm100_fp8_fp4_mega_moe_situ.cuh
++template <bool kFastMath>
++CUTLASS_DEVICE float2 nvfp4_situ_sigmoid_f32x2(const float2& values) {
++    const auto exponentials = make_float2(
++        kFastMath ? __expf(-values.x) : expf(-values.x),
++        kFastMath ? __expf(-values.y) : expf(-values.y));
++    const auto denominators = __fadd2_rn({1.0f, 1.0f}, exponentials);
++    if constexpr (kFastMath) {
++        return {math::fast_rcp(denominators.x), math::fast_rcp(denominators.y)};
++    } else {
++        return {1.0f / denominators.x, 1.0f / denominators.y};
++    }
++}
++
++template <bool kFastMath>
++CUTLASS_DEVICE float2 nvfp4_situ_tanh_f32x2(const float2& values) {
++    // Match FlashInfer: tanh(x) = 2 * sigmoid(2 * x) - 1.
++    const auto sigmoid = nvfp4_situ_sigmoid_f32x2<kFastMath>(
++        __fmul2_rn(values, {2.0f, 2.0f}));
++    return __fadd2_rn(__fmul2_rn(sigmoid, {2.0f, 2.0f}), {-1.0f, -1.0f});
++}
++
++// Pre-dispatch (M1): spare words of MegaMoESignals::expert_send_count, beyond every expert index a launch uses
++constexpr uint32_t kK31PreWordIdx = layout::MegaMoESignals::kNumMaxExperts - 1;
++constexpr uint32_t kK31EpochWordIdx = layout::MegaMoESignals::kNumMaxExperts - 2;
++constexpr uint32_t kK31XReadyBaseIdx = layout::MegaMoESignals::kNumMaxExperts - 128;  // [source rank]
++constexpr uint64_t kK31PreBit = 1ull << 62;
++constexpr uint64_t kK31TagBit = 1ull << 63;
++
+ template <
+     uint32_t kNumMaxTokensPerRank,
+     uint32_t kHidden, uint32_t kIntermediateHidden,
+@@ -348,6 +379,13 @@ sm100_nvfp4_mega_moe_impl(void* y,
+     // Wait for primary kernel completion
+     cudaGridDependencySynchronize();
+ 
++    // Pre-dispatch (M1): pre-dispatched launch (see k31_mega_predispatch); every SM reads the word before any grid sync
++    DG_STATIC_ASSERT(kNumExperts <= kK31XReadyBaseIdx and kNumRanks <= 32, "M1 spare words or ready mask");
++    const uint64_t k31_pre_word = *reinterpret_cast<volatile uint64_t*>(
++        workspace.signals->expert_send_count + kK31PreWordIdx);
++    const bool k31_is_pre = (k31_pre_word & kK31PreBit) != 0;
++    const uint64_t k31_epoch = k31_pre_word & (kK31PreBit - 1);
++
+     // Task scheduler
+     auto scheduler = sched::MegaMoEScheduler<
+         BLOCK_M, BLOCK_N, BLOCK_K,
+@@ -426,6 +464,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
+             }
+         };
+ 
++        if (not k31_is_pre) {
+         // Count experts' tokens
+         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
+@@ -518,6 +557,13 @@ sm100_nvfp4_mega_moe_impl(void* y,
+             }
+         }
+ 
++        } else if (sm_idx == 0 and thread_idx < kNumRanks) {
++            // Pre-dispatch (M1): this rank's inputs (staged before this launch, ordered by the grid dependency sync) are
++            // ready for this epoch; peers acquire it before their first pull from this rank
++            ptx::st_rel_sys(sym_buffer.map(workspace.signals->expert_send_count + kK31XReadyBaseIdx + sym_buffer.rank_idx,
++                                           thread_idx), k31_epoch);
++        }
++
+         // Ensure the epilogue barrier cannot run with the pull barrier
+         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+ 
+@@ -559,6 +605,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
+         }
+ 
+         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
++        uint32_t k31_ready_mask = 0;  // Pre-dispatch (M1): peers whose inputs this warp has acquired
+         for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+             // Advance expert until within the range
+             int old_expert_idx = current_expert_idx;
+@@ -667,6 +714,14 @@ sm100_nvfp4_mega_moe_impl(void* y,
+                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
+             }
+ 
++            if (k31_is_pre and not ((k31_ready_mask >> current_rank_in_expert_idx) & 1u)) {
++                // Pre-dispatch (M1): every lane acquires the source rank's readiness before its remote loads
++                const auto k31_ready_ptr = workspace.signals->expert_send_count + kK31XReadyBaseIdx + current_rank_in_expert_idx;
++                comm::wait_until([&]() { return ptx::ld_acq_sys(k31_ready_ptr) >= k31_epoch; }, [&]() {
++                    printf("K31 M1 input-ready timeout: rank=%u, peer=%u\n", sym_buffer.rank_idx, current_rank_in_expert_idx);
++                });
++                k31_ready_mask |= 1u << current_rank_in_expert_idx;
++            }
+             const auto src_base_ptr = sym_buffer.map(
+                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
+             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
+@@ -769,6 +824,9 @@ sm100_nvfp4_mega_moe_impl(void* y,
+             #pragma unroll
+             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
+                 *workspace.get_expert_send_count_ptr(i) = 0;
++            // Pre-dispatch (M1): every SM read the pre-dispatched word at its start, before the epilogue grid sync
++            if (thread_idx == 0 and k31_is_pre)
++                workspace.signals->expert_send_count[kK31PreWordIdx] = 0;
+             if (warp_idx == 0 and cute::elect_one_sync()) {
+                 *workspace.get_l1_task_count_ptr() = 0;
+                 *workspace.get_l2_task_count_ptr() = 0;
+@@ -1240,6 +1298,11 @@ sm100_nvfp4_mega_moe_impl(void* y,
+                 task_info.block_phase == sched::BlockPhase::Linear1 ?
+                     (l1_alpha == nullptr ? 1.0f : l1_alpha[task_info.local_expert_idx]) :
+                     (l2_alpha == nullptr ? 1.0f : l2_alpha[task_info.local_expert_idx]);
++            // Static input scales: each local expert's L2 input scale sits at its index in the (unused) local
++            // input x-scales region
++            DG_STATIC_ASSERT(kUseXScales or kNumMaxTokensPerRank >= kNumExpertsPerRank, "x-scales region too small");
++            const float l2_input_scale = (kUseXScales or task_info.is_shared()) ? l2_activation_scale :
++                buffer.input_x_scales_buffer.get_base_ptr<float>()[task_info.local_expert_idx];
+ 
+             if (task_info.block_phase == sched::BlockPhase::Linear1 or task_info.block_phase == sched::BlockPhase::SharedLinear1) {
+                 // Drain this warpgroup's accumulator slice from TMEM first, then release the TMEM stage, so the next
+@@ -1339,34 +1402,30 @@ sm100_nvfp4_mega_moe_impl(void* y,
+                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                         const uint32_t j = s * kNumAtomsPerStore + i;
+ 
+-                        // Apply SwiGLU: gate * sigmoid(alpha * gate) * (up + beta)
++                        // Apply SiTU (Kimi K3): alpha * tanh(gate / alpha) * sigmoid(gate) * beta * tanh(up / beta),
++                        // the expression of sm100_fp8_fp4_mega_moe_situ; unweighted (combine applies the top-k weights)
++                        DG_STATIC_ASSERT(kActivationAlpha > 0.0f, "SiTU activation alpha must be positive");
++                        DG_STATIC_ASSERT(kActivationBeta >= 0.0f, "SiTU activation beta must be non-negative");
+                         #pragma unroll
+                         for (uint32_t k = 0; k < 2; ++ k) {
+-                            const auto bf16_gate = gate_up[j][k][0];
+-                            const auto bf16_up = gate_up[j][k][1];
+-
+-                            // SwiGLU
+-                            const auto gate = __bfloat1622float2(bf16_gate);
+-                            auto sigmoid_input = gate;
+-                            if constexpr (kActivationAlpha != 1.0f)
+-                                sigmoid_input = __fmul2_rn(
+-                                    sigmoid_input, {kActivationAlpha, kActivationAlpha});
+-                            auto neg_gate_exp = make_float2(
+-                                kFastMath ? __expf(-sigmoid_input.x) : expf(-sigmoid_input.x),
+-                                kFastMath ? __expf(-sigmoid_input.y) : expf(-sigmoid_input.y));
+-                            const auto denom = __fadd2_rn({1.0f, 1.0f}, neg_gate_exp);
+-                            float2 gated;
+-                            if constexpr (kFastMath) {
+-                                gated = __fmul2_rn(
+-                                    gate, {math::fast_rcp(denom.x), math::fast_rcp(denom.y)});
+-                            } else {
+-                                gated = {gate.x / denom.x, gate.y / denom.y};
++                            const auto gate = __bfloat1622float2(gate_up[j][k][0]);
++                            auto up = __bfloat1622float2(gate_up[j][k][1]);
++                            constexpr float kInvActivationAlpha = 1.0f / kActivationAlpha;
++                            const auto gated = __fmul2_rn(
++                                __fmul2_rn(
++                                    nvfp4_situ_tanh_f32x2<kFastMath>(
++                                        __fmul2_rn(gate, {kInvActivationAlpha, kInvActivationAlpha})),
++                                    {kActivationAlpha, kActivationAlpha}),
++                                nvfp4_situ_sigmoid_f32x2<kFastMath>(gate));
++
++                            // A zero beta leaves FlashInfer's optional situ_linear_beta unset.
++                            if constexpr (kActivationBeta > 0.0f) {
++                                constexpr float kInvActivationBeta = 1.0f / kActivationBeta;
++                                up = __fmul2_rn(
++                                    nvfp4_situ_tanh_f32x2<kFastMath>(
++                                        __fmul2_rn(up, {kInvActivationBeta, kInvActivationBeta})),
++                                    {kActivationBeta, kActivationBeta});
+                             }
+-                            if constexpr (kClampAfterSilu and kActivationClamp != cute::numeric_limits<float>::infinity())
+-                                gated = {fminf(gated.x, kActivationClamp), fminf(gated.y, kActivationClamp)};
+-                            auto up = __bfloat1622float2(bf16_up);
+-                            if constexpr (kActivationBeta != 0.0f)
+-                                up = __fadd2_rn(up, {kActivationBeta, kActivationBeta});
+                             activation_values[i][k] = __fmul2_rn(gated, up);
+                         }
+ 
+@@ -1404,7 +1463,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
+                             // `amax / (6 * l2_activation_scale)`: the division's FMA-corrected fast path with the
+                             // divisor's refined reciprocal hoisted; this matches IEEE division for every quotient in
+                             // the [2^-9, 448] clamp range, and larger inputs are capped so `amax * r1` stays finite
+-                            const float quant_d = 6.0f * l2_activation_scale;
++                            const float quant_d = 6.0f * l2_input_scale;
+                             const float quant_r = math::fast_rcp(quant_d);
+                             const float quant_r1 = __fmaf_rn(quant_r, __fmaf_rn(-quant_d, quant_r, 1.0f), quant_r);
+                             const float quant_cap = 448.0f * quant_d;
+@@ -1415,8 +1474,8 @@ sm100_nvfp4_mega_moe_impl(void* y,
+                             };
+                             const __nv_fp8_e4m3 sf_x(fminf(448.0f, fmaxf(0x1p-9f, div_d(amax_values[i].x))));
+                             const __nv_fp8_e4m3 sf_y(fminf(448.0f, fmaxf(0x1p-9f, div_d(amax_values[i].y))));
+-                            const float2 inv = {1.0f / (static_cast<float>(sf_x) * l2_activation_scale),
+-                                                1.0f / (static_cast<float>(sf_y) * l2_activation_scale)};
++                            const float2 inv = {1.0f / (static_cast<float>(sf_x) * l2_input_scale),
++                                                1.0f / (static_cast<float>(sf_y) * l2_input_scale)};
+                             const uint32_t token_base = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                             const uint32_t row = token_base + (lane_idx % 4) * 2;
+ 
+@@ -1721,7 +1780,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
+         DG_STATIC_ASSERT(kNumRanks <= kNumEpilogueThreads, "Insufficient threads for combine readiness");
+         uint64_t peer_grid_idx = 0;
+         if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
+-            peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
++            peer_grid_idx = k31_is_pre ? (k31_epoch | kK31TagBit) : *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
+ 
+         // All local L2 writes are done after this grid sync
+         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+@@ -1737,7 +1796,7 @@ sm100_nvfp4_mega_moe_impl(void* y,
+         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+ 
+         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
+-        const auto grid_idx = ptx::get_grid_idx() + 1;
++        const uint64_t grid_idx = k31_is_pre ? (k31_epoch | kK31TagBit) : static_cast<uint64_t>(ptx::get_grid_idx() + 1);
+         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
+             const uint32_t token_idx = token_chunk_idx / kNumChunks;
+             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;

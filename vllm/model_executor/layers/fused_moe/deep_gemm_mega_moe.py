@@ -10,6 +10,7 @@ scales each token by its own FP32 scale.
 """
 
 import math
+import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from inspect import signature
@@ -169,7 +170,8 @@ MEGA_MOE_NVFP4 = MegaMoEWeightFormat(
     routed=_NVFP4_WEIGHT,
     shared=(_MXFP8_WEIGHT, _BF16_WEIGHT),
     hidden_quant=kNvfp4DynamicToken,
-    activations=frozenset({"swiglu"}),
+    # Opt-in (K31_NVFP4_SITU_HEADER=1): SiTU comes from the patched NVFP4 MegaMoE header (build option VLLM_K31_NVFP4_SITU_PATCH).
+    activations=frozenset({"swiglu", "situ"}),
 )
 MEGA_MOE_BF16 = MegaMoEWeightFormat(
     name="bf16",
@@ -345,10 +347,30 @@ class DeepGemmMegaMoEExperts(nn.Module):
         self.fast_math = fast_math
         self.l2_input_scale = l2_input_scale
         self._kernel_kwargs = activation.kernel_kwargs()
+        if weight_format.uses_nvfp4_api and activation.name == "situ":
+            # A DeepGEMM built with VLLM_K31_NVFP4_SITU_PATCH=ON (K31_NVFP4_SITU_HEADER=1) computes SiTU (scales
+            # activation_alpha / activation_beta) in the NVFP4 MegaMoE epilogue of its 'swiglu' launch.
+            if os.environ.get("K31_NVFP4_SITU_HEADER") != "1":
+                raise NotImplementedError(
+                    "NVFP4 MegaMoE SiTU needs the patched DeepGEMM header (K31_NVFP4_SITU_HEADER=1)."
+                )
+            self._kernel_kwargs.pop("activation", None)
         self.eplb_state = EplbLayerState()
         # L2 input scale of every logical expert; the NVFP4 kernel takes the max.
         self._w2_input_scales = torch.zeros(self.num_logical_experts, device="cpu")
         self.l2_activation_scale = 1.0
+        # Opt-in (K31_NVFP4_CKPT_SCALES=1, patched header): the checkpoint's scales as they are. The dispatch
+        # quantizes every token with the static w1/w3 `input_scale` (one value shared by all experts: their max, as
+        # vLLM's FlashInfer NVFP4 MoE does), and each expert quantizes its intermediate with its own `w2.input_scale`.
+        self.ckpt_scales = (
+            weight_format.uses_nvfp4_api and os.environ.get("K31_NVFP4_CKPT_SCALES") == "1"
+        )
+        if self.ckpt_scales and os.environ.get("K31_NVFP4_SITU_HEADER") != "1":
+            raise NotImplementedError(
+                "NVFP4 MegaMoE checkpoint scales need the patched DeepGEMM header (K31_NVFP4_SITU_HEADER=1)."
+            )
+        self._w13_input_scales = torch.zeros(self.num_logical_experts, device="cpu")
+        self.x_static_scale: float | None = None
         # The first of each expert's w1/w3 weight_scale_2 until the other loads.
         self._pending_l1_scales: dict[int, tuple[str, float]] = {}
         # Shared-expert shards whose weight / scale loaded since the last SM90
@@ -461,12 +483,22 @@ class DeepGemmMegaMoEExperts(nn.Module):
         self._register_weight("w2", (e, h, i), fmt.routed)
         if fmt.routed.has_global_scale:
             # w13_weight_scale_2 is the kernel's L1 alpha (per-token dispatch).
-            for name in ("w13_weight_scale_2", "w2_weight_scale_2", "w2_input_scale"):
+            names = ["w13_weight_scale_2", "w2_weight_scale_2", "w2_input_scale"]
+            if self.ckpt_scales:
+                names.append("w13_input_scale")
+            for name in names:
                 scale = torch.zeros(e, dtype=torch.float32)
                 self.register_parameter(name, nn.Parameter(scale, requires_grad=False))
+                if name.endswith("input_scale"):
+                    # Dummy loads: unit activation scales (the checkpoint's values).
+                    set_weight_attrs(getattr(self, name), {"dummy_weight_value": 1.0})
             # w2 global weight scale times the L2 activation scale, per launch.
             l2_alpha = torch.zeros(e, dtype=torch.float32)
             self.register_buffer("_l2_alpha", l2_alpha, persistent=False)
+            if self.ckpt_scales:
+                # L1 alphas with the static input scale folded in, per launch.
+                l1_alpha = torch.zeros(e, dtype=torch.float32)
+                self.register_buffer("_l1_alpha_ckpt", l1_alpha, persistent=False)
         if self.shared_spec is not None:
             # The shared expert has the layout of one routed expert slice.
             s = i * self.num_shared_experts
@@ -560,6 +592,12 @@ class DeepGemmMegaMoEExperts(nn.Module):
         if weight_name.endswith("w2_input_scale"):
             self._w2_input_scales[expert_id] = scale.max()
             self.l2_activation_scale = float(self._w2_input_scales.max()) or 1.0
+        elif weight_name.endswith("w13_input_scale"):
+            # w1 and w3 of one expert, then all experts, share the dispatch's static scale: the max.
+            self._w13_input_scales[expert_id] = torch.maximum(
+                self._w13_input_scales[expert_id], scale.max().float().cpu()
+            )
+            self.x_static_scale = float(self._w13_input_scales.max())
         elif weight_name.endswith("w13_weight_scale_2"):
             # Compare w1 and w3 of the same load, not the live (maybe stale) slot.
             prev = self._pending_l1_scales.pop(expert_id, None)
@@ -916,6 +954,52 @@ class DeepGemmMegaMoEExperts(nn.Module):
         # Warmup: every rank runs the same token counts.
         return num_tokens
 
+    def k31_m1_enabled(self) -> bool:
+        """Pre-dispatch (M1, K31_M1=1): whether this layer can run pre-dispatched launches (env, format, patched header)."""
+        ok = getattr(self, "_k31_m1_ok", None)
+        if ok is None:
+            ok = False
+            if os.environ.get("K31_M1") == "1" and self.weight_format.uses_nvfp4_api and self.ckpt_scales \
+                    and not self.has_fused_shared_experts:
+                from vllm.model_executor.layers.fused_moe import k31_predispatch
+
+                ok = k31_predispatch.header_supports_m1()
+                if not ok:
+                    logger.warning_once("K31_M1=1 but the DeepGEMM NVFP4 MegaMoE header is not the M1 one; off")
+            self._k31_m1_ok = ok
+        return ok
+
+    def k31_predispatch(self, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> None:
+        """Pre-dispatch (M1): stage the routing and run the dispatch head of this launch now, on the current stream.
+
+        Call right after the router top-k (on a side stream); the next forward() of this layer then stages only
+        the activations and launches the MegaMoE kernel, which starts at the token pulls. Every rank must
+        pre-dispatch the same launches (DEP ranks run the same padded batch)."""
+        from vllm.model_executor.layers.fused_moe import k31_predispatch
+
+        num_tokens = topk_ids.shape[0]
+        self._synchronize_first_launch()
+        is_padding = None
+        if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+            is_padding = get_forward_context().is_padding
+            if is_padding is not None:
+                is_padding = is_padding[:num_tokens]
+        symm_buffer = self.get_symm_buffer()
+        prepare_megamoe_nvfp4_inputs(
+            None,
+            topk_weights,
+            topk_ids,
+            symm_buffer.x[:num_tokens],
+            symm_buffer.x_sf[:num_tokens],
+            symm_buffer.x_scales,
+            symm_buffer.topk_idx[:num_tokens],
+            symm_buffer.topk_weights[:num_tokens],
+            is_padding=is_padding,
+            eplb_state=self.eplb_state,
+            stage="route",
+        )
+        k31_predispatch.predispatch(symm_buffer, num_tokens)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -976,7 +1060,44 @@ class DeepGemmMegaMoEExperts(nn.Module):
         if self.shared_spec is not None and self.shared_spec.scale_group_k:
             shared_x_sf = symm_buffer.shared_l1_acts_sf
             shared_block_m = self.get_block_m(block_m_num_tokens)
-        if fmt.uses_nvfp4_api:
+        # Pre-dispatch (M1): an event set by DepMoeMx after k31_predispatch() on its side stream
+        k31_pre_event = getattr(self, "_k31_pre_event", None)
+        self._k31_pre_event = None
+        if fmt.uses_nvfp4_api and self.ckpt_scales:
+            # Checkpoint scales: static input scale, per-expert L2 input scales (staged into the unused x-scales
+            # region, where the patched header reads them when use_x_scales=False). Dummy loads keep unit scales.
+            static_x_scale = self.x_static_scale or 1.0
+            prepare_megamoe_nvfp4_inputs(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                symm_buffer.x[:num_tokens],
+                symm_buffer.x_sf[:num_tokens],
+                symm_buffer.x_scales,
+                symm_buffer.topk_idx[:num_tokens],
+                symm_buffer.topk_weights[:num_tokens],
+                is_padding=is_padding,
+                shared_x=symm_buffer.shared_l1_acts[:num_tokens]
+                if self.has_fused_shared_experts
+                else None,
+                shared_x_sf=shared_x_sf,
+                shared_block_m=shared_block_m,
+                w2_global_scale=self.w2_weight_scale_2,
+                l2_alpha=self._l2_alpha,
+                eplb_state=self.eplb_state,
+                a2_scales=self.w2_input_scale,
+                l1_global_scale=self.w13_weight_scale_2,
+                l1_alpha_out=self._l1_alpha_ckpt,
+                static_x_scale=static_x_scale,
+                stage="all" if k31_pre_event is None else "x",
+            )
+            kwargs.update(
+                l1_alpha=self._l1_alpha_ckpt,
+                l2_alpha=self._l2_alpha,
+                l2_activation_scale=1.0,
+                use_x_scales=False,
+            )
+        elif fmt.uses_nvfp4_api:
             l2_activation_scale = self.l2_activation_scale
             prepare_megamoe_nvfp4_inputs(
                 hidden_states,
@@ -1025,6 +1146,8 @@ class DeepGemmMegaMoEExperts(nn.Module):
             kwargs["shared_l1_weights"] = self._kernel_weights("shared_l1")
             kwargs["shared_l2_weights"] = self._kernel_weights("shared_l2")
         y = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        if k31_pre_event is not None:
+            torch.cuda.current_stream().wait_event(k31_pre_event)
         getattr(deep_gemm, fmt.kernel)(
             y,
             self.l1_weights,
