@@ -825,10 +825,10 @@ def test_internal_checkpoint_publication_respects_retention(
     )
 
 
-def test_shared_prefix_boundary_exported_without_transient_overwrite():
-    """With retention_interval=0, a shared-prefix junction inside an
-    intermediate chunk is exported directly into a detached checkpoint block,
-    and no transient off-boundary checkpoint (112) is ever emitted.
+def test_intermediate_chunk_leaves_skipped_boundary_and_transient_uncached():
+    """With retention_interval=0, an intermediate chunk [0, 128) does not
+    export a transient off-boundary checkpoint (112) and never hashes skipped
+    block 2 (96) as if its block-end state had been materialized.
     """
     hash_block_size = 16
     manager = make_full_mamba_manager(
@@ -846,13 +846,12 @@ def test_shared_prefix_boundary_exported_without_transient_overwrite():
     assert manager.allocate_slots(request, 128, num_computed, computed_blocks)
 
     checkpoints, retained = manager.take_mamba_prefill_checkpoints()
-    assert checkpoints[1][request.request_id][0] == 96
+    assert not checkpoints
+    assert not retained
     boundary_hash = request.block_hashes[96 // hash_block_size - 1]
-    hit = manager.block_pool.get_cached_block(boundary_hash, [1])
-    assert hit is not None and hit[0].block_id == checkpoints[1][request.request_id][1]
+    assert manager.block_pool.get_cached_block(boundary_hash, [1]) is None
     transient_hash = request.block_hashes[112 // hash_block_size - 1]
     assert manager.block_pool.get_cached_block(transient_hash, [1]) is None
-    manager.block_pool.free_blocks(retained)
 
 
 @pytest.mark.parametrize("prompt_len", [120, 104, 96])

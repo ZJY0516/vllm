@@ -1867,6 +1867,17 @@ class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):
 
 
 class MambaManager(SingleTypeKVCacheManager):
+    """KV cache manager for Mamba / linear-attention recurrent state blocks.
+
+    Block-slot invariant (`prefix_caching=True`):
+        `req_to_blocks[i]` strictly belongs to token range `(i * B, (i + 1) * B]`.
+        It holds its full block-end state `state@((i + 1) * B)` if and only if
+        a prefill chunk (or external load) ended at `(i + 1) * B` (`i in
+        _prefill_block_ends`) or decode stepped sequentially past `_last_prefill_end`.
+        Interior prefill checkpoints are exported to detached blocks outside
+        `req_to_blocks` so `req_to_blocks[i]` never aliases another block's state.
+    """
+
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
     zeroes_new_blocks: ClassVar[bool] = False
 
@@ -1963,11 +1974,11 @@ class MambaManager(SingleTypeKVCacheManager):
             self._num_retired_blocks: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
-            # Planned detached prefill checkpoint for the current allocation:
-            # request_id -> (checkpoint_position, query_offset).
-            self._planned_checkpoints: dict[str, tuple[int, int]] = {}
-            # Planned prefill chunk end committed in `allocate_new_blocks`.
-            self._planned_prefill_ends: dict[str, int] = {}
+            # Transient per-allocation prefill plan committed in `allocate_new_blocks`:
+            # request_id -> (prefill_end_tokens, (ckpt_pos, query_offset) | None).
+            self._planned_prefill_steps: dict[
+                str, tuple[int, tuple[int, int] | None]
+            ] = {}
             # Allocated detached prefill checkpoints awaiting worker dispatch:
             # request_id -> (checkpoint_position, query_offset, checkpoint_block).
             self._pending_checkpoints: dict[str, tuple[int, int, KVCacheBlock]] = {}
@@ -2236,39 +2247,24 @@ class MambaManager(SingleTypeKVCacheManager):
         self,
         query_start: int,
         query_end: int,
-        prefill_end: int,
         num_prompt_tokens: int | None,
-        shared_prefix_boundary: int,
         retention_interval: int | None,
-        num_hashed_tokens: int | None,
     ) -> int:
-        """Select a reusable interior checkpoint position for this prefill chunk,
+        """Select a reusable interior checkpoint position for a prefill chunk,
         or `0` if none should be exported."""
         if (
             not self.has_prefill_checkpoint_blocks
             or self.prefill_checkpoint_alignment is None
-            or not self._is_prefill_chunk(
-                query_start, query_end, prefill_end, num_prompt_tokens
-            )
         ):
             return 0
         lookahead = self.block_pool.num_hash_lookahead_tokens
-        candidates: list[int] = [
+        candidates = [
             get_reusable_prefix_length(
                 num_prompt_tokens if num_prompt_tokens is not None else query_end,
                 num_hash_lookahead_tokens=lookahead,
                 alignment_tokens=self.cache_hit_alignment_tokens,
             )
         ]
-        if shared_prefix_boundary > 0:
-            if self.shared_prefix_checkpoint and (
-                num_prompt_tokens is None or shared_prefix_boundary <= num_prompt_tokens
-            ):
-                candidates.append(shared_prefix_boundary)
-            else:
-                candidates.append(
-                    shared_prefix_boundary // self.block_size * self.block_size
-                )
         if retention_interval != 0:
             max_block_end = get_reusable_prefix_length(
                 query_end,
@@ -2281,11 +2277,7 @@ class MambaManager(SingleTypeKVCacheManager):
 
         best = 0
         for pos in candidates:
-            if pos <= best:
-                continue
-            if num_hashed_tokens is not None and pos > num_hashed_tokens:
-                continue
-            if is_mamba_prefill_checkpoint_valid(
+            if pos > best and is_mamba_prefill_checkpoint_valid(
                 query_start=query_start,
                 query_end=query_end,
                 checkpoint_position=pos,
@@ -2326,9 +2318,7 @@ class MambaManager(SingleTypeKVCacheManager):
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
         num_prompt_tokens: int | None = None,
-        shared_prefix_boundary: int = 0,
         retention_interval: int | None = None,
-        num_hashed_tokens: int | None = None,
     ) -> int:
         if (
             len(new_computed_blocks) > 0
@@ -2384,29 +2374,32 @@ class MambaManager(SingleTypeKVCacheManager):
                 )
                 or request_id in self._partial_hit_reqs
             )
-            checkpoint_position = self._select_prefill_checkpoint(
-                query_start=total_computed_tokens,
-                query_end=num_tokens,
-                prefill_end=prefill_end,
-                num_prompt_tokens=num_prompt_tokens,
-                shared_prefix_boundary=shared_prefix_boundary,
-                retention_interval=retention_interval,
-                num_hashed_tokens=num_hashed_tokens,
+            is_prefill_chunk = self._is_prefill_chunk(
+                total_computed_tokens, num_tokens, prefill_end, num_prompt_tokens
+            )
+            checkpoint_position = (
+                self._select_prefill_checkpoint(
+                    query_start=total_computed_tokens,
+                    query_end=num_tokens,
+                    num_prompt_tokens=num_prompt_tokens,
+                    retention_interval=retention_interval,
+                )
+                if is_prefill_chunk
+                else 0
             )
             if not apply_admission_cap:
-                if checkpoint_position > 0:
-                    self._planned_checkpoints[request_id] = (
-                        checkpoint_position,
-                        checkpoint_position - total_computed_tokens,
+                if is_prefill_chunk:
+                    planned_ckpt = (
+                        (
+                            checkpoint_position,
+                            checkpoint_position - total_computed_tokens,
+                        )
+                        if checkpoint_position > 0
+                        else None
                     )
+                    self._planned_prefill_steps[request_id] = (num_tokens, planned_ckpt)
                 else:
-                    self._planned_checkpoints.pop(request_id, None)
-                if self._is_prefill_chunk(
-                    total_computed_tokens, num_tokens, prefill_end, num_prompt_tokens
-                ):
-                    self._planned_prefill_ends[request_id] = num_tokens
-                else:
-                    self._planned_prefill_ends.pop(request_id, None)
+                    self._planned_prefill_steps.pop(request_id, None)
 
             num_new_blocks = (
                 num_table_new_blocks
@@ -2442,9 +2435,10 @@ class MambaManager(SingleTypeKVCacheManager):
             num_required_blocks = (
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
-            planned_checkpoint = self._planned_checkpoints.pop(request_id, None)
-            planned_prefill_end = self._planned_prefill_ends.pop(request_id, None)
-            if planned_prefill_end is not None:
+            planned_prefill = self._planned_prefill_steps.pop(request_id, None)
+            planned_checkpoint = None
+            if planned_prefill is not None:
+                planned_prefill_end, planned_checkpoint = planned_prefill
                 self._record_prefill_end(request_id, planned_prefill_end)
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
@@ -2632,8 +2626,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
-            self._planned_checkpoints.pop(request_id, None)
-            self._planned_prefill_ends.pop(request_id, None)
+            self._planned_prefill_steps.pop(request_id, None)
             self._last_prefill_end.pop(request_id, None)
             self._prefill_block_ends.pop(request_id, None)
             self._last_checkpoint_block.pop(request_id, None)
@@ -2855,8 +2848,7 @@ class MambaManager(SingleTypeKVCacheManager):
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
         if self.prefix_caching:
-            self._planned_checkpoints.clear()
-            self._planned_prefill_ends.clear()
+            self._planned_prefill_steps.clear()
             if self._pending_checkpoints:
                 # Direct KVCacheManager callers that do not drain checkpoints
                 # through Scheduler still release detached checkpoint refs on

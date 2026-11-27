@@ -565,7 +565,6 @@ class KVCacheManager:
         # Matches the scheduler's own prefill boundary: `num_tokens - 1`
         # extends it to resumed requests replaying their output tokens.
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
-        num_hashed_tokens = len(request.block_hashes) * self.block_pool.hash_block_size
 
         full_sequence_shortfall = 0
         if full_sequence_must_fit:
@@ -583,8 +582,6 @@ class KVCacheManager:
                 apply_admission_cap=True,
                 prefill_end=prefill_end,
                 num_prompt_tokens=request.num_prompt_tokens,
-                shared_prefix_boundary=request.shared_prefix_boundary,
-                num_hashed_tokens=num_hashed_tokens,
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             full_sequence_shortfall = (
@@ -624,8 +621,6 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
             prefill_end=prefill_end,
             num_prompt_tokens=request.num_prompt_tokens,
-            shared_prefix_boundary=request.shared_prefix_boundary,
-            num_hashed_tokens=num_hashed_tokens,
         )
 
         # Keep `reserved_blocks` free for other in-flight sequences, and an

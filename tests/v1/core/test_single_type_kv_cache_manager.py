@@ -222,7 +222,7 @@ def test_mamba_checkpoint_admission_matches_allocation(
 
     admission_estimate = estimate(prompt_tokens, computed_tokens, True)
     allocation_estimate = estimate(prompt_tokens, computed_tokens, False)
-    assert request_id in manager._planned_checkpoints
+    assert manager._planned_prefill_steps[request_id][1] is not None
 
     free_before = pool.get_num_free_blocks()
     manager.allocate_new_blocks(request_id, prompt_tokens, prompt_tokens)

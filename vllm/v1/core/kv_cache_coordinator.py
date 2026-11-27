@@ -155,8 +155,6 @@ class KVCacheCoordinator(ABC):
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
         num_prompt_tokens: int | None = None,
-        shared_prefix_boundary: int = 0,
-        num_hashed_tokens: int | None = None,
     ) -> int:
         """Get the number of device blocks needed to be allocated for the request.
 
@@ -181,11 +179,7 @@ class KVCacheCoordinator(ABC):
             prefill_end: The token index the request's prefill ends at, the
                 same value the scheduler splits chunks against.
             num_prompt_tokens: Prompt token count of the request, used by Mamba
-                to select reusable internal prefill checkpoints.
-            shared_prefix_boundary: Detected Marconi shared-prefix junction for
-                the request, if any.
-            num_hashed_tokens: Number of tokens covered by finalized block
-                hashes on the request.
+                to select reusable prefill checkpoints.
 
         Returns:
             The number of blocks to allocate.
@@ -216,9 +210,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                     prefill_end=prefill_end,
                     num_prompt_tokens=num_prompt_tokens,
-                    shared_prefix_boundary=shared_prefix_boundary,
                     retention_interval=self.retention_interval,
-                    num_hashed_tokens=num_hashed_tokens,
                 )
             else:
                 if apply_admission_cap:

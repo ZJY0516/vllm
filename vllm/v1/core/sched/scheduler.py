@@ -3741,8 +3741,6 @@ class Scheduler(SchedulerInterface):
             apply_admission_cap=True,
             prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
             num_prompt_tokens=request.num_prompt_tokens,
-            shared_prefix_boundary=request.shared_prefix_boundary,
-            num_hashed_tokens=len(request.block_hashes) * self.hash_block_size,
         )
 
     def _set_kv_fetch_stage(self, request: Request, stage: str | None) -> None:
