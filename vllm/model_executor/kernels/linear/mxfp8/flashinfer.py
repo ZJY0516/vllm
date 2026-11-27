@@ -178,24 +178,121 @@ class FlashInferCutedslMxfp8LinearKernel(Mxfp8LinearKernel):
         else:
             assert isinstance(x, torch.Tensor)
             out_dtype, input_shape = layer.params_dtype, x.shape
-            input_mxfp8, input_scale = mxfp8_e4m3_quantize(
-                x.view(-1, K), is_sf_swizzled_layout=True
-            )
+            x2 = x.view(-1, K)
+            fast = _k31_fast_quant(x2)  # opt-in: K31_MXFP8_FASTQ=1
+            if fast is not None:
+                input_mxfp8, input_scale = fast
+            else:
+                input_mxfp8, input_scale = mxfp8_e4m3_quantize(
+                    x2, is_sf_swizzled_layout=True
+                )
 
-        output = vllm_flashinfer.mm_mxfp8(
-            input_mxfp8,
-            weight,
-            input_scale,
-            weight_scale,
-            out_dtype=out_dtype,
-            backend="cute-dsl",
-        )
+        output = _k31_tactic_mm(input_mxfp8, weight, input_scale, weight_scale, out_dtype)
+        if output is None:
+            output = vllm_flashinfer.mm_mxfp8(
+                input_mxfp8,
+                weight,
+                input_scale,
+                weight_scale,
+                out_dtype=out_dtype,
+                backend="cute-dsl",
+            )
 
         if bias is not None:
             output = output + bias
 
         output_shape = (*input_shape[:-1], N)
         return output.view(output_shape)
+
+
+# Opt-in (K31_MXFP8_TACTICS=1): fixed cute-dsl tactics for the Kimi K3.1 NVFP4
+# checkpoint's MXFP8 linears at decode rows, picked by timing every valid tactic with
+# cold weights (the untuned default and the autotuner, which profiles one hot weight,
+# pick slower ones there). Output equals the default tactic's bit for bit at the timed
+# rows. {(N, K): [(max rows, tactic), ...]}, applied for 33 <= rows <= 80.
+# Opt-in (K31_MXFP8_FASTQ=1): decode-row activation quantization by k31_mxfp8q (the CuTe-DSL quantizer's
+# arithmetic, laid out over the real rows); checked bitwise against mxfp8_e4m3_quantize on the first eager call per
+# width, which falls back to the stock quantizer on any difference.
+_K31_FASTQ = __import__("os").environ.get("K31_MXFP8_FASTQ") == "1"
+_K31_FASTQ_OK: dict = {}
+
+
+def _k31_fast_quant(x2):
+    if not _K31_FASTQ or x2.dtype != torch.bfloat16 or not x2.is_contiguous():
+        return None
+    rows, width = x2.shape
+    if width % 128 or not 0 < rows <= 256 or x2.data_ptr() % 16:
+        return None
+    from vllm.model_executor.layers.fused_moe import k31_mxfp8q
+
+    ok = _K31_FASTQ_OK.get(width)
+    if ok is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        q0, s0 = mxfp8_e4m3_quantize(x2, is_sf_swizzled_layout=True)
+        q1, s1 = k31_mxfp8q.mxfp8_quant(x2)
+        ok = torch.equal(q0.view(torch.uint8), q1.view(torch.uint8)) and torch.equal(
+            s0.view(torch.uint8), s1.view(torch.uint8)
+        )
+        _K31_FASTQ_OK[width] = ok
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info("K31_MXFP8_FASTQ: K=%d rows=%d %s", width, rows,
+                    "bitwise equal, on" if ok else "differs, off")  # fmt: skip
+        return q0, s0
+    return k31_mxfp8q.mxfp8_quant(x2) if ok else None
+
+
+_K31_TACTICS = {
+    (7168, 12288): [(80, ((256, 64), (2, 2), True, True, 1))],  # KDA o_proj
+    (49376, 7168): [(64, ((256, 64), (4, 1), True, False, 1)),  # KDA in_proj
+                    (80, ((256, 128), (2, 1), True, False, 1))],
+    (12288, 7168): [(64, ((256, 64), (2, 1), True, False, 1)),  # shared gate_up
+                    (80, ((256, 128), (2, 1), True, False, 1))],
+    (7168, 6144): [(80, ((128, 64), (1, 4), False, True, 1))],  # shared down
+}
+_k31_cache: dict = {}
+
+
+def _k31_tactic_mm(a, b, a_descale, b_descale, out_dtype):
+    import os
+
+    if os.environ.get("K31_MXFP8_TACTICS") != "1":
+        return None
+    m = a.shape[0]
+    K, N = b.shape
+    plan = _K31_TACTICS.get((N, K))
+    if plan is None or not 33 <= m <= 80:
+        return None
+    tactic = next((t for max_m, t in plan if m <= max_m), None)
+    from flashinfer.gemm import gemm_base as gb
+    from flashinfer.utils import get_compute_capability
+
+    out = torch.empty((m, N), device=a.device, dtype=out_dtype)
+    ws = gb._get_stream_cache_buf("mm_mxfp8_workspace", gb.DEFAULT_WORKSPACE_SIZE, a.device)
+    inputs = [a, b, a_descale, b_descale, out_dtype, out, ws]
+    key = (N, K, m, out_dtype)
+    runner = _k31_cache.get(key, 0)
+    if runner == 0:
+        runner = None
+        major, minor = get_compute_capability(a.device)
+        for r in gb._cute_dsl_mxfp8_runners(major, minor, True, out_dtype, inputs):
+            try:
+                if tactic in list(r.get_valid_tactics(inputs, None)):
+                    runner = r
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        _k31_cache[key] = runner
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "K31_MXFP8_TACTICS: N=%d K=%d rows=%d tactic=%s %s", N, K, m, tactic,
+            "used" if runner is not None else "not valid, default kept")
+    if runner is None:
+        return None
+    runner(inputs=inputs, tactic=tactic)
+    return out
 
 
 class FlashInferTrtllmMxfp8LinearKernel(Mxfp8LinearKernel):
