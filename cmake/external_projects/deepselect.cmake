@@ -29,6 +29,32 @@ endif()
 FetchContent_MakeAvailable(deepselect)
 message(STATUS "DeepSelect is available at ${deepselect_SOURCE_DIR}")
 
+# Local changes on top of the pinned commit, applied to the fetched tree only
+# (a DEEPSELECT_SRC_DIR tree is used as is). A tree that already has a patch,
+# such as a reused _deps checkout, is left alone.
+#   deepselect_bf16_topk2048_tier.patch: a max_topk 2048 tier for BF16 top-k
+#   with 1024 < topk <= 2048 (the DSA sparse indexer's prefill top-k), the
+#   same tuple as the max_topk 4096 tier otherwise; output indices and their
+#   order are identical.
+if(NOT DEEPSELECT_SRC_DIR)
+  find_package(Git REQUIRED)
+  foreach(_ds_patch
+      "${CMAKE_SOURCE_DIR}/cmake/patches/deepselect_bf16_topk2048_tier.patch")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_ds_patch}"
+      WORKING_DIRECTORY "${deepselect_SOURCE_DIR}"
+      RESULT_VARIABLE _ds_patch_present
+      OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _ds_patch_present EQUAL 0)
+      message(STATUS "DeepSelect: applying ${_ds_patch}")
+      execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply "${_ds_patch}"
+        WORKING_DIRECTORY "${deepselect_SOURCE_DIR}"
+        COMMAND_ERROR_IS_FATAL ANY)
+    endif()
+  endforeach()
+endif()
+
 # DeepSelect kernels require CUDA 12.9+; 10.0f (family) covers SM100 and SM103.
 set(DEEPSELECT_SUPPORT_ARCHS)
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
@@ -36,6 +62,12 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
 endif()
 
 cuda_archs_loose_intersection(DEEPSELECT_ARCHS "${DEEPSELECT_SUPPORT_ARCHS}" "${CUDA_ARCHS}")
+# When the SM100 family is targeted, also build SM103-specific code (B300 /
+# GB300), which the driver picks over the family code on SM103; the kernels
+# measured faster than the 10.0f build there.
+if("10.0f" IN_LIST DEEPSELECT_ARCHS)
+    list(APPEND DEEPSELECT_ARCHS "10.3a")
+endif()
 if(DEEPSELECT_ARCHS)
     message(STATUS "DeepSelect CUDA architectures: ${DEEPSELECT_ARCHS}")
 

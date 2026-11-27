@@ -1,0 +1,186 @@
+Add a max_topk 2048 tier to DeepSelect's BF16 top-k (csrc/api.cpp) for
+1024 < topk <= 2048, the DSA sparse indexer's prefill top-k. Applied by
+cmake/external_projects/deepselect.cmake to the pinned DeepSelect checkout.
+
+- That range used the max_topk 4096 tuple (512 threads, occupancy 1,
+  B 8192, B2 4096, TMA depth 3). The new tier is the same tuple with
+  max_topk 2048: the scan order, the segment permutation, the reconstruct
+  threshold and the tie handling do not depend on max_topk, which only sizes
+  the candidate buffers and the loops over them.
+- Output indices (and their order) are identical to the max_topk 4096 tuple.
+- Adds the eight bf16 instantiations of the new tuple and lets the bf16
+  normal kernel accept max_topk 2048.
+
+diff --git a/csrc/api.cpp b/csrc/api.cpp
+index c6e238f..b1f1593 100644
+--- a/csrc/api.cpp
++++ b/csrc/api.cpp
+@@ -174,6 +174,10 @@ void topk(
+                             dispatch.template operator()<512>();
+                         } else if (topk <= 1024) {
+                             dispatch.template operator()<1024>();
++                        } else if (topk <= 2048) {
++                            // Modified by NVIDIA: topk in (1024, 2048] uses the same tuple as the big-topk tier
++                            // (512t / occ1 / B8192 / B2 4096 / TMA3) with max_topk 2048 (smaller buffers, same scan order).
++                            topk_select_bf16_normal::run_topk_select_kernel<TopkSelectConfig<nv_bfloat16, OutIdxT, false, SORTED_INDEX, RETURN_VALUE, 2048, 512, 1, 8192, 4096, 3>>(args);
+                         } else {
+                             // Big-topk coverage tier, topk in (1024, 4096]: one correctness-only tuple
+                             // (512t / occ1 / B8192 / B2 4096 / TMA3 / max_topk 4096), no wave split.
+diff --git a/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si0_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si0_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+new file mode 100644
+index 0000000..46ce726
+--- /dev/null
++++ b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si0_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+@@ -0,0 +1,11 @@
++// Modified by NVIDIA: added max_topk 2048 instantiation (same tuple as the max_topk 4096 tier).
++#include "../topk_select.cuh"
++
++namespace topk_select_bf16_normal {
++
++template
++void run_topk_select_kernel<
++    TopkSelectConfig<nv_bfloat16, int32_t, false, false, false, 2048, 512, 1, 8192, 4096, 3, 512, 1>
++>(const TopkSelectArgs &args);
++
++}   // topk_select_bf16_normal
+diff --git a/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si0_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si0_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+new file mode 100644
+index 0000000..dbf0fce
+--- /dev/null
++++ b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si0_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+@@ -0,0 +1,11 @@
++// Modified by NVIDIA: added max_topk 2048 instantiation (same tuple as the max_topk 4096 tier).
++#include "../topk_select.cuh"
++
++namespace topk_select_bf16_normal {
++
++template
++void run_topk_select_kernel<
++    TopkSelectConfig<nv_bfloat16, int32_t, false, false, true, 2048, 512, 1, 8192, 4096, 3, 512, 1>
++>(const TopkSelectArgs &args);
++
++}   // topk_select_bf16_normal
+diff --git a/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si1_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si1_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+new file mode 100644
+index 0000000..d785e24
+--- /dev/null
++++ b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si1_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+@@ -0,0 +1,11 @@
++// Modified by NVIDIA: added max_topk 2048 instantiation (same tuple as the max_topk 4096 tier).
++#include "../topk_select.cuh"
++
++namespace topk_select_bf16_normal {
++
++template
++void run_topk_select_kernel<
++    TopkSelectConfig<nv_bfloat16, int32_t, false, true, false, 2048, 512, 1, 8192, 4096, 3, 512, 1>
++>(const TopkSelectArgs &args);
++
++}   // topk_select_bf16_normal
+diff --git a/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si1_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si1_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+new file mode 100644
+index 0000000..896ab19
+--- /dev/null
++++ b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i32_sv0_si1_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+@@ -0,0 +1,11 @@
++// Modified by NVIDIA: added max_topk 2048 instantiation (same tuple as the max_topk 4096 tier).
++#include "../topk_select.cuh"
++
++namespace topk_select_bf16_normal {
++
++template
++void run_topk_select_kernel<
++    TopkSelectConfig<nv_bfloat16, int32_t, false, true, true, 2048, 512, 1, 8192, 4096, 3, 512, 1>
++>(const TopkSelectArgs &args);
++
++}   // topk_select_bf16_normal
+diff --git a/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si0_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si0_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+new file mode 100644
+index 0000000..66ac1b2
+--- /dev/null
++++ b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si0_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+@@ -0,0 +1,11 @@
++// Modified by NVIDIA: added max_topk 2048 instantiation (same tuple as the max_topk 4096 tier).
++#include "../topk_select.cuh"
++
++namespace topk_select_bf16_normal {
++
++template
++void run_topk_select_kernel<
++    TopkSelectConfig<nv_bfloat16, int64_t, false, false, false, 2048, 512, 1, 8192, 4096, 3, 512, 1>
++>(const TopkSelectArgs &args);
++
++}   // topk_select_bf16_normal
+diff --git a/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si0_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si0_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+new file mode 100644
+index 0000000..78837b9
+--- /dev/null
++++ b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si0_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+@@ -0,0 +1,11 @@
++// Modified by NVIDIA: added max_topk 2048 instantiation (same tuple as the max_topk 4096 tier).
++#include "../topk_select.cuh"
++
++namespace topk_select_bf16_normal {
++
++template
++void run_topk_select_kernel<
++    TopkSelectConfig<nv_bfloat16, int64_t, false, false, true, 2048, 512, 1, 8192, 4096, 3, 512, 1>
++>(const TopkSelectArgs &args);
++
++}   // topk_select_bf16_normal
+diff --git a/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si1_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si1_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+new file mode 100644
+index 0000000..02c5cc6
+--- /dev/null
++++ b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si1_rv0_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+@@ -0,0 +1,11 @@
++// Modified by NVIDIA: added max_topk 2048 instantiation (same tuple as the max_topk 4096 tier).
++#include "../topk_select.cuh"
++
++namespace topk_select_bf16_normal {
++
++template
++void run_topk_select_kernel<
++    TopkSelectConfig<nv_bfloat16, int64_t, false, true, false, 2048, 512, 1, 8192, 4096, 3, 512, 1>
++>(const TopkSelectArgs &args);
++
++}   // topk_select_bf16_normal
+diff --git a/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si1_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si1_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+new file mode 100644
+index 0000000..f324d05
+--- /dev/null
++++ b/csrc/cuda_kernels/v3/instantiations/value_bf16_outidx_i64_sv0_si1_rv1_maxtopk_2048_numthreads_512_occupancy_1_b_8192_b2_4096_tma_3.cu
+@@ -0,0 +1,11 @@
++// Modified by NVIDIA: added max_topk 2048 instantiation (same tuple as the max_topk 4096 tier).
++#include "../topk_select.cuh"
++
++namespace topk_select_bf16_normal {
++
++template
++void run_topk_select_kernel<
++    TopkSelectConfig<nv_bfloat16, int64_t, false, true, true, 2048, 512, 1, 8192, 4096, 3, 512, 1>
++>(const TopkSelectArgs &args);
++
++}   // topk_select_bf16_normal
+diff --git a/csrc/cuda_kernels/v3/topk_select.cuh b/csrc/cuda_kernels/v3/topk_select.cuh
+index 0f9ff69..466c945 100644
+--- a/csrc/cuda_kernels/v3/topk_select.cuh
++++ b/csrc/cuda_kernels/v3/topk_select.cuh
+@@ -4,6 +4,8 @@ TopK select kernel bf16 common variant.
+ Usage caveats:
+   - vocab_size must be < 2^23.
+   - Do NOT assume that the kernel will select a prefix index on ties.
++
++Modified by NVIDIA: allow MAX_TOPK == 2048 (used for topk in (1024, 2048]).
+ */
+ 
+ #pragma once
+@@ -40,7 +42,7 @@ public:
+     using BF16Base::NUM_SEGS_PER_ROUND;
+ 
+     static_assert(Config::target_occupancy >= 1 && Config::target_occupancy <= 8);
+-    static_assert(MAX_TOPK == 512 || MAX_TOPK == 1024 || MAX_TOPK == 4096);
++    static_assert(MAX_TOPK == 512 || MAX_TOPK == 1024 || MAX_TOPK == 2048 || MAX_TOPK == 4096);
+     static constexpr bool HAS_PARTIAL_ROUNDS = NUM_SEGS_PER_ROUND > NUM_TAIL_SEGS;
+     struct SharedMemoryPlan : SharedMemoryPlanBase {};
+ 
