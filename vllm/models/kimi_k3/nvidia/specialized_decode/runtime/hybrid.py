@@ -35,6 +35,23 @@ from vllm.models.common.ops.sequence_parallel import sp_padding_mask, sp_shard
 
 from ..cutedsl.dsa.prepared import PreparedDsa
 from ..cutedsl.gemm.decode import DecodeProjection
+from .dep import mxfp8_linear, output_rows
+
+
+class MxProjection:
+    """NVFP4 checkpoint: an MXFP8 TP linear (KDA input projection,
+    o_proj) runs the stock layer's MXFP8 GEMM (its dynamic MXFP8 activation
+    quantization and kernel) at every batch, as the DEP runtime does; for a
+    row-parallel o_proj this is the partial GEMM (the hybrid step all-reduces)."""
+
+    def __init__(self, linear):
+        self.mx, self.weight, self.rows = linear, None, output_rows(linear)
+
+    def run(self, x, out):
+        return self.mx.quant_method.apply(self.mx, x)
+
+    def engine(self, rows):
+        return "mxfp8"
 from ..cutedsl.kda.prepared import PreparedKda
 from .providers import (
     Attention,
@@ -75,10 +92,14 @@ class HybridAttention(Attention):
             weight = pack_dsa_projection(attention)
         else:
             weight = attention.in_proj_qkvgfab.weight
-        pitch = weight.shape[0]
+        mx_in = kind != "dsa" and mxfp8_linear(attention.in_proj_qkvgfab)
+        pitch = output_rows(attention.in_proj_qkvgfab) if mx_in else weight.shape[0]
         self.wide = batches = tuple(runtime.wide_batches(kind))
-        policies = projection_policies(tp, pitch, batches)
-        self.projection = DecodeProjection(weight, batches, policies)
+        if mx_in:
+            self.projection = MxProjection(attention.in_proj_qkvgfab)
+        else:
+            policies = projection_policies(tp, pitch, batches)
+            self.projection = DecodeProjection(weight, batches, policies)
         self.core: Any
         if kind == "dsa":
             pitches = {b: pitch for b in batches}
@@ -113,14 +134,19 @@ class HybridAttention(Attention):
         self.storage = {b: (projected[:b], local[:b]) for b in batches}
         # o_proj (the SP deployment's: no reduction): warp split-K up to 16 rows,
         # cuBLAS past it (the stock GEMM).
-        self.output = DecodeProjection(attention.o_proj.weight, batches, {})
+        if mxfp8_linear(attention.o_proj):
+            self.output = MxProjection(attention.o_proj)
+            self.output_rows = self.output.rows
+        else:
+            self.output = DecodeProjection(attention.o_proj.weight, batches, {})
+            self.output_rows = attention.o_proj.weight.shape[0]
 
     def run_wide(self, x, caches, metadata, slot_mapping, q):
         """The all-reduced attention output of the normalized group rows `x`."""
         projected, local = self.storage[x.shape[0]]
         projected = self.projection.run(x, projected)
         self.run_core(projected, local, caches, metadata, slot_mapping, q)
-        out = x.new_empty((x.shape[0], self.output.weight.shape[0]))
+        out = x.new_empty((x.shape[0], self.output_rows))
         return all_reduce(self.output.run(local, out))
 
 

@@ -34,6 +34,7 @@ at every batch (its dynamic MXFP8 activation quantization and kernel, i.e. the
 stock decode's numerics for that linear) instead of needing a BF16 copy of the
 weight; BF16 linears are unchanged."""
 
+import os
 from typing import Any
 
 import torch
@@ -271,7 +272,341 @@ class DepKda:
         return self.output.run(local, x.new_empty((b, x.shape[1])))
 
 
-class DepMoe:
+def _mx_shared(module) -> bool:
+    """An MXFP8 shared expert (NVFP4 checkpoint) with a BF16 latent down."""
+    se = module.shared_experts
+    return (
+        se is not None
+        and mxfp8_linear(se.gate_up_proj)
+        and mxfp8_linear(se.down_proj)
+        and module.routed_expert_down_proj.weight.dtype == torch.bfloat16
+    )
+
+
+# Opt-in F1 / F3 (NVFP4 DEP decode MoE front). Both reproduce the
+# stock numerics bit for bit (checked at 48-80 rows): F1 runs the router and the
+# latent down as one split-K GEMM over the packed [router | latent down] BF16 weight
+# with FP32 output (the router's own output dtype and split at these rows), then the
+# latent columns get the one BF16 rounding the stock BF16-output GEMM applies; F3
+# fuses the shared expert's SiTU-and-mul with the MXFP8 quantization of its output
+# (FP32 SiTU with tanhf, one BF16 rounding, FlashInfer's MXFP8 recipe and swizzled
+# 128x4 scale layout) and hands the codes to the down projection as a
+# QuantizedActivation. No approximate instructions.
+import triton
+import triton.language as tl
+from triton.language.extra.cuda import libdevice
+
+
+@triton.jit
+def _situ_mxfp8_kernel(gu_ptr, q_ptr, s_ptr, M, D: tl.constexpr, padded_sf_cols,
+                       inv_e4m3_max, beta: tl.constexpr, linear_beta: tl.constexpr,
+                       GROUPS: tl.constexpr):
+    row = tl.program_id(0)
+    gblk = tl.program_id(1)
+    sf_col = gblk * GROUPS + tl.arange(0, GROUPS)
+    sf_off = (sf_col % 4) + (sf_col // 4) * 512 + (row % 32) * 16 \
+        + ((row % 128) // 32) * 4 + (row // 128) * (128 * padded_sf_cols)
+    valid = row < M  # rows past M: the scale buffer's padding rows (zero scales)
+    cols = gblk * GROUPS * 32 + tl.arange(0, GROUPS * 32)
+    g = tl.load(gu_ptr + row * (2 * D) + cols, mask=valid & (cols < D),
+                other=0.0).to(tl.float32)
+    u = tl.load(gu_ptr + row * (2 * D) + D + cols, mask=valid & (cols < D),
+                other=0.0).to(tl.float32)
+    gate = (0.5 * beta) * libdevice.tanh(g * (1.0 / beta)) \
+        * (1.0 + libdevice.tanh(g * 0.5))
+    up = linear_beta * libdevice.tanh(u * (1.0 / linear_beta))
+    act = (gate * up).to(tl.bfloat16).to(tl.float32)
+    a2 = tl.reshape(act, [GROUPS, 32])
+    norm = tl.max(tl.abs(a2), axis=1) * inv_e4m3_max
+    bits = norm.to(tl.int32, bitcast=True)
+    exp_b = (bits >> 23) & 255
+    mant = bits & 0x7FFFFF
+    bump = tl.where(mant != 0, 1, 0)
+    bump = tl.where((exp_b == 0) & (mant <= 0x400000), 0, bump)
+    ue = tl.minimum(exp_b + bump, 254)
+    ue = tl.where(norm <= 0.0, 0, ue)
+    inv = tl.where(ue == 0, 0.0,
+                   (tl.maximum(254 - ue, 0) << 23).to(tl.float32, bitcast=True))
+    y = tl.maximum(tl.minimum(a2 * inv[:, None], 448.0), -448.0)
+    q = tl.reshape(y, [GROUPS * 32]).to(tl.float8e4nv)
+    tl.store(q_ptr + row * D + cols, q, mask=valid & (cols < D))
+    tl.store(s_ptr + sf_off, tl.where(valid, ue, 0).to(tl.uint8))
+
+
+def situ_mul_mxfp8(gate_up, beta, linear_beta, groups=8):
+    """gate_up [M, 2D] BF16 -> (E4M3 [M, D], uint8 swizzled 128x4 scales)."""
+    m, d = gate_up.shape[0], gate_up.shape[1] // 2
+    padded_m = (m + 127) // 128 * 128
+    sf_cols = d // 32
+    q = torch.empty(m, d, dtype=torch.float8_e4m3fn, device=gate_up.device)
+    s = torch.empty(padded_m * sf_cols, dtype=torch.uint8, device=gate_up.device)
+    _situ_mxfp8_kernel[(padded_m, d // (32 * groups))](
+        gate_up, q, s, m, d, sf_cols, 1.0 / 448.0, beta, linear_beta, groups,
+        num_warps=4,
+    )
+    return q, s
+
+
+@triton.jit
+def _split_front_kernel(src_ptr, logits_ptr, latent_ptr, E: tl.constexpr,
+                        L: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    v = tl.load(src_ptr + row * (E + L) + cols, mask=cols < E + L)
+    tl.store(logits_ptr + row * E + cols, v, mask=cols < E)
+    tl.store(latent_ptr + row * L + (cols - E), v.to(tl.bfloat16),
+             mask=(cols >= E) & (cols < E + L))
+
+
+def pack_router_latent(moe):
+    """One [router | latent down] BF16 weight [896 + 3584, 7168]; the stock
+    parameters become views of it (no extra memory)."""
+    packed = getattr(moe, "f1_front_weight", None)
+    if packed is not None:
+        return packed
+    gate, down = moe.gate.weight, moe.routed_expert_down_proj.weight
+    packed = torch.cat([gate.data, down.data])
+    gate.data = packed[: gate.shape[0]]
+    down.data = packed[gate.shape[0]:]
+    moe.f1_front_weight = packed
+    return packed
+
+
+_K31_PRE_STREAM = None
+_K31_SIDE_STREAM = None
+
+
+def _k31_pre_stream():
+    """Pre-dispatch (M1): one stream for the early dispatch of every DepMoeMx layer."""
+    global _K31_PRE_STREAM
+    if _K31_PRE_STREAM is None:
+        # High priority: its one CTA should take the first SM freed by the GEMMs it overlaps
+        # (with K31_DEPMOE_SIDE_PRIO the side stream outranks -1, so take the device's highest)
+        prio = -100 if os.environ.get("K31_DEPMOE_SIDE_PRIO") is not None else -1
+        _K31_PRE_STREAM = torch.cuda.Stream(priority=prio)
+    return _K31_PRE_STREAM
+
+
+class DepMoeMx:
+    """DepMoeMx (opt-in K31_NVFP4_DEPMOE=1): one MegaMoE layer of a DEP step whose shared
+    expert is MXFP8, on the EpMoeLayer stream schedule with the front split in two:
+
+      side  the shared expert from the layer start (its MXFP8 linears: dynamic MXFP8
+            activation quantization and the stock GEMM; the stock SiTU-and-mul, or
+            with K31_DEPMOE_F3=1 SiTU fused with the down projection's MXFP8 input
+            quantization)
+      main  router split-K (FP32 logits) + sigmoid top-16, latent down split-K (BF16)
+            (with K31_DEPMOE_F1=1 one split-K over [router | latent down] above 32
+            rows), the routed experts, the latent RMSNorm, then the up-projection
+            accumulated into the shared output (cuBLAS addmm: one rounding, as stock)
+
+    Precision is the stock module's (the split-K GEMMs as in EpMoeLayer); batches
+    above FRONT_MAX run the stock module."""
+
+    def __init__(self, module, batches, side_stream):
+        from vllm.logger import init_logger
+        from vllm.model_executor.layers.fusion.quant_activation import (
+            get_input_quant_key,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kMxfp8Dynamic,
+        )
+
+        from ..cutedsl.moe.ep.layer import FRONT_MAX, front_tactic
+
+        self.module = module
+        self.side = side_stream or torch.cuda.Stream()
+        # Opt-in: K31_DEPMOE_SIDE_PRIO=<p> runs the shared expert on its own stream at priority p
+        # (negative = higher), so the side work finishes before MegaMoE takes the SMs.
+        side_prio = os.environ.get("K31_DEPMOE_SIDE_PRIO")
+        if side_prio is not None:
+            global _K31_SIDE_STREAM
+            if _K31_SIDE_STREAM is None:
+                _K31_SIDE_STREAM = torch.cuda.Stream(priority=int(side_prio))
+            self.side = _K31_SIDE_STREAM
+        self.events = [torch.cuda.Event() for _ in range(4)]
+        # Opt-in scheduling knobs: K31_DEPMOE_HIPRI=1 runs the main front (router / latent
+        # down / top-k) on a high-priority stream so its GEMM gets SMs before the side
+        # stream's; K31_DEPMOE_SIDE_AFTER=1 starts the side stream after the main front's
+        # GEMM (event edge). Order of work and numerics are unchanged.
+        self.hipri = os.environ.get("K31_DEPMOE_HIPRI") == "1"
+        self.side_after = os.environ.get("K31_DEPMOE_SIDE_AFTER") == "1"
+        self.hi = torch.cuda.Stream(priority=-10) if self.hipri else None
+        fronts = [b for b in batches if b <= FRONT_MAX]
+        gate_w, down_w = module.gate.weight, module.routed_expert_down_proj.weight
+        f1 = (
+            os.environ.get("K31_DEPMOE_F1") == "1"
+            and gate_w.dtype == down_w.dtype == torch.bfloat16
+            and gate_w.shape[1] == down_w.shape[1]
+        )
+        self.f1_rows = {b for b in fronts if b > 32} if f1 else set()
+        if self.f1_rows:
+            packed = pack_router_latent(module)
+            self.front = PreparedProjection(
+                packed,
+                {b: front_tactic(b, split=2) for b in self.f1_rows},
+                output_dtype=torch.float32,
+            ).prepare()
+            gate_w, down_w = module.gate.weight, module.routed_expert_down_proj.weight
+        router = {b: front_tactic(b, split=4 if b <= 32 else 2) for b in fronts}
+        down = {
+            b: front_tactic(b, split=int(os.environ.get("K31_DEPMOE_DOWN_SPLIT", "2")))
+            for b in fronts
+        }
+        self.router = PreparedProjection(
+            gate_w, router, output_dtype=torch.float32
+        ).prepare()
+        self.down = PreparedProjection(down_w, down).prepare()
+        self.batches = set(fronts)
+        norm = module.routed_expert_norm
+        self.norm_weight, self.eps = norm.weight, norm.variance_epsilon
+        self.up = module.routed_expert_up_proj.weight
+        self.latent = down_w.shape[0]
+        self.experts_n = gate_w.shape[0]
+        se = module.shared_experts
+        act = se.act_fn
+        self.f3 = (
+            os.environ.get("K31_DEPMOE_F3") == "1"
+            and type(act).__name__ == "SituAndMul"
+            and getattr(act, "linear_beta", None) is not None
+            and not getattr(se, "shard_sequence_parallel", False)
+            and getattr(se, "gemm_rs_ar", None) is None
+            and get_input_quant_key(se.down_proj) == kMxfp8Dynamic
+            and se.down_proj.input_size_per_partition % 256 == 0
+        )
+        if self.f3:
+            self.beta, self.linear_beta = float(act.beta), float(act.linear_beta)
+            self.qkey = kMxfp8Dynamic
+        # Opt-in (F3 CUDA variant, K31_F3=1): CUDA SiTU + MXFP8 quantization,
+        # enabled only when its init probe is bitwise equal to the stock shared expert.
+        self.f3v = None
+        if os.environ.get("K31_F3") == "1":
+            from vllm.model_executor.layers.fused_moe import k31_situ_mxfp8
+
+            if k31_situ_mxfp8.shared_forward_supported(se):
+                self.f3v = k31_situ_mxfp8.shared_forward
+                self.f3 = False
+        # Pre-dispatch (M1): routing staging + MegaMoE dispatch head on a third
+        # stream right after the top-k (K31_M1=1 with the M1 DeepGEMM header)
+        enabled = getattr(module.experts, "k31_m1_enabled", None)
+        self.m1 = bool(enabled is not None and enabled())
+        if self.m1:
+            self.pre_stream = _k31_pre_stream()
+            self.pre_events = [torch.cuda.Event() for _ in range(2)]
+        if not getattr(DepMoeMx, "_logged", False):
+            DepMoeMx._logged = True
+            init_logger(__name__).info(
+                "K31 DepMoeMx front: F1 rows %s, F3 %s, F3v3 %s (stock act %s), hipri %s "
+                "(priority %s), side_after %s, m1 %s, side priority %s",
+                sorted(self.f1_rows), self.f3, self.f3v is not None,
+                getattr(getattr(act, "_forward_method", None), "__name__", "?"),
+                self.hipri, self.hi.priority if self.hi is not None else None,
+                self.side_after, (self.m1, self.pre_stream.priority if self.m1 else None),
+                self.side.priority,
+            )
+
+    def serves(self, batch):
+        return batch in self.batches
+
+    def _shared(self, x):
+        se = self.module.shared_experts
+        if self.f3v is not None:
+            return self.f3v(se, x)
+        if not self.f3:
+            return self.module.shared_experts(x)
+        from vllm.model_executor.layers.fusion.quant_activation import (
+            QuantizedActivation,
+        )
+
+        gate_up, _ = se.gate_up_proj(x)
+        q, s = situ_mul_mxfp8(gate_up, self.beta, self.linear_beta)
+        qa = QuantizedActivation(
+            data=q, scale=s, orig_dtype=gate_up.dtype,
+            orig_shape=torch.Size((gate_up.shape[0], q.shape[1])),
+            quant_key=self.qkey,
+        )
+        out, _ = se.down_proj(qa)
+        return out
+
+    def run(self, x):
+        from vllm import _custom_ops as ops
+        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+            fused_grouped_topk,
+        )
+
+        m, t = self.module, x.shape[0]
+        if t not in self.batches:
+            return m(x)
+        main, ev = torch.cuda.current_stream(), self.events
+        ev[0].record(main)
+        front = self.hi if self.hipri else main
+        if front is not main:
+            front.wait_event(ev[0])
+        if not self.side_after:
+            self._launch_side(x, main, ev)
+        e, lat = self.experts_n, self.latent
+        with torch.cuda.stream(front):
+            logits = torch.empty(t, e, device=x.device, dtype=torch.float32)
+            latent = torch.empty(t, lat, device=x.device, dtype=x.dtype)
+            if t in self.f1_rows:
+                both = torch.empty(t, e + lat, device=x.device, dtype=torch.float32)
+                self.front.run(x, both)
+                if self.side_after:
+                    ev[2].record(front)
+                    self._launch_side(x, main, ev, after=ev[2])
+                _split_front_kernel[(t, triton.cdiv(e + lat, 1024))](
+                    both, logits, latent, e, lat, 1024, num_warps=4
+                )
+            else:
+                self.router.run(x, logits)
+                if self.side_after:
+                    ev[2].record(front)
+                    self._launch_side(x, main, ev, after=ev[2])
+            topk_w, topk_ids = fused_grouped_topk(
+                x, logits, m.experts.top_k, m.moe_renormalize,
+                m.gate.e_score_correction_bias, 1, 1, "sigmoid", m.routed_scaling_factor,
+            )
+            if self.m1:
+                ev_t, ev_p = self.pre_events
+                ev_t.record(front)
+                with torch.cuda.stream(self.pre_stream):
+                    self.pre_stream.wait_event(ev_t)
+                    topk_w.record_stream(self.pre_stream)
+                    topk_ids.record_stream(self.pre_stream)
+                    m.experts.k31_predispatch(topk_w, topk_ids)
+                    ev_p.record(self.pre_stream)
+                m.experts._k31_pre_event = ev_p
+            if t not in self.f1_rows:
+                self.down.run(x, latent)
+        if front is not main:
+            ev[3].record(front)
+            main.wait_event(ev[3])
+            for z in (latent, topk_w, topk_ids):
+                z.record_stream(main)
+        routed = m.experts(latent, topk_w, topk_ids)
+        normed = torch.empty_like(routed)
+        ops.rms_norm(normed, routed, self.norm_weight, self.eps)
+        main.wait_event(ev[1])
+        return self._shared_out.addmm_(normed, self.up.t())
+
+    def _launch_side(self, x, main, ev, after=None):
+        with torch.cuda.stream(self.side):
+            self.side.wait_event(ev[0] if after is None else after)
+            shared = self._shared(x)
+            # Consumed (and returned) on the main stream after ev[1].
+            shared.record_stream(main)
+            ev[1].record(self.side)
+        self._shared_out = shared
+
+
+def DepMoe(module, batches, side_stream):  # noqa: N802 (the stock name is a class)
+    """The stock DepMoe, or DepMoeMx for an MXFP8 shared expert."""
+    if _mx_shared(module):
+        return DepMoeMx(module, batches, side_stream)
+    return DepMoeBf16(module, batches, side_stream)
+
+
+class DepMoeBf16:
     """One MegaMoE layer of a DEP step: the EpMoeLayer schedule over the stock
     module's weights (its batches up to FRONT_MAX; wider: the stock module)."""
 
@@ -318,4 +653,14 @@ def dep_moe_supported(module) -> bool:
         and module.num_expert_group == 1
         and module.topk_group == 1
         and module.moe_router_activation_func == "sigmoid"
+        # EpMoeLayer packs a BF16 [shared gate_up | latent down] front;
+        # an NVFP4 checkpoint (MXFP8 shared expert) runs DepMoeMx with
+        # K31_NVFP4_DEPMOE=1, else the stock MoE module.
+        and (
+            (
+                module.shared_experts.gate_up_proj.weight.dtype == torch.bfloat16
+                and module.routed_expert_down_proj.weight.dtype == torch.bfloat16
+            )
+            or (os.environ.get("K31_NVFP4_DEPMOE") == "1" and _mx_shared(module))
+        )
     )
