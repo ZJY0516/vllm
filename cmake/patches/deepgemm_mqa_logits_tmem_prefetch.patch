@@ -1,0 +1,67 @@
+Issue the TMEM accumulator loads of the next Q token before the current
+token's head reduction in DeepGEMM's SM100 MQA logits kernel
+(sm100_mqa_logits.cuh, contiguous-KV entry used by the sparse indexer for
+prefill). Applied by cmake/external_projects/deepgemm.cmake to the pinned
+DeepGEMM checkout.
+
+- Two register buffers hold one token's 32 head accumulators each; the next
+  token's two x16 TMEM loads are issued before the current token's reduction
+  and waited for after it, and TMEM is released once the last token's loads
+  have completed (as before, after its last load).
+- The per-token reduction is unchanged: the same head order, the same packed
+  BF16 (or FP32) multiply-adds into the same two partial sums, the same final
+  adds and rounding, so the logits are bitwise identical.
+- Only kNumHeads == 32 on the contiguous path takes the new loop; the paged
+  path (decode) and other head counts keep the original code.
+
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh b/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh
+index 6fe33c2..bc90653 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh
+@@ -1,3 +1,5 @@
++// Modified by NVIDIA: contiguous (non-paged) MQA logits load each token's TMEM accumulators before the previous
++// token's reduction (two register buffers); the reduction order and rounding are unchanged.
+ #pragma once
+ 
+ #include <cutlass/arch/reg_reconfig.h>
+@@ -535,6 +537,32 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
+                     smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
+                     ptx::tcgen05_after_thread_sync();
+ 
++                    if constexpr (kNumHeads == 32 and not kIsPaged) {
++                        float pf_acc[2][kNumHeads];
++                        const auto pf_load = [&](const uint32_t& t, float* dst) {
++                            ptx::tmem_load_32dp32b<16>(tmem_stage_idx * UMMA_N + t * kNumHeads, reinterpret_cast<uint32_t*>(dst));
++                            ptx::tmem_load_32dp32b<16>(tmem_stage_idx * UMMA_N + t * kNumHeads + 16, reinterpret_cast<uint32_t*>(dst + 16));
++                        };
++                        pf_load(0, pf_acc[0]);
++                        cutlass::arch::fence_view_async_tmem_load();
++                        #pragma unroll
++                        for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
++                            auto sum_0 = make_zero_sum();
++                            auto sum_1 = make_zero_sum();
++                            if (i + 1 < kNumValidTokens) {
++                                pf_load(i + 1, pf_acc[(i + 1) & 1]);
++                            } else {
++                                // Every load of this stage has completed: release TMEM to overlap MMA with reduction
++                                ptx::tcgen05_before_thread_sync();
++                                smem.empty_tmem_barriers[tmem_stage_idx].arrive();
++                            }
++                            reduce_pairs(pf_acc[i & 1], weights[i], smem.smem_weights[q_stage_idx] + i * kNumWeightElementsPerRow,
++                                         kNumHeads, sum_0, sum_1);
++                            store_token(i, kv_offset, sum_0, sum_1);
++                            if (i + 1 < kNumValidTokens)
++                                cutlass::arch::fence_view_async_tmem_load();
++                        }
++                    } else {
+                     #pragma unroll
+                     for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
+                         auto sum_0 = make_zero_sum();
+@@ -556,6 +584,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
+                         visit_tmem_head_chunks<kNumHeads>(tmem_stage_idx * UMMA_N + i * kNumHeads, accum, reduce_head_chunk);
+                         store_token(i, kv_offset, sum_0, sum_1);
+                     }
++                    }
+                 }
+             };
+ 

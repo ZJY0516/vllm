@@ -73,9 +73,13 @@ else()
   #   deepgemm_mega_moe_situ_fixed_cost.patch: lower fixed per-call cost of the
   #   FP8/FP4 SiTU Mega MoE kernel for decode-sized launches; outputs are
   #   bitwise identical.
+  #   deepgemm_mqa_logits_tmem_prefetch.patch: in the SM100 MQA logits kernel
+  #   (contiguous KV, 32 heads), load the next Q token's TMEM accumulators
+  #   before the current token's head reduction; logits are bitwise identical.
   find_package(Git REQUIRED)
   foreach(_dg_patch
-      "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm_mega_moe_situ_fixed_cost.patch")
+      "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm_mega_moe_situ_fixed_cost.patch"
+      "${CMAKE_SOURCE_DIR}/cmake/patches/deepgemm_mqa_logits_tmem_prefetch.patch")
     execute_process(
       COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_dg_patch}"
       WORKING_DIRECTORY "${deepgemm_SOURCE_DIR}"
