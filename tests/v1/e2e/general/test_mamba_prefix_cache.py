@@ -961,13 +961,14 @@ def test_mamba_mid_block_resume_exports_into_resumed_block(
     enforce_eager: bool,
 ):
     """A partial hit resuming mid-block whose prompt ends in the next block
-    prefills in one step, exporting the checkpoint into the resumed block.
+    prefills in one step, exporting the checkpoint into a detached block.
 
     With B = 576 and hits every 64 tokens: a 776-token prompt caches its state
     at 768 (block 1); a 1252-token prompt sharing it resumes at 768 and runs to
-    1252 at once, exporting its checkpoint (1216) into block 1. Block 1 must
-    then hold the state a fresh 1216-token prefill ends with, block 2 the one
-    a fresh 1252-token prefill ends with, and the next turn must hit at 1216.
+    1252 at once, exporting its checkpoint (1216) into a detached block without
+    aliasing block 1. That detached block must hold the state a fresh
+    1216-token prefill ends with, block 2 the one a fresh 1252-token prefill
+    ends with, and the next turn must hit at 1216.
     """
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     envs.disable_envs_cache()
