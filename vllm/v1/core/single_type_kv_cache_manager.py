@@ -2570,8 +2570,6 @@ class MambaManager(SingleTypeKVCacheManager):
         if pending is None:
             return
         _, _, block = pending
-        if block.block_hash is not None:
-            self.cached_blocks_this_step.discard(block.block_hash)
         self._last_checkpoint_block.pop(request_id, None)
         self._pending_boundary_state_offloads = [
             entry
@@ -2666,8 +2664,7 @@ class MambaManager(SingleTypeKVCacheManager):
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
         )
-        if ckpt_hash is None:
-            return
+        assert ckpt_hash is not None
         self.cached_blocks_this_step.add(ckpt_hash)
         self._record_tip(request.request_id, checkpoint_block)
         self._last_checkpoint_block[request.request_id] = (

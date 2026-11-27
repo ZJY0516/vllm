@@ -3108,7 +3108,8 @@ def test_two_token_resumed_prefill_crossing_block_boundary_never_caches_skipped_
 
 def test_rollback_pending_mamba_prefill_checkpoint_restores_pool_and_state():
     """Rolling back a same-step detached checkpoint (e.g. PRIORITY preemption)
-    evicts its hash, frees its block, and clears step-scoped tracking."""
+    evicts its hash, frees its block, clears its offload/cache tracking, and
+    preserves same-step protection for another request sharing that hash."""
     hash_block_size = 16
     mamba_block_size = 64
     manager = make_full_mamba_manager(
@@ -3116,26 +3117,50 @@ def test_rollback_pending_mamba_prefill_checkpoint_restores_pool_and_state():
         hash_block_size=hash_block_size,
         full_block_size=hash_block_size,
         mamba_block_size=mamba_block_size,
-        num_blocks=32,
+        num_blocks=64,
         num_prefill_checkpoint_blocks=1,
     )
     manager.coordinator.retention_interval = 0
-    mamba_manager = manager.coordinator.single_type_managers[1]
 
     free_before = manager.block_pool.get_num_free_blocks()
-    request = make_request("victim", list(range(50)), hash_block_size, sha256)
+    tokens = list(range(120))
+    request = make_request("victim", tokens[:50], hash_block_size, sha256)
     assert manager.allocate_slots(request, 50) is not None
     assert manager.estimate_cached_tokens(request) == 48
     ckpt_hash = request.block_hashes[48 // hash_block_size - 1]
     assert manager.block_pool.get_cached_block(ckpt_hash, [1]) is not None
-    assert mamba_manager.cached_blocks_this_step
 
     manager.rollback_pending_mamba_prefill_checkpoints(request.request_id)
     assert manager.block_pool.get_cached_block(ckpt_hash, [1]) is None
-    assert not mamba_manager.cached_blocks_this_step
     assert manager.estimate_cached_tokens(request) == 0
     assert manager.take_mamba_prefill_checkpoints() == ({}, [])
     assert manager.take_boundary_state_offloads() == {}
 
     manager.free(request)
     assert manager.block_pool.get_num_free_blocks() == free_before
+    manager.new_step_starts()
+
+    # Two running requests finishing chunk 2 [64, 120) in the same step cache
+    # the same checkpoint hash@112. Rolling back one must not drop same-step
+    # protection for the surviving peer's uncomputed checkpoint block.
+    peer = make_request("peer", tokens, hash_block_size, sha256)
+    victim2 = make_request("victim2", tokens, hash_block_size, sha256)
+    assert manager.allocate_slots(peer, 64) is not None
+    assert manager.allocate_slots(victim2, 64) is not None
+    peer.num_computed_tokens = 64
+    victim2.num_computed_tokens = 64
+    manager.new_step_starts()
+
+    assert manager.allocate_slots(peer, 56) is not None
+    assert manager.allocate_slots(victim2, 56) is not None
+    manager.rollback_pending_mamba_prefill_checkpoints(victim2.request_id)
+    manager.free(victim2)
+
+    late = make_request("late", tokens, hash_block_size, sha256)
+    computed_blocks, num_hit, _ = manager.get_computed_blocks(late)
+    assert num_hit == 112
+    # Must still be deferred because `peer`'s checkpoint block hasn't executed.
+    assert manager.allocate_slots(late, 8, num_hit, computed_blocks) is None
+    _, retained = manager.take_mamba_prefill_checkpoints()
+    manager.block_pool.free_blocks(retained)
+    manager.free(peer)

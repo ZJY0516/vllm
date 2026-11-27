@@ -3380,8 +3380,9 @@ class Scheduler(SchedulerInterface):
     def _free_cow_retained_blocks(
         self, blocks: list[KVCacheBlock], fence_seq: int
     ) -> None:
-        """Release CoW copy retentions, deferring their return to the block
-        pool while the step that runs the copy may still be in flight.
+        """Release step-retained blocks (CoW copies and detached prefill
+        checkpoints), deferring their return to the block pool while the step
+        that writes them may still be in flight.
         """
         if not self.defer_block_free or fence_seq <= self.processed_step_seq:
             self.kv_cache_manager.block_pool.free_blocks(blocks)
