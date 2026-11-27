@@ -229,6 +229,7 @@ if TYPE_CHECKING:
     VLLM_MLA_FUSED_Q_QUANT_PAD: bool = False
     VLLM_MLA_FUSED_OUTPUT_GATE: bool = False
     VLLM_MLA_FUSED_Q_ABSORB: bool = False
+    VLLM_LONG_PREFILL_FILL_BUDGET: bool = False
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1812,6 +1813,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Bitwise identical; off by default while it is measured.
     "VLLM_MLA_FUSED_Q_ABSORB": lambda: bool(
         int(os.getenv("VLLM_MLA_FUSED_Q_ABSORB", "0"))
+    ),
+    # Scheduler: when a step still has token budget after the WAITING pass, give
+    # it to RUNNING prefill chunks that the (adaptive) long-prefill threshold
+    # cut. Only chunk boundaries move; off by default while it is measured.
+    "VLLM_LONG_PREFILL_FILL_BUDGET": lambda: bool(
+        int(os.getenv("VLLM_LONG_PREFILL_FILL_BUDGET", "0"))
     ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3

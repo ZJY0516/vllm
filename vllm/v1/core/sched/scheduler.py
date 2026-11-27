@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -411,6 +412,13 @@ class Scheduler(SchedulerInterface):
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
         self.prefill_capacity_bound = False
+        # Opt-in (VLLM_LONG_PREFILL_FILL_BUDGET): after the WAITING pass, give the
+        # step's leftover token budget to RUNNING prefill chunks that the
+        # long-prefill threshold cut. Counters: schedule calls, chunks, tokens.
+        self.fill_long_prefill_budget = envs.VLLM_LONG_PREFILL_FILL_BUDGET
+        self._fill_stats = [0, 0, 0]
+        if self.fill_long_prefill_budget:
+            logger.info("Long-prefill leftover budget fill enabled")
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -1712,6 +1720,85 @@ class Scheduler(SchedulerInterface):
             if not defer_prefills:
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+
+        # Leftover budget fill (VLLM_LONG_PREFILL_FILL_BUDGET): the adaptive
+        # long-prefill threshold also counts waiting requests whose KV is still
+        # loading, so running chunks can stop at the threshold while the step
+        # has budget no ready request can take. Grow those chunks, in running
+        # order, through the same clips as above and one more allocate_slots
+        # call for the larger chunk (no preemption: on a block shortage the
+        # chunk keeps its first-pass size).
+        if self.fill_long_prefill_budget:
+            self._fill_stats[0] += 1
+            if (
+                token_budget > 0
+                and long_prefill_token_threshold > 0
+                and not preempted_reqs
+            ):
+                for request in scheduled_running_reqs:
+                    if token_budget <= 0 or input_budget <= draft_slots:
+                        break
+                    rid = request.request_id
+                    cur = num_scheduled_tokens.get(rid, 0)
+                    if (
+                        cur != long_prefill_token_threshold
+                        or request.spec_token_ids
+                        or request.has_encoder_inputs
+                        or rid in scheduled_spec_decode_tokens
+                    ):
+                        continue
+                    computed = request.num_computed_tokens
+                    remaining = (
+                        request.num_tokens_with_spec
+                        + request.num_output_placeholders
+                        - computed
+                    )
+                    want = min(
+                        remaining,
+                        cur + token_budget,
+                        cur + input_budget - draft_slots,
+                        self.max_model_len - computed - self.num_sampled_tokens_per_step,
+                    )
+                    if want <= cur:
+                        continue
+                    if self.need_mamba_block_aligned_split:
+                        want = self._mamba_block_aligned_split(request, want)
+                    want = self._reserve_prefill_lookahead(request, computed, want)
+                    if want <= cur:
+                        continue
+                    ctx_more = self._prefill_context_pages(
+                        computed, want
+                    ) - self._prefill_context_pages(computed, cur)
+                    if (
+                        ctx_more > 0
+                        and self.max_prefill_context_pages is not None
+                        and prefill_context_pages + ctx_more
+                        > self.max_prefill_context_pages
+                    ):
+                        continue
+                    more_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        want,
+                        num_lookahead_tokens=self.num_lookahead_tokens,
+                    )
+                    if more_blocks is None:
+                        continue
+                    extra = want - cur
+                    req_to_new_blocks[rid] = req_to_new_blocks[rid] + more_blocks
+                    num_scheduled_tokens[rid] = want
+                    token_budget -= extra
+                    input_budget -= extra
+                    prefill_context_pages += max(ctx_more, 0)
+                    drafts_needed = drafts_needed or not self._drafts_unused(
+                        request, computed, want
+                    )
+                    self._fill_stats[1] += 1
+                    self._fill_stats[2] += extra
+            if self._fill_stats[0] % 2000 == 0:
+                logger.debug(
+                    "Long-prefill fill: %d schedule calls, %d chunks grown, %d tokens",
+                    *self._fill_stats,
+                )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
