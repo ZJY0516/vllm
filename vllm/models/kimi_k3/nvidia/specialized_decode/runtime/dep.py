@@ -433,6 +433,24 @@ class DepMoeMx:
         self.side_after = os.environ.get("K31_DEPMOE_SIDE_AFTER") == "1"
         self.hi = torch.cuda.Stream(priority=-10) if self.hipri else None
         fronts = [b for b in batches if b <= FRONT_MAX]
+        # Opt-in: K31_DEPMOE_MAX=<rows> lets DepMoeMx also take the
+        # batches above FRONT_MAX up to <rows> (unset: FRONT_MAX, unchanged). Their router
+        # and latent down run per K31_DEPMOE_WIDE:
+        #   stock  (default) the stock module's own gate (FP32 logits) and
+        #          routed_expert_down_proj: the stock kernels on the same inputs, so the
+        #          layer output equals the stock module's at these rows;
+        #   splitk the split-K tactics of front_tactic (128-token tile, up to 128 rows;
+        #          with K31_DEPMOE_F1=1 the packed F1 front), the same math as stock;
+        #          rows above 128 (up to <rows>) take the stock kernels as in `stock`.
+        # The shared expert (side stream), MegaMoE, RMSNorm and up addmm are unchanged.
+        wide_max = int(os.environ.get("K31_DEPMOE_MAX", str(FRONT_MAX)))
+        self.wide_mode = os.environ.get("K31_DEPMOE_WIDE", "stock")
+        if self.wide_mode not in ("stock", "splitk"):
+            raise ValueError(f"K31_DEPMOE_WIDE={self.wide_mode}: expected stock or splitk")
+        wides = [b for b in batches if FRONT_MAX < b <= wide_max]
+        split_max = 128 if self.wide_mode == "splitk" else FRONT_MAX  # front_tactic's widest token tile
+        self.stock_rows = {b for b in wides if b > split_max}
+        fronts = fronts + [b for b in wides if b <= split_max]
         gate_w, down_w = module.gate.weight, module.routed_expert_down_proj.weight
         f1 = (
             os.environ.get("K31_DEPMOE_F1") == "1"
@@ -457,7 +475,7 @@ class DepMoeMx:
             gate_w, router, output_dtype=torch.float32
         ).prepare()
         self.down = PreparedProjection(down_w, down).prepare()
-        self.batches = set(fronts)
+        self.batches = set(fronts) | self.stock_rows
         norm = module.routed_expert_norm
         self.norm_weight, self.eps = norm.weight, norm.variance_epsilon
         self.up = module.routed_expert_up_proj.weight
@@ -496,8 +514,10 @@ class DepMoeMx:
         if not getattr(DepMoeMx, "_logged", False):
             DepMoeMx._logged = True
             init_logger(__name__).info(
-                "K31 DepMoeMx front: F1 rows %s, F3 %s, F3v3 %s (stock act %s), hipri %s "
-                "(priority %s), side_after %s, m1 %s, side priority %s",
+                "K31 DepMoeMx front: rows %s, wide %s (stock-op rows %s), F1 rows %s, F3 %s, "
+                "F3v3 %s (stock act %s), hipri %s (priority %s), side_after %s, m1 %s, "
+                "side priority %s",
+                sorted(self.batches), self.wide_mode, sorted(self.stock_rows),
                 sorted(self.f1_rows), self.f3, self.f3v is not None,
                 getattr(getattr(act, "_forward_method", None), "__name__", "?"),
                 self.hipri, self.hi.priority if self.hi is not None else None,
@@ -545,10 +565,17 @@ class DepMoeMx:
         if not self.side_after:
             self._launch_side(x, main, ev)
         e, lat = self.experts_n, self.latent
+        stock_op = t in self.stock_rows
         with torch.cuda.stream(front):
-            logits = torch.empty(t, e, device=x.device, dtype=torch.float32)
-            latent = torch.empty(t, lat, device=x.device, dtype=x.dtype)
-            if t in self.f1_rows:
+            if not stock_op:
+                logits = torch.empty(t, e, device=x.device, dtype=torch.float32)
+                latent = torch.empty(t, lat, device=x.device, dtype=x.dtype)
+            if stock_op:
+                logits, _ = m.gate(x)
+                if self.side_after:
+                    ev[2].record(front)
+                    self._launch_side(x, main, ev, after=ev[2])
+            elif t in self.f1_rows:
                 both = torch.empty(t, e + lat, device=x.device, dtype=torch.float32)
                 self.front.run(x, both)
                 if self.side_after:
@@ -576,7 +603,9 @@ class DepMoeMx:
                     m.experts.k31_predispatch(topk_w, topk_ids)
                     ev_p.record(self.pre_stream)
                 m.experts._k31_pre_event = ev_p
-            if t not in self.f1_rows:
+            if stock_op:
+                latent, _ = m.routed_expert_down_proj(x)
+            elif t not in self.f1_rows:
                 self.down.run(x, latent)
         if front is not main:
             ev[3].record(front)
