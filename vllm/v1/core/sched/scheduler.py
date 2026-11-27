@@ -612,10 +612,13 @@ class Scheduler(SchedulerInterface):
         )
 
         end = start + num_new_tokens
-        checkpoint_position = get_reusable_prefix_length(
-            prefill_end,
+        prompt_checkpoint = get_reusable_prefix_length(
+            request.num_prompt_tokens,
             num_hash_lookahead_tokens=self.num_hash_lookahead_tokens,
             alignment_tokens=ckpt_block_size,
+        )
+        checkpoint_position = (
+            prompt_checkpoint if prompt_checkpoint > start else last_cache_position
         )
         use_internal_checkpoint = (
             self.mamba_has_prefill_checkpoint_blocks
@@ -625,7 +628,6 @@ class Scheduler(SchedulerInterface):
                 query_end=end,
                 checkpoint_position=checkpoint_position,
                 hash_block_size=self.hash_block_size,
-                mamba_block_size=block_size,
                 checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
             )
         )
@@ -966,6 +968,9 @@ class Scheduler(SchedulerInterface):
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            self.kv_cache_manager.rollback_pending_mamba_prefill_checkpoints(
+                                preempted_req_id
+                            )
                             if preempted_encoder_inputs:
                                 del scheduled_encoder_inputs[preempted_req_id]
                                 # Restore encoder compute budget if the preempted
@@ -1768,13 +1773,20 @@ class Scheduler(SchedulerInterface):
         kv_cache_block_copies, cow_retained_blocks = (
             self.kv_cache_manager.take_kv_cache_block_copies()
         )
-        if kv_cache_block_copies:
-            # The copies run with this step's execution; the first non-empty
-            # step at or after it gets seq `sched_step_seq + 1` (0-token steps
-            # do not advance the seq), and its completion implies the copies
-            # have run.
-            self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
+        mamba_prefill_checkpoints, checkpoint_retained_blocks = (
+            self.kv_cache_manager.take_mamba_prefill_checkpoints()
+        )
+        step_retained_blocks = cow_retained_blocks + checkpoint_retained_blocks
+        if step_retained_blocks:
+            # The copies and checkpoints run with this step's execution; the
+            # first non-empty step at or after it gets seq `sched_step_seq + 1`
+            # (0-token steps do not advance the seq), and its completion implies
+            # they have run.
+            self._free_cow_retained_blocks(
+                step_retained_blocks, self.sched_step_seq + 1
+            )
         pending_kv_cache_block_copies = kv_cache_block_copies or None
+        pending_mamba_prefill_checkpoints = mamba_prefill_checkpoints or None
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
@@ -1806,6 +1818,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            mamba_prefill_checkpoints=pending_mamba_prefill_checkpoints,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             skip_drafts=not drafts_needed,
@@ -3367,8 +3380,9 @@ class Scheduler(SchedulerInterface):
     def _free_cow_retained_blocks(
         self, blocks: list[KVCacheBlock], fence_seq: int
     ) -> None:
-        """Release CoW copy retentions, deferring their return to the block
-        pool while the step that runs the copy may still be in flight.
+        """Release step-retained blocks (CoW copies and detached prefill
+        checkpoints), deferring their return to the block pool while the step
+        that writes them may still be in flight.
         """
         if not self.defer_block_free or fence_seq <= self.processed_step_seq:
             self.kv_cache_manager.block_pool.free_blocks(blocks)
@@ -3727,6 +3741,7 @@ class Scheduler(SchedulerInterface):
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
             prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
+            num_prompt_tokens=request.num_prompt_tokens,
         )
 
     def _set_kv_fetch_stage(self, request: Request, stage: str | None) -> None:

@@ -470,8 +470,13 @@ def test_cudagraph_capture_batch_stays_decode_only():
 
 
 def _create_checkpoint_builder_and_batch(
-    num_spec: int, prefix_match_unit: int | None = 16
+    num_spec: int,
+    prefix_match_unit: int | None = 16,
+    checkpoint_offset: int = 96,
+    checkpoint_block_id: int = 41,
 ) -> tuple[GDNAttentionMetadataBuilder, CommonAttentionMetadata, dict]:
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
     vllm_config = create_vllm_config(
         model_name="Qwen/Qwen3.5-0.8B",
         block_size=BLOCK_SIZE,
@@ -504,7 +509,13 @@ def _create_checkpoint_builder_and_batch(
     table = common.block_table_tensor + 1
     if num_spec:
         table = torch.cat([table, torch.zeros(3, num_spec, dtype=table.dtype)], dim=1)
-    common = common.replace(block_table_tensor=table)
+    common = common.replace(
+        block_table_tensor=table,
+        mamba_prefill_checkpoints=(
+            [0, checkpoint_offset, 0],
+            [NULL_BLOCK_ID, checkpoint_block_id, NULL_BLOCK_ID],
+        ),
+    )
     kwargs = {}
     if num_spec:
         kwargs = dict(
@@ -521,16 +532,16 @@ def _create_checkpoint_builder_and_batch(
 def test_checkpoint_metadata_preserves_non_spec_order(
     num_spec, prefix_match_unit, expected_offset
 ):
-    """Only eligible non-spec rows get a checkpoint in their reserved page."""
+    """Only eligible non-spec rows get a checkpoint in their detached page."""
     from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
     builder, common, kwargs = _create_checkpoint_builder_and_batch(
-        num_spec, prefix_match_unit
+        num_spec, prefix_match_unit, checkpoint_offset=expected_offset
     )
     actual = builder.build(0, common, **kwargs)
     assert actual.checkpoint is not None
     offsets = [expected_offset, 0] if num_spec else [0, expected_offset, 0]
-    slots = [common.block_table_tensor[1, 0].item(), NULL_BLOCK_ID]
+    slots = [41, NULL_BLOCK_ID]
     if not num_spec:
         slots.insert(0, NULL_BLOCK_ID)
     torch.testing.assert_close(
@@ -640,37 +651,24 @@ def test_replayssm_decode_plan_inputs(enable_prefix_caching: bool):
 
 
 @pytest.mark.parametrize("num_spec", [0, 3])
-def test_update_block_table_regathers_checkpoint(num_spec):
-    """Checkpoint pages come from the target group's block table, not the
-    source group's (otherwise the target group's checkpoint page is never
-    written while the prefix cache treats it as valid)."""
-    src, common, kwargs = _create_checkpoint_builder_and_batch(num_spec)
-    dst, _, _ = _create_checkpoint_builder_and_batch(num_spec)
-    ref, _, _ = _create_checkpoint_builder_and_batch(num_spec)
-    other_table = common.block_table_tensor + 100
-    other = common.replace(block_table_tensor=other_table)
-    dst.mamba_aligned_state_indices = mamba_get_block_table_tensor(
-        other_table,
-        other.seq_lens,
-        dst.kv_cache_spec,
-        True,
-        dst.num_speculative_blocks,
+def test_distinct_mamba_groups_use_own_checkpoint_block_ids(num_spec):
+    """Each Mamba group consumes its own scheduler-assigned checkpoint block."""
+    src, common_a, kwargs = _create_checkpoint_builder_and_batch(
+        num_spec, checkpoint_block_id=41
+    )
+    dst, common_b, _ = _create_checkpoint_builder_and_batch(
+        num_spec, checkpoint_block_id=141
     )
 
-    source = src.build(0, common, **kwargs)
-    expected = ref.build(0, other, **kwargs)
-    actual = dst.update_block_table(source, other_table, other.slot_mapping)
+    meta_a = src.build(0, common_a, **kwargs)
+    meta_b = dst.build(0, common_b, **kwargs)
 
-    assert source.checkpoint is not None and expected.checkpoint is not None
-    assert actual.checkpoint is not None
+    assert meta_a.checkpoint is not None and meta_b.checkpoint is not None
     torch.testing.assert_close(
-        actual.checkpoint.state_indices, expected.checkpoint.state_indices
-    )
-    torch.testing.assert_close(
-        actual.checkpoint.checkpoint_offsets, expected.checkpoint.checkpoint_offsets
+        meta_a.checkpoint.checkpoint_offsets, meta_b.checkpoint.checkpoint_offsets
     )
     assert not torch.equal(
-        actual.checkpoint.state_indices, source.checkpoint.state_indices
+        meta_a.checkpoint.state_indices, meta_b.checkpoint.state_indices
     )
 
 
@@ -681,6 +679,8 @@ def test_build_packs_flashinfer_checkpoint_plan(num_spec):
     Rows: a decode (spec when `num_spec`), two prefills checkpointing at
     192 and 256 tokens (interval 64: 7 states, 2 used), a short prefill.
     """
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
     vllm_config = create_vllm_config(model_name="Qwen/Qwen3.5-0.8B", block_size=64)
     if num_spec:
         vllm_config.speculative_config = SpeculativeConfig(
@@ -714,7 +714,13 @@ def test_build_packs_flashinfer_checkpoint_plan(num_spec):
             ),
             num_accepted_tokens=torch.ones(4, dtype=torch.int32),
         )
-    common = common.replace(block_table_tensor=table)
+    common = common.replace(
+        block_table_tensor=table,
+        mamba_prefill_checkpoints=(
+            [0, 192, 256, 0],
+            [NULL_BLOCK_ID, 41, 42, NULL_BLOCK_ID],
+        ),
+    )
 
     plan = builder.build(0, common, **kwargs).flashinfer_checkpoint_plan
 

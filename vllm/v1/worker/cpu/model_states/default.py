@@ -161,5 +161,6 @@ class DefaultModelState(ModelState):
             req_idx=input_batch.idx_mapping_np,
             fast_prefill=input_batch.fast_prefill,
             model_specific_attn_metadata=model_specific_attn_metadata,
+            mamba_prefill_checkpoints=input_batch.mamba_prefill_checkpoints,
         )
         return attn_metadata

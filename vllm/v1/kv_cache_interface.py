@@ -606,7 +606,6 @@ def is_mamba_prefill_checkpoint_valid(
     query_end: int,
     checkpoint_position: int,
     hash_block_size: int,
-    mamba_block_size: int,
     checkpoint_alignment: int | None,
 ) -> bool:
     """Whether a backend can export the checkpoint in this query."""
@@ -614,13 +613,10 @@ def is_mamba_prefill_checkpoint_valid(
         return False
     assert checkpoint_alignment > 0
 
-    checkpoint_col = cdiv(query_end, mamba_block_size) - 2
     return (
         query_start % hash_block_size == 0
-        # A mid-block query may export into its first column (private copy).
-        and checkpoint_col >= query_start // mamba_block_size
         and query_start + hash_block_size <= checkpoint_position
-        and query_start < checkpoint_position < query_end
+        and checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0
     )
 

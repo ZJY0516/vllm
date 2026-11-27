@@ -473,11 +473,8 @@ def get_mamba_prefix_cache_step_configs(
 def get_internal_checkpoint_step_configs(
     async_scheduling: bool,
 ) -> dict[str, TestConfig]:
-    """The GDN prefill exports its checkpoint, so the final chunk runs whole.
-
-    The checkpoint goes in the second-to-last block the chunk reaches, keyed to
-    the boundary: column 1 holds the state at 2B for a 2B + 10 prompt.
-    """
+    """The GDN prefill exports its checkpoint into a detached block, so the
+    final chunk runs whole and `req_to_blocks` keeps skipped columns null."""
     B = BLOCK_SIZE
     return {
         "prompt_2_block_size": TestConfig(
@@ -485,11 +482,11 @@ def get_internal_checkpoint_step_configs(
             num_generated_tokens=10,
             num_accepted_tokens=4,
             step_actions=[
-                StepAction(0, B * 2, [1, 1, 1, 1, 1], (-1, -1), (-1, -1)),
+                StepAction(0, B * 2, [0, 1, 1, 1, 1], (-1, -1), (-1, -1)),
                 StepAction(
                     B * 2,
                     4,
-                    [1, 1, 1, 1, 1, 1] if async_scheduling else [0, 1, 1, 1, 1, 1],
+                    [0, 1, 1, 1, 1, 1],
                     (1, 2),
                     (-1, -1),
                 ),
@@ -500,11 +497,11 @@ def get_internal_checkpoint_step_configs(
             num_generated_tokens=10,
             num_accepted_tokens=4,
             step_actions=[
-                StepAction(0, B * 2 + 10, [0, 1, 1, 1, 1, 1], (-1, -1), (-1, -1)),
+                StepAction(0, B * 2 + 10, [0, 0, 1, 1, 1, 1], (-1, -1), (-1, -1)),
                 StepAction(
                     B * 2 + 10,
                     4,
-                    [0, 1, 1, 1, 1, 1] if async_scheduling else [0, 0, 1, 1, 1, 1],
+                    [0, 0, 1, 1, 1, 1],
                     (-1, -1),
                     (-1, -1),
                 ),
@@ -519,14 +516,14 @@ def get_internal_checkpoint_step_configs(
                 StepAction(
                     B * 5,
                     B * 5,
-                    [0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1],
+                    [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1],
                     (4, 9),
                     (-1, -1),
                 ),
                 StepAction(
                     B * 10,
                     4,
-                    [0, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1]
+                    [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1]
                     if async_scheduling
                     else [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
                     (9, 10),
@@ -543,7 +540,7 @@ def get_internal_checkpoint_step_configs(
                 StepAction(
                     B * 5,
                     B * 5 + 10,
-                    [0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1],
+                    [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1],
                     (4, 10),
                     (-1, -1),
                 ),
@@ -700,7 +697,11 @@ def _run_mamba_prefix_cache_mrv2(
                 start_pos = input_batch.positions[input_batch.query_start_loc[0]].item()
             assert cur_step_action.num_computed_tokens_start == start_pos
         if scheduler_output.scheduled_new_reqs and "snapshot_col" in captured:
-            captured["snapshot"] = block_states(self, captured.pop("snapshot_col"))
+            col = captured.pop("snapshot_col")
+            if col is None:
+                captured["snapshot"] = checkpoint_block_states(self, scheduler_output)
+            else:
+                captured["snapshot"] = block_states(self, col)
         return ret
 
     def block_states(runner: MRV2GPUModelRunner, col: int) -> list[list[torch.Tensor]]:
@@ -710,6 +711,25 @@ def _run_mamba_prefix_cache_mrv2(
         return [
             [
                 temporal_block(state, captured["block_tables"][group_id], col).clone()
+                for state in forward_context[layer_name].kv_cache
+            ]
+            for group_ids in get_mamba_groups(kv_cache_config).values()
+            for group_id in group_ids
+            for layer_name in kv_cache_config.kv_cache_groups[group_id].layer_names
+        ]
+
+    def checkpoint_block_states(
+        runner: MRV2GPUModelRunner, scheduler_output: SchedulerOutput
+    ) -> list[list[torch.Tensor]]:
+        # Each Mamba layer's (conv, temporal) states in the detached checkpoint block.
+        kv_cache_config = captured["kv_cache_config"]
+        forward_context = runner.vllm_config.compilation_config.static_forward_context
+        checkpoints = scheduler_output.mamba_prefill_checkpoints
+        assert checkpoints is not None
+        req_id = scheduler_output.scheduled_new_reqs[0].req_id
+        return [
+            [
+                state[checkpoints[group_id][req_id][1]].clone()
                 for state in forward_context[layer_name].kv_cache
             ]
             for group_ids in get_mamba_groups(kv_cache_config).values()
@@ -844,13 +864,13 @@ def _run_mamba_prefix_cache_mrv2(
         assert engine.llm_engine.engine_core.engine_core.scheduler.reset_prefix_cache()
 
         if internal_checkpoints:
-            # The checkpoint a 2B + 10 prefill exports at 2B (column 1) is the
-            # final state of a prefill that stops at 2B (column 1). Distinct
+            # The checkpoint a 2B + 10 prefill exports at 2B (detached block) is
+            # the final state of a prefill that stops at 2B (column 1). Distinct
             # tokens make a shifted conv window visible.
             tokens = [(i * 7919) % 30000 + 1 for i in range(BLOCK_SIZE * 2 + 10)]
             scheduler = engine.llm_engine.engine_core.engine_core.scheduler
             states = []
-            for num_tokens, col in ((BLOCK_SIZE * 2, 1), (len(tokens), 1)):
+            for num_tokens, col in ((BLOCK_SIZE * 2, 1), (len(tokens), None)):
                 captured["snapshot_col"] = col
                 _ = engine.generate(
                     [TokensPrompt(prompt_token_ids=tokens[:num_tokens])],
@@ -941,13 +961,14 @@ def test_mamba_mid_block_resume_exports_into_resumed_block(
     enforce_eager: bool,
 ):
     """A partial hit resuming mid-block whose prompt ends in the next block
-    prefills in one step, exporting the checkpoint into the resumed block.
+    prefills in one step, exporting the checkpoint into a detached block.
 
     With B = 576 and hits every 64 tokens: a 776-token prompt caches its state
     at 768 (block 1); a 1252-token prompt sharing it resumes at 768 and runs to
-    1252 at once, exporting its checkpoint (1216) into block 1. Block 1 must
-    then hold the state a fresh 1216-token prefill ends with, block 2 the one
-    a fresh 1252-token prefill ends with, and the next turn must hit at 1216.
+    1252 at once, exporting its checkpoint (1216) into a detached block without
+    aliasing block 1. That detached block must hold the state a fresh
+    1216-token prefill ends with, block 2 the one a fresh 1252-token prefill
+    ends with, and the next turn must hit at 1216.
     """
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     envs.disable_envs_cache()
@@ -973,16 +994,28 @@ def test_mamba_mid_block_resume_exports_into_resumed_block(
             self, input_batch, block_tables, *args, **kwargs
         )
 
-    def block_states(runner: MRV2GPUModelRunner, col: int) -> list[torch.Tensor]:
-        # Every Mamba layer's (conv, temporal) states in block column col;
-        # reading block ids back is a deliberate D2H.
+    def block_states(
+        runner: MRV2GPUModelRunner,
+        col: int | None,
+        scheduler_output: SchedulerOutput,
+    ) -> list[torch.Tensor]:
+        # Every Mamba layer's (conv, temporal) states in block column col, or
+        # in the detached checkpoint block when col is None.
         kv_cache_config = captured["kv_cache_config"]
         forward_context = runner.vllm_config.compilation_config.static_forward_context
         states: list[torch.Tensor] = []
         with gpu_sync_allowed():
             for group_ids in get_mamba_groups(kv_cache_config).values():
                 for group_id in group_ids:
-                    block_id = int(captured["block_tables"][group_id][0, col].item())
+                    if col is None:
+                        ckpts = scheduler_output.mamba_prefill_checkpoints
+                        assert ckpts is not None
+                        req_id = next(iter(scheduler_output.num_scheduled_tokens))
+                        block_id = ckpts[group_id][req_id][1]
+                    else:
+                        block_id = int(
+                            captured["block_tables"][group_id][0, col].item()
+                        )
                     for name in kv_cache_config.kv_cache_groups[group_id].layer_names:
                         states.extend(
                             s[block_id].clone() for s in forward_context[name].kv_cache
@@ -1005,7 +1038,8 @@ def test_mamba_mid_block_resume_exports_into_resumed_block(
         end = start + num_scheduled
         if end == captured.get("snapshot_end"):
             captured["snapshot"] = {
-                col: block_states(self, col) for col in captured["snapshot_cols"]
+                col: block_states(self, col, scheduler_output)
+                for col in captured["snapshot_cols"]
             }
         return ret
 
@@ -1047,11 +1081,11 @@ def test_mamba_mid_block_resume_exports_into_resumed_block(
 
     try:
         prefill(produced)
-        assert prefill(prompt, snapshot_cols=(1, 2)) == [
+        assert prefill(prompt, snapshot_cols=(None, 2)) == [
             (resumed_at, prompt - resumed_at)
         ]
         resumed = captured.pop("snapshot")
-        # The next turn resumes at the checkpoint in block 1.
+        # The next turn resumes at the detached checkpoint.
         assert prefill(prompt + 64)[0][0] == checkpoint
 
         references = {}
@@ -1063,7 +1097,7 @@ def test_mamba_mid_block_resume_exports_into_resumed_block(
         state_len = (
             engine.llm_engine.model_config.hf_text_config.linear_conv_kernel_dim - 1
         )
-        for col, num_tokens in ((1, checkpoint), (2, prompt)):
+        for col, num_tokens in ((None, checkpoint), (2, prompt)):
             for i, (new, ref) in enumerate(zip(resumed[col], references[num_tokens])):
                 if i % 2 == 0:  # conv state: compare the window only
                     if not is_conv_state_dim_first():

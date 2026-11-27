@@ -155,7 +155,7 @@ class Mamba2AttentionMetadataBuilder(
         )
         self.chunk_size: int = chunk_size
         self.checkpoint_builder = MambaPrefillCheckpointBuilder(
-            vllm_config, kv_cache_spec, self.checkpoint_alignment
+            vllm_config, self.checkpoint_alignment
         )
 
     def build(
@@ -233,12 +233,5 @@ class Mamba2AttentionMetadataBuilder(
         blk_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> Mamba2AttentionMetadata:
-        new_metadata = super().update_block_table(metadata, blk_table, slot_mapping)
-        if metadata.checkpoint_meta is None:
-            return new_metadata
-        # Checkpoint destinations are block-table entries, so each group
-        # re-gathers its own rather than writing into the source group's.
-        return replace(
-            new_metadata,
-            checkpoint_meta=metadata.checkpoint_meta.regather_state_indices(blk_table),
-        )
+        assert metadata.checkpoint_meta is None
+        return super().update_block_table(metadata, blk_table, slot_mapping)

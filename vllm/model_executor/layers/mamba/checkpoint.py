@@ -1,111 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.kv_cache_interface import (
-    MambaSpec,
-    get_reusable_prefix_length,
-    is_mamba_prefill_checkpoint_valid,
-)
 
 
-def compute_mamba_prefill_checkpoints(
-    seq_lens: list[int],
-    query_lens: list[int],
-    hash_block_size: int,
-    mamba_block_size: int,
-    checkpoint_alignment: int | None,
-    cache_hit_alignment_tokens: int,
-    num_hash_lookahead_tokens: int,
-) -> tuple[list[int], list[int]]:
-    """Per-row internal prefill checkpoint offsets and cache block columns.
-
-    Backends call this instead of re-deriving the rules, so they decline in
-    lockstep with the scheduler and `MambaManager`: allocating a checkpoint
-    block without writing it leaves the prefix cache serving uninitialized
-    state.
-
-    Returns:
-        `(offsets, cols)`: the checkpoint's offset into each row's query and
-        its block-table column. `0` and `-1` mean the row has none.
-
-    """
-    offsets: list[int] = []
-    cols: list[int] = []
-    for seq_len, query_len in zip(seq_lens, query_lens):
-        query_start = seq_len - query_len
-        position = get_reusable_prefix_length(
-            seq_len,
-            num_hash_lookahead_tokens=num_hash_lookahead_tokens,
-            alignment_tokens=cache_hit_alignment_tokens,
-        )
-        valid = is_mamba_prefill_checkpoint_valid(
-            query_start=query_start,
-            query_end=seq_len,
-            checkpoint_position=position,
-            hash_block_size=hash_block_size,
-            mamba_block_size=mamba_block_size,
-            checkpoint_alignment=checkpoint_alignment,
-        )
-        offsets.append(position - query_start if valid else 0)
-        cols.append(cdiv(seq_len, mamba_block_size) - 2 if valid else -1)
-    return offsets, cols
-
-
-def _gather_checkpoint_state_indices(
-    block_table: torch.Tensor, request_rows: torch.Tensor, block_cols: torch.Tensor
-) -> torch.Tensor:
-    return torch.where(
-        block_cols >= 0, block_table[request_rows, block_cols], NULL_BLOCK_ID
-    )
+def align_mamba_prefill_checkpoints(
+    checkpoints: Mapping[int, Mapping[str, tuple[int, int]]] | None,
+    req_ids: Sequence[str],
+) -> dict[int, tuple[list[int], list[int]]] | None:
+    """Align scheduler-supplied prefill checkpoints with batch row order."""
+    if not checkpoints:
+        return None
+    aligned: dict[int, tuple[list[int], list[int]]] = {}
+    for group_id, group_ckpts in checkpoints.items():
+        offsets: list[int] = []
+        block_ids: list[int] = []
+        for req_id in req_ids:
+            if (ckpt := group_ckpts.get(req_id)) is not None:
+                offsets.append(ckpt[0])
+                block_ids.append(ckpt[1])
+            else:
+                offsets.append(0)
+                block_ids.append(NULL_BLOCK_ID)
+        aligned[group_id] = (offsets, block_ids)
+    return aligned
 
 
 @dataclass
 class MambaPrefillCheckpointMetadata:
     checkpoint_offsets: torch.Tensor
     state_indices: torch.Tensor
-    # Host copies of ``checkpoint_offsets`` and of each row's query length, for
+    # Host copies of `checkpoint_offsets` and of each row's query length, for
     # backends that lay out the checkpoint before any tensor exists (Mamba2's
     # SSD chunk split, FlashInfer GDN's checkpoint plan).
     offsets: list[int] | None = None
     query_lens: list[int] | None = None
-    # Gather indices into the block table, kept so that another KV cache group
-    # with the same spec can re-derive its own ``state_indices``.
-    request_rows: torch.Tensor | None = None
-    block_cols: torch.Tensor | None = None
-
-    def regather_state_indices(
-        self, block_table: torch.Tensor
-    ) -> "MambaPrefillCheckpointMetadata":
-        assert self.request_rows is not None and self.block_cols is not None
-        return replace(
-            self,
-            state_indices=_gather_checkpoint_state_indices(
-                block_table, self.request_rows, self.block_cols
-            ),
-        )
 
 
 class MambaPrefillCheckpointBuilder:
-    """Build backend-neutral prefill checkpoint locations."""
+    """Build backend-neutral prefill checkpoint locations from scheduler plan."""
 
     def __init__(
         self,
         vllm_config: VllmConfig,
-        kv_cache_spec: MambaSpec,
         checkpoint_alignment: int | None,
     ) -> None:
         self.vllm_config = vllm_config
-        self.kv_cache_spec = kv_cache_spec
         self.checkpoint_alignment = checkpoint_alignment
 
     def build(
@@ -113,52 +62,30 @@ class MambaPrefillCheckpointBuilder:
         m: CommonAttentionMetadata,
         request_rows: list[int],
     ) -> MambaPrefillCheckpointMetadata | None:
-        if not self.vllm_config.cache_config.enable_prefix_caching:
+        if (
+            not self.vllm_config.cache_config.enable_prefix_caching
+            or self.checkpoint_alignment is None
+            or m.mamba_prefill_checkpoints is None
+        ):
             return None
-        if self.checkpoint_alignment is None:
-            return None
-        cache_config = self.vllm_config.cache_config
-        hash_block_size = cache_config.hash_block_size
-        cache_hit_alignment_tokens = cache_config.cache_hit_alignment_tokens
-        if hash_block_size is None or cache_hit_alignment_tokens is None:
-            # Unresolved only for the minimal KV cache built for profiling.
-            return None
-        assert m.seq_lens_cpu_upper_bound is not None
-        all_query_lens = m.query_start_loc_cpu.diff().tolist()
-        query_lens = [all_query_lens[row] for row in request_rows]
-        seq_lens = m.seq_lens_cpu_upper_bound.tolist()
-        block_size = self.kv_cache_spec.block_size
-        checkpoint_offsets, checkpoint_cols = compute_mamba_prefill_checkpoints(
-            [seq_lens[row] for row in request_rows],
-            query_lens,
-            hash_block_size=hash_block_size,
-            mamba_block_size=block_size,
-            checkpoint_alignment=self.checkpoint_alignment,
-            cache_hit_alignment_tokens=cache_hit_alignment_tokens,
-            num_hash_lookahead_tokens=self.vllm_config.num_hash_lookahead_tokens,
-        )
+        all_offsets, all_block_ids = m.mamba_prefill_checkpoints
+        checkpoint_offsets = [
+            all_offsets[row] if row < len(all_offsets) else 0 for row in request_rows
+        ]
         if not any(checkpoint_offsets):
             return None
-        checkpoint_offsets_tensor = async_tensor_h2d(
-            checkpoint_offsets,
-            dtype=torch.int32,
-            device=m.query_start_loc.device,
-        )
-        request_rows_tensor = async_tensor_h2d(
-            request_rows, dtype=torch.int64, device=m.query_start_loc.device
-        )
-        checkpoint_cols_tensor = async_tensor_h2d(
-            checkpoint_cols, dtype=torch.int64, device=m.query_start_loc.device
-        )
+        state_indices = [
+            all_block_ids[row] if offset > 0 else NULL_BLOCK_ID
+            for row, offset in zip(request_rows, checkpoint_offsets)
+        ]
+        all_query_lens = m.query_start_loc_cpu.diff().tolist()
+        query_lens = [all_query_lens[row] for row in request_rows]
+        device = m.query_start_loc.device
         return MambaPrefillCheckpointMetadata(
-            checkpoint_offsets_tensor,
-            _gather_checkpoint_state_indices(
-                m.block_table_tensor, request_rows_tensor, checkpoint_cols_tensor
-            ),
+            async_tensor_h2d(checkpoint_offsets, dtype=torch.int32, device=device),
+            async_tensor_h2d(state_indices, dtype=torch.int32, device=device),
             offsets=checkpoint_offsets,
             query_lens=query_lens,
-            request_rows=request_rows_tensor,
-            block_cols=checkpoint_cols_tensor,
         )
 
 

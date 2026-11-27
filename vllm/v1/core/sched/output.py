@@ -321,6 +321,11 @@ class SchedulerOutput:
     # CoW copies to apply after zeroing new blocks and before forward.
     kv_cache_block_copies: list[KVCacheBlockCopy] | None = None
 
+    # Explicit per-Mamba-group prefill checkpoint exports:
+    # group_id -> {req_id: (query_offset, block_id)}.
+    # None when no request exports a prefill checkpoint in this step.
+    mamba_prefill_checkpoints: dict[int, dict[str, tuple[int, int]]] | None = None
+
     # Scheduler-local; always None by the time this reaches a worker.
     kv_connector_block_state: KVConnectorBlockState | None = None
 

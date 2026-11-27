@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -265,6 +265,7 @@ def build_attn_metadata(
     rswa_prefix_lens: torch.Tensor | None = None,
     fast_prefill: FastPrefillBatchMetadata | None = None,
     req_idx: np.ndarray | None = None,
+    mamba_prefill_checkpoints: Mapping[int, tuple[list[int], list[int]]] | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if seq_lens_cpu_upper_bound is not None:
@@ -297,6 +298,11 @@ def build_attn_metadata(
                 num_logits_indices=fast_prefill.num_logits_indices,
                 max_logits_per_req=fast_prefill.max_logits_per_req,
             )
+        group_checkpoints = (
+            mamba_prefill_checkpoints.get(i)
+            if mamba_prefill_checkpoints is not None
+            else None
+        )
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc,
@@ -314,6 +320,7 @@ def build_attn_metadata(
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
             req_idx=req_idx,
+            mamba_prefill_checkpoints=group_checkpoints,
             _token_to_req_indices_cache=token_to_req_indices,
             **common_attn_metadata_extra_kwargs,
         )
@@ -321,8 +328,10 @@ def build_attn_metadata(
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder()
             reuse_key = None
-            if attn_metadata_builder.supports_update_block_table and isinstance(
-                attn_group.kv_cache_spec, MambaSpec
+            if (
+                attn_metadata_builder.supports_update_block_table
+                and isinstance(attn_group.kv_cache_spec, MambaSpec)
+                and group_checkpoints is None
             ):
                 reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
             if reuse_key in cached_metadata:

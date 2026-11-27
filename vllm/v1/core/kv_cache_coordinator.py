@@ -154,6 +154,7 @@ class KVCacheCoordinator(ABC):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        num_prompt_tokens: int | None = None,
     ) -> int:
         """Get the number of device blocks needed to be allocated for the request.
 
@@ -176,18 +177,15 @@ class KVCacheCoordinator(ABC):
                 the full-sequence admission gate; per-step allocation must
                 leave it False so the predictor matches `allocate_new_blocks`.
             prefill_end: The token index the request's prefill ends at, the
-                same value the scheduler splits chunks against. Under sparse
-                retention Mamba reserves a prefill checkpoint only on the chunk
-                reaching it; under dense retention every chunk publishes a
-                state, so it is ignored (0).
+                same value the scheduler splits chunks against.
+            num_prompt_tokens: Prompt token count of the request, used by Mamba
+                to select reusable prefill checkpoints.
 
         Returns:
             The number of blocks to allocate.
 
         """
         num_blocks_to_allocate = 0
-        if self.retention_interval != 0:
-            prefill_end = 0
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
@@ -200,6 +198,19 @@ class KVCacheCoordinator(ABC):
                     0,
                     num_encoder_tokens,
                     apply_admission_cap=apply_admission_cap,
+                )
+            elif isinstance(manager, MambaManager):
+                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    new_computed_blocks[i],
+                    total_computed_tokens,
+                    num_local_computed_tokens,
+                    num_tokens_main_model,
+                    apply_admission_cap=apply_admission_cap,
+                    prefill_end=prefill_end,
+                    num_prompt_tokens=num_prompt_tokens,
+                    retention_interval=self.retention_interval,
                 )
             else:
                 if apply_admission_cap:

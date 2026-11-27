@@ -339,6 +339,7 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            mamba_prefill_checkpoints=input_batch.mamba_prefill_checkpoints,
         )
         if self._use_replayssm_trackers:
             self._replayssm_query_start_loc = None

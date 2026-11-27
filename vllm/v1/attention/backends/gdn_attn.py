@@ -197,7 +197,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and self.speculative_config.enable_adaptive_verification
         )
         self.checkpoint_builder = MambaPrefillCheckpointBuilder(
-            vllm_config, kv_cache_spec, self.checkpoint_alignment
+            vllm_config, self.checkpoint_alignment
         )
         from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
             _resolve_gdn_prefill_backend,
@@ -840,11 +840,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         """Re-gather this group's state indices. The other fields are
         batch-level and stay shared with `metadata`."""
         m = metadata
-        checkpoint = (
-            m.checkpoint.regather_state_indices(blk_table)
-            if m.checkpoint is not None
-            else None
-        )
+        assert m.checkpoint is None
         if self.vllm_config.cache_config.enable_prefix_caching:
             assert self.mamba_aligned_state_indices is not None
             blk_table = self.mamba_aligned_state_indices
@@ -886,7 +882,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_state_indices_tensor=spec_indices,
             non_spec_state_indices_tensor=non_spec_indices,
             prefill_state_indices=prefill_indices,
-            checkpoint=checkpoint,
         )
 
     def build_for_cudagraph_capture(

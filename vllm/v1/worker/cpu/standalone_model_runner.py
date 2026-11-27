@@ -17,6 +17,9 @@ from vllm.config.compilation import CompilationMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.checkpoint import (
+    align_mamba_prefill_checkpoints,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -893,6 +896,9 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
             ),
             prompt_lens=prompt_lens,
             fast_prefill=fast_prefill,
+            mamba_prefill_checkpoints=align_mamba_prefill_checkpoints(
+                scheduler_output.mamba_prefill_checkpoints, req_ids
+            ),
         )
 
     def prepare_attn(
