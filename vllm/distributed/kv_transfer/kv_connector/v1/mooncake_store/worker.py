@@ -132,6 +132,32 @@ _K31_TAIL_STORE = (
     _K31_TAIL_LOOKUP and os.environ.get("VLLM_DFLASH_SWA_TAIL_STORE", "0") == "1"
 )
 
+# Store retention for low-value boundary keys (opt-in, all off by default).
+# Each rank removes, after a delay, only keys it put itself; reads stay exact
+# prefix hits, so a removed key only means recomputation.
+#  - Short-prompt tails: a prompt below VLLM_MOONCAKE_SHORT_TAIL_MAX_TOKENS has
+#    no block-aligned Mamba state, and its prompt-tail state (one full state per
+#    Mamba group, independent of prompt length) is rarely read after a minute.
+#    Its tail keys (Mamba tail state, other groups' final partial chunk) are
+#    removed VLLM_MOONCAKE_SHORT_TAIL_TTL_S seconds after the put. Full chunks
+#    stay: they also name prefixes of longer prompts.
+#  - Block-aligned Mamba states at or beyond
+#    VLLM_MOONCAKE_ALIGNED_STATE_TTL_MIN_BLOCKS blocks are removed
+#    VLLM_MOONCAKE_ALIGNED_STATE_TTL_S seconds after the put. A continuing
+#    prompt reads its tail state instead; only branches inside the block need
+#    them. Attention chunks are never removed here.
+_K31_SHORT_TAIL_TTL_S = float(os.environ.get("VLLM_MOONCAKE_SHORT_TAIL_TTL_S", "0"))
+_K31_SHORT_TAIL_MAX_TOKENS = int(
+    os.environ.get("VLLM_MOONCAKE_SHORT_TAIL_MAX_TOKENS", "16384")
+)
+_K31_ALIGNED_STATE_TTL_S = float(
+    os.environ.get("VLLM_MOONCAKE_ALIGNED_STATE_TTL_S", "0")
+)
+_K31_ALIGNED_STATE_TTL_MIN_BLOCKS = int(
+    os.environ.get("VLLM_MOONCAKE_ALIGNED_STATE_TTL_MIN_BLOCKS", "3")
+)
+_K31_STORE_TTL = _K31_SHORT_TAIL_TTL_S > 0 or _K31_ALIGNED_STATE_TTL_S > 0
+
 
 def _k31_tail_floor(spec, ref_tokens: int | None) -> int | None:
     """Draft sliding-window chunks ending at or below the returned token are
@@ -586,18 +612,20 @@ class _ConsumedTailCollector:
         store: Any,
         record_operation: Callable[..., None],
         delay_s: float,
+        operation: str = "tail_remove",
     ):
         self.store = store
         self._record_operation = record_operation
         self.delay_s = delay_s
+        self.operation = operation
         self._lock = threading.Lock()
         # (due time, key, attempts made)
         self._pending: list[tuple[float, str, int]] = []
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
-    def add(self, keys: list[str]) -> None:
-        due = time.monotonic() + self.delay_s
+    def add(self, keys: list[str], delay_s: float | None = None) -> None:
+        due = time.monotonic() + (self.delay_s if delay_s is None else delay_s)
         with self._lock:
             if self._stop.is_set():
                 return
@@ -653,7 +681,7 @@ class _ConsumedTailCollector:
         if failed and status == "ok":
             status = "partial_failure"
         self._record_operation(
-            "tail_remove",
+            self.operation,
             start,
             len(keys),
             status=status,
@@ -736,6 +764,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self._retry_token_ids: dict[str, tuple[int, list[int]]] = {}
         self._tail_collector = _ConsumedTailCollector(
             store, self._record_operation, envs.VLLM_MOONCAKE_TAIL_GC_DELAY_S
+        )
+        self._ttl_collector = (
+            _ConsumedTailCollector(store, self._record_operation, 0.0, "ttl_remove")
+            if _K31_STORE_TTL
+            else None
         )
 
     def add_request(self, request: ReqMeta) -> None:
@@ -1066,7 +1099,82 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 "Mooncake CPU/disk offloading pressure cleared after a "
                 "successful boundary-state batch"
             )
+        if self._ttl_collector is not None:
+            self._schedule_ttl_removals(req_meta, keys, sizes)
         return True
+
+    def _ttl_delays(self, req_meta: ReqMeta) -> dict[str, float]:
+        """Retention delay of each boundary key this job may put (see the
+        ``_K31_SHORT_TAIL_TTL_S`` / ``_K31_ALIGNED_STATE_TTL_S`` rules)."""
+        delays: dict[str, float] = {}
+        num_prompt = req_meta.num_prompt_tokens
+        hash_block_size = self.coord.hash_block_size
+        tail_boundary = (
+            (num_prompt - 1) // hash_block_size * hash_block_size
+            if num_prompt
+            else None
+        )
+        short = (
+            _K31_SHORT_TAIL_TTL_S > 0
+            and num_prompt is not None
+            and num_prompt < _K31_SHORT_TAIL_MAX_TOKENS
+        )
+        for group_id, block_id, num_tokens in req_meta.boundary_puts or []:
+            if block_id == NULL_BLOCK_ID:
+                continue
+            db = self.token_databases[group_id]
+            is_mamba = group_id in self.coord.mamba_group_ids
+            block_aligned = num_tokens % db.store_layout.block_size == 0
+            delay: float | None = None
+            if is_mamba and block_aligned and num_tokens != tail_boundary:
+                if _K31_ALIGNED_STATE_TTL_S > 0 and num_tokens >= (
+                    _K31_ALIGNED_STATE_TTL_MIN_BLOCKS * db.store_layout.block_size
+                ):
+                    delay = _K31_ALIGNED_STATE_TTL_S
+            elif short and num_tokens == tail_boundary:
+                delay = _K31_SHORT_TAIL_TTL_S
+            if delay is None:
+                continue
+            for _, _, end, key_hash in self._boundary_chunks(
+                group_id, num_tokens, req_meta.block_hashes
+            ):
+                # A non-Mamba chunk that ends on a chunk boundary also names a
+                # full chunk of every longer prefix: keep it.
+                if not is_mamba and (
+                    end != num_tokens or num_tokens % db.chunk_size == 0
+                ):
+                    continue
+                for shard_id in db.store_layout.local_shard_ids:
+                    delays[db.store_layout.key_for(shard_id, key_hash)] = delay
+        return delays
+
+    def _schedule_ttl_removals(
+        self, req_meta: ReqMeta, put_keys: list[str], put_sizes: list[list[int]]
+    ) -> None:
+        """Queue the delayed removal of the keys this rank just put."""
+        delays = self._ttl_delays(req_meta)
+        if not delays:
+            return
+        start = time.perf_counter()
+        by_delay: dict[float, list[str]] = {}
+        num_bytes = 0
+        for key, size in zip(put_keys, put_sizes):
+            delay = delays.get(key)
+            if delay is None:
+                continue
+            by_delay.setdefault(delay, []).append(key)
+            num_bytes += sum(size)
+        if not by_delay:
+            return
+        assert self._ttl_collector is not None
+        for delay, keys in by_delay.items():
+            self._ttl_collector.add(keys, delay)
+        self._record_operation(
+            "ttl_schedule",
+            start,
+            sum(len(keys) for keys in by_delay.values()),
+            num_bytes=num_bytes,
+        )
 
     def _handle_request(self, req_meta: ReqMeta):
         # The single `finally` is the only way out, so the scheduler releases
@@ -2991,6 +3099,9 @@ class MooncakeStoreWorker:
         tail_collector = getattr(self.kv_send_thread, "_tail_collector", None)
         if tail_collector is not None:
             tail_collector.close()
+        ttl_collector = getattr(self.kv_send_thread, "_ttl_collector", None)
+        if ttl_collector is not None:
+            ttl_collector.close()
         deadline = time.monotonic() + 5.0
         for thread in (self.kv_send_thread, *self.kv_recv_threads):
             if thread is None:
